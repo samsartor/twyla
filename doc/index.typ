@@ -165,6 +165,89 @@ and it bypasses `image()` entirely.
   is one line and gave us system fonts with zero ceremony — keep using
   it during development.
 
+== Findings — experiment 2 (2026-05-17)
+
+Repointed at typst main (commit `de6f400`, 2026-04-11) for the bundle export
+feature merged in #7964. Plan: switch back to crates.io 0.15.x once it ships.
+
+Three `#document(path, title: ..)` calls + one `#asset(path, bytes)` in
+`experiment.typ`. Compiled as `typst::compile::<Bundle>(&world)` with
+`Library::builder().with_features([Feature::Html, Feature::Bundle])`.
+
+*Worked first try (after API breakage cleanup — see below):*
+
+- *Four files emitted from one compile:* `index.html`, `blog/index.html`,
+  `blog/guis-2.html`, `style.css`. The router question is *closed*:
+  `#document(path, ..)` is the primitive. We don't need filesystem-mirror
+  conventions or manifest files; we can build sugar on top later.
+- *Cross-document linking is automatic and path-correct.* Labels in one
+  doc, referenced from another:
+  - `index.html`     → `<a href="blog/index.html#blog">`
+  - `blog/index.html` → `<a href="../index.html#home-meta">` _(uses `..`!)_
+  - `blog/index.html` → `<a href="guis-2.html#post-1">`     _(sibling)_
+
+  Typst computes relative paths. Zero URL construction work for us.
+- *Labels auto-emit as HTML `id` anchors.* `<my-label>` placed in content
+  becomes `<span id="my-label"></span>` inline. Good enough for `#link()`
+  to work; placement is up to the author (typst attaches to the closest
+  preceding element).
+- *Per-document metadata isolation works.* `doc.introspector().query(..)`
+  on each `BundleDocument::Html` returns only that doc's metadata.
+- *Bundle-wide metadata also works.* `bundle.introspector.query(..)`
+  returns metadata from across all docs. This is the *primitive for feed
+  generation:* query all `kind: "post"` entries → emit the feed.
+- *Assets are direct.* `#asset("style.css", bytes("body { ... }"))`
+  produces a `BundleFile::Asset(Bytes)` at the requested path. For
+  optimized images we'll preprocess bytes in Rust, then hand them to
+  typst via `#asset`.
+
+*Surprises / notes:*
+
+- *Smart quotes default on:* `"Aren't"` rendered as `"Aren't"` (U+2019).
+  Disable per-document with `#set smartquote(enabled: false)` if matching
+  Zola output requires it.
+- *Heading level offset:* `= Heading` emits `<h2>`, not `<h1>` — typst
+  reserves `<h1>` for the document title (configurable via
+  `html.frame` rules; revisit during porting).
+- *`<html lang="en">` is auto-set* on main (was missing in 0.14.2). Good
+  default.
+- *Only warning:* "bundle export is experimental." Same status as HTML
+  export — fine for our purposes.
+- *Asset hook (`World::file`) was not called* this experiment because we
+  used `bytes("...")` (literal) for the CSS. Already verified in
+  experiment 1 that `image("foo")` triggers it.
+
+*Architectural decisions confirmed:*
+
++ Router primitive: `#document(path, ..)` (typst-owned, not twyla-owned).
++ Cross-doc links: typst-owned.
++ Feed generation: written as `#document("atom.xml", ...)` in twyla's
+  library, querying `bundle.introspector` for posts.
++ Multi-entrypoint sugar: twyla scans `content/*.typ`, generates a
+  `main.typ` in memory that emits one `#document(..)` per file, compiles
+  the bundle.
++ Asset optimization: still twyla's job. Either (a) Rust scans
+  references and preprocesses before exposing via World::file, or
+  (b) custom typst functions in twyla's library (e.g. `optimized-image`)
+  that do the work and emit `html.img(src: <hashed-url>)` + `#asset`.
+
+*Breaking changes between 0.14.2 and main (for future-us pinning bumps):*
+
+- `typst-kit`: feature `fonts` → split into `scan-fonts` + `embedded-fonts`.
+  API: `Fonts::searcher()` → gone. New: `FontStore::new()` +
+  `extend(typst_kit::fonts::embedded())` + `extend(typst_kit::fonts::system())`.
+- `FileId::new(None, vpath)` → `FileId::new(RootedPath::new(VirtualRoot::Project, vpath))`.
+- `VirtualPath::new(s)` now returns `Result<Self, PathError>`.
+- `VirtualPath::as_rootless_path()` deprecated → `get_without_slash()`
+  (returns `&str`, not `&Path`).
+- `HtmlDocument::{info, introspector}` fields → private; use methods
+  `.info()` and `.introspector()`. Requires `use typst_library::model::Document;`.
+- `World::today(_offset: Option<i64>)` → `Option<typst::foundations::Duration>`.
+- `bundle.introspector` is `Arc<BundleIntrospector>`; `.query()` requires
+  `use typst::introspection::Introspector;` in scope.
+- New crate: `typst-bundle` (pinned same rev).
+- New `Feature::Bundle` enum variant alongside `Feature::Html`.
+
 == Notes
 
 - VCS: both `~/Src/twyla` and `~/Src/site` are managed with jj. *Rule:*

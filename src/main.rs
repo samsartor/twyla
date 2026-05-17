@@ -1,52 +1,61 @@
-// Throwaway experiment harness for twyla.
+// Experiment 2 harness — bundle mode against typst main.
 //
-// Goal: implement the smallest possible `typst::World`, compile a single
-// `.typ` file to HTML via typst 0.14's typed-HTML API, and dump:
-//   - resolved document info (title, author)
-//   - all `metadata(..)` payloads queried back out of the introspector
-//   - the rendered HTML string
-//   - every World::file() request the compiler made (asset-hook trace)
+// Goal: verify the post-PR-#7964 bundle export API. Compile `experiment.typ`
+// as a `Bundle` (multi-document), then for each emitted file print:
+//   - the virtual path
+//   - file kind (document / asset)
+//   - per-document title and metadata payloads
+//   - rendered HTML (for HTML documents)
+//   - asset byte length (for assets)
 //
-// None of this code is meant to live — it answers feasibility questions
-// for the real twyla design.
+// Throwaway. None of this code lives.
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 
-use comemo::Prehashed;
 use typst::diag::{FileError, FileResult, Warned};
-use typst::foundations::{Bytes, Datetime, Selector, Smart};
-use typst::syntax::{FileId, Source, VirtualPath};
+use typst::foundations::{Bytes, Datetime, Duration, Selector};
+use typst::introspection::Introspector;
+use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
+use typst_bundle::{Bundle, BundleDocument, BundleFile};
+use typst_kit::fonts::FontStore;
 use typst_library::Feature;
-use typst_html::HtmlDocument;
-use typst_kit::fonts::{FontSlot, Fonts};
+use typst_library::foundations::NativeElement;
+use typst_library::introspection::MetadataElem;
+use typst_library::model::Document;
 
 struct ExperimentWorld {
     main_id: FileId,
     source: Source,
     library: LazyHash<Library>,
-    book: LazyHash<FontBook>,
-    fonts: Vec<FontSlot>,
+    fonts: FontStore,
     asset_log: Mutex<Vec<String>>,
 }
 
 impl ExperimentWorld {
     fn new(typ_source: &str) -> Self {
-        let fonts = Fonts::searcher().include_system_fonts(true).search();
-        let main_id = FileId::new(None, VirtualPath::new("/main.typ"));
+        let mut fonts = FontStore::new();
+        fonts.extend(typst_kit::fonts::embedded());
+        fonts.extend(typst_kit::fonts::system());
+
+        let vpath = VirtualPath::new("/main.typ").expect("valid path");
+        let main_id = FileId::new(RootedPath::new(VirtualRoot::Project, vpath));
         let source = Source::new(main_id, typ_source.to_string());
+
         Self {
             main_id,
             source,
             library: LazyHash::new(
                 Library::builder()
-                    .with_features([Feature::Html].into_iter().collect())
+                    .with_features(
+                        [Feature::Html, Feature::Bundle].into_iter().collect(),
+                    )
                     .build(),
             ),
-            book: LazyHash::new(fonts.book),
-            fonts: fonts.fonts,
+            fonts,
             asset_log: Mutex::new(Vec::new()),
         }
     }
@@ -57,7 +66,7 @@ impl World for ExperimentWorld {
         &self.library
     }
     fn book(&self) -> &LazyHash<FontBook> {
-        &self.book
+        self.fonts.book()
     }
     fn main(&self) -> FileId {
         self.main_id
@@ -66,24 +75,22 @@ impl World for ExperimentWorld {
         if id == self.main_id {
             Ok(self.source.clone())
         } else {
-            Err(FileError::NotFound(
-                id.vpath().as_rootless_path().to_path_buf(),
-            ))
+            Err(FileError::NotFound(PathBuf::from(
+                id.vpath().get_without_slash(),
+            )))
         }
     }
     fn file(&self, id: FileId) -> FileResult<Bytes> {
-        let path = id.vpath().as_rootless_path().to_string_lossy().to_string();
-        self.asset_log.lock().unwrap().push(path.clone());
-        // Serve a 1x1 transparent SVG for any request so we exercise the
-        // happy path of the asset hook without needing real files.
+        let path = id.vpath().get_without_slash().to_string();
+        self.asset_log.lock().unwrap().push(path);
         const STUB_SVG: &[u8] =
             b"<svg xmlns='http://www.w3.org/2000/svg' width='1' height='1'></svg>";
         Ok(Bytes::new(STUB_SVG.to_vec()))
     }
     fn font(&self, index: usize) -> Option<Font> {
-        self.fonts.get(index)?.get()
+        self.fonts.font(index)
     }
-    fn today(&self, _offset: Option<i64>) -> Option<Datetime> {
+    fn today(&self, _offset: Option<Duration>) -> Option<Datetime> {
         Datetime::from_ymd(2026, 5, 17)
     }
 }
@@ -92,54 +99,81 @@ fn main() {
     let typ_src = include_str!("../experiment.typ");
     let world = ExperimentWorld::new(typ_src);
 
-    let Warned { output, warnings } = typst::compile::<HtmlDocument>(&world);
+    let Warned { output, warnings } = typst::compile::<Bundle>(&world);
 
     println!("=== Warnings ({}) ===", warnings.len());
     for w in &warnings {
         println!("  {}", w.message);
     }
 
-    let doc = match output {
-        Ok(d) => d,
+    let bundle = match output {
+        Ok(b) => b,
         Err(errors) => {
             println!("\n=== Errors ({}) ===", errors.len());
             for e in &errors {
-                println!("  {}: {}", e.span.id().map(|i| format!("{:?}", i)).unwrap_or_default(), e.message);
-            }
-            println!("\n=== Asset requests ({}) ===", world.asset_log.lock().unwrap().len());
-            for p in world.asset_log.lock().unwrap().iter() {
-                println!("  {}", p);
+                println!("  {}", e.message);
             }
             std::process::exit(1);
         }
     };
 
-    println!("\n=== Document info ===");
-    println!("  title:  {:?}", doc.info.title);
-    println!("  author: {:?}", doc.info.author);
+    println!("\n=== Bundle files ({}) ===", bundle.files.len());
+    for (path, file) in bundle.files.iter() {
+        let kind = match file {
+            BundleFile::Document(BundleDocument::Html(_)) => "html",
+            BundleFile::Document(BundleDocument::Paged(_, _)) => "paged",
+            BundleFile::Asset(_) => "asset",
+        };
+        println!("  - {:?}  [{}]", path.get_without_slash(), kind);
+    }
 
-    println!("\n=== metadata() payloads ===");
-    use typst_library::foundations::NativeElement;
-    use typst_library::introspection::MetadataElem;
-    let sel = Selector::Elem(MetadataElem::ELEM, None);
-    let hits = doc.introspector.query(&sel);
-    println!("  ({} hits via Selector::Elem)", hits.len());
+    let meta_sel = Selector::Elem(MetadataElem::ELEM, None);
+
+    for (path, file) in bundle.files.iter() {
+        let path_str = path.get_without_slash().to_string();
+        println!("\n--- {} ---", path_str);
+        match file {
+            BundleFile::Document(BundleDocument::Html(doc)) => {
+                println!("  title:  {:?}", doc.info().title);
+                println!("  author: {:?}", doc.info().author);
+
+                let hits = doc.introspector().query(&meta_sel);
+                println!("  metadata in this doc: {} hits", hits.len());
+                for c in &hits {
+                    let label = c.label();
+                    let value = c.to_packed::<MetadataElem>().map(|m| &m.value);
+                    println!("    label={:?} value={:?}", label, value);
+                }
+
+                let html = typst_html::html(doc).expect("html serialization");
+                println!("  --- HTML ---\n{}", html);
+            }
+            BundleFile::Document(BundleDocument::Paged(_, _)) => {
+                println!("  (paged document, not dumped)");
+            }
+            BundleFile::Asset(bytes) => {
+                println!("  asset bytes: {} bytes", bytes.len());
+                if let Ok(s) = std::str::from_utf8(bytes) {
+                    println!("  content: {:?}", s);
+                }
+            }
+        }
+    }
+
+    println!("\n=== Bundle-wide metadata query ===");
+    let hits = bundle.introspector.query(&meta_sel);
+    println!("  ({} hits across whole bundle)", hits.len());
     for c in &hits {
         let label = c.label();
         let value = c.to_packed::<MetadataElem>().map(|m| &m.value);
         println!("  - label={:?} value={:?}", label, value);
     }
 
-    println!("\n=== Asset requests ({}) ===", world.asset_log.lock().unwrap().len());
+    println!(
+        "\n=== Asset requests via World::file ({}) ===",
+        world.asset_log.lock().unwrap().len()
+    );
     for p in world.asset_log.lock().unwrap().iter() {
         println!("  {}", p);
     }
-
-    println!("\n=== Rendered HTML ===");
-    let html = typst_html::html(&doc).expect("html serialization");
-    println!("{}", html);
-
-    // Suppress unused-import warnings while iterating
-    let _ = Prehashed::new(0u8);
-    let _ = Smart::<u8>::Auto;
 }
