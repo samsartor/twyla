@@ -1,8 +1,9 @@
 // twyla — design notes & project tracker
 //
-// Living plan for twyla, a static-site generator built around the typst
-// compiler crate. Today this file is a plan; over time, as decisions
-// solidify, it should split out into a reference + style guide under doc/.
+// Living design doc. Reflects current understanding; expect rewrites as
+// decisions land. Historical context (experiment 1, experiment 2,
+// breaking-changes-from-0.14, detailed gotcha lists) lives in git
+// history, not here.
 
 #set document(title: "twyla — design & plan")
 #set page(margin: 2cm, numbering: "1")
@@ -15,408 +16,337 @@
 
 A static-site generator whose only authoring language is typst.
 
-Twyla embeds the typst compiler as a Rust library (the `typst` crate), not the
-CLI, so it can: route typst files to URLs, intercept asset resolution to
-fingerprint/optimize images, walk the compiled document for metadata, emit
-RSS/Atom, and (eventually) do incremental rebuilds.
+Twyla embeds the typst compiler as a Rust library (the `typst` crate), not
+the CLI, so it can route typst files to URLs, intercept asset resolution
+to fingerprint/optimize images, walk the compiled document for metadata,
+emit RSS/Atom, and (eventually) do incremental rebuilds.
 
-The first concrete goal is to port #link("https://samsartor.com")[samsartor.com]
-(currently zola + tera + markdown, source at `~/Src/site`) to twyla + typst,
-with HTML AST equivalence as the porting harness.
+The driving target is porting
+#link("https://samsartor.com")[samsartor.com] (currently zola + tera +
+markdown, at `~/Src/site`) to twyla + typst, with HTML AST equivalence as
+the porting harness.
 
 == Why pure typst (no template layer)
 
-Considered: a tera-like template engine layered on top of typst, by analogy
-with zola layering tera on top of markdown. Rejected — typst already provides
-the moving parts a template language would re-invent:
+Considered: a tera-like template engine layered on top of typst, by
+analogy with zola layering tera on top of markdown. Rejected — typst
+already provides the moving parts a template language would re-invent:
 
-- *Inheritance* — `base.html` + `{% block %}` becomes a typst function that
-  takes a `body` parameter, with show/set rules supplying the defaults.
+- *Inheritance* — `base.html` + `{% block %}` becomes a typst function
+  taking a `body` parameter, with show/set rules supplying the defaults.
 - *Filters* — typst functions compose better than pipeline syntax.
 - *Shortcodes* — already just typst functions, no separate registry.
-- *HTML output* — `html.elem(..)` since typst 0.13 lets us emit arbitrary
-  tag + class + attribute structures, which is what tera shortcodes do today.
+- *HTML output* — `html.elem(..)` and the typed `html.div(..)` family
+  let us emit arbitrary tag + class + attribute structures.
 
-Cost of *adding* a template language: two scoping models, two escape-hatch
-conventions (`| safe` vs typst's `html.frame`), and two contexts for the
-author to switch between.
+Cost of *adding* a template language: two scoping models, two escape
+hatches, two contexts for the author to switch between. Cost of *not*
+adding one: typst's HTML export is younger than tera, so ergonomic rough
+edges land on us. That's where twyla earns its keep — wrapping the crate
+gives us room to shape output rather than living with defaults.
 
-Cost of *not* adding one: typst's HTML export is younger than tera, so we may
-hit ergonomic rough edges. That's where twyla earns its keep — wrapping the
-crate gives us room to shape the output rather than living with the default.
+== Architecture
 
-== Open questions
+=== Routing & bundle
 
-+ *Routing model.* Single typst `World`, with custom content nodes (working
-  names: `asset`, `resource`, `page`) that auto-split into html / svg / pdf
-  outputs at a derived-or-declared path. Multi-entrypoint sugar on top:
-  dropping a new `.typ` into `posts/` creates a post without further config.
-  Open: does the path come from the filesystem (mirror layout), from a
-  `metadata()` call inside the doc, or both? Leaning filesystem-by-default,
-  metadata-override.
+`#document(path, ..)` (typst PR #7964) is the routing primitive: one call
+per emitted HTML file. Cross-document links use labels; typst computes
+relative paths automatically. `#asset(path, bytes)` writes raw files into
+the same bundle output.
 
-+ *HTML AST equivalence.* "Match the zola output up to whitespace" needs a
-  concrete differ — parse both sides (html5ever / scraper), normalize
-  whitespace + attribute order, compare trees, report structural drift.
-  This is the porting feedback loop; without it, every page becomes manual
-  eyeballing. Must be early infrastructure, not a side tool.
+Twyla's job, eventually: scan `content/*.typ`, generate a `main.typ` in
+memory that emits one `#document(..)` per source file (path derived from
+filesystem layout with `metadata()` override), compile the bundle,
+post-process. Today the render binary handles a single user-supplied
+entrypoint at a time, no scan-and-generate yet.
 
-+ *Asset pipeline.* Image references inside typst need to be fingerprinted,
-  optimized, and emitted at stable URLs. Sass and JS bundling — probably
-  shell out to existing tools (current site uses vite) rather than
-  reimplement. Open: does twyla own the dev server, or do we keep
-  `vite dev` alongside?
+=== Asset model
 
-+ *Metadata extraction.* Title, description, date, draft, custom `extra.*`
-  fields all live in TOML frontmatter today. In typst they become document
-  metadata + `metadata()` calls, queried after compile. Need to verify what
-  `typst::compile` returns and what's queryable from outside the document.
+Two orthogonal axes for asset primitives — *input source* and *output kind*:
 
-+ *Compile interface.* One `World` with many entry points (fast,
-  deduplicates imports, manual source-file lifetime management) vs
-  `typst::compile` per page (simple, slow, no cross-page reuse). Leaning
-  single World.
+#table(
+  columns: (auto, 1fr, 1fr),
+  align: (left, left, left),
+  table.header[][*Output: bytes*][*Output: url*],
 
-== Milestones
+  [*Input: path*],
+  [`read(path) -> bytes` \
+   _Already typst's built-in._],
+  [`asset-url(path) -> str` \
+   — emit URL pointing at file. \
+   Eventually fingerprinted.],
 
-+ #strike[*HTML-export prototype.*] _Done — experiment 1 (and experiment 2
-  on main, which superseded it). Class control, metadata round-trip, asset
-  hook all confirmed._
+  [*Input: bytes*],
+  [_byte transforms (font rewrite, \
+    webp encode); rust or typst._],
+  [`content-url(bytes, name) -> str` \
+   — hash, write to bundle, URL.],
 
-+ #strike[*AST-diff harness.*] _Done — see the `twyla::diff` module
-  (`src/diff/`) and the `twyla-diff` CLI binary. 17 unit tests covering
-  identity, whitespace, attribute / class-token ordering, structural drift,
-  text / tag / attribute mismatches, comment dropping, and each of the three
-  relaxation rules. See the *AST diff harness* section below for the
-  relaxation framework._
+  [*Input: content* \
+   _(typst Content)_],
+  [`render(content, format) -> bytes` \
+   — sub-compile. Overlaps with \
+   typst's `#document(path,..)`.],
+  [`asset.from-content(...).url` \
+   — render + register + URL.],
+)
 
-+ *Port one page end-to-end.* Target: `guis-2`. Exercises TOML frontmatter,
-  code blocks with syntax highlighting, tables with embedded shortcodes in
-  cells, horizontal rules, and the `centered` / `svg` / `diagram` / `image`
-  shortcodes. If guis-2 round-trips, most of the site will.
+Principle: byte transforms run in Rust (or in user typst where
+ergonomic); presentation decisions (inline `<svg>` vs `<img>` vs
+`<picture>` vs `<use href>` vs iframe) run in user typst templates.
+URL-returning primitives are the seam: above them typst owns layout and
+emission; below them Rust owns paths, fingerprinting, and the on-disk
+bundle.
 
-+ *Generalize.* Only after guis-2 matches: routing convention, asset
-  collection, feed generation, dev server.
+Phase 1 implements only `read` (free from typst). URL primitives are
+deferred until a second use case forces the API surface.
 
-== AST diff harness
+`#document` is the page-level expression of "content input → URL." Open
+question whether the eventual `asset.from-content(..)` API subsumes it,
+or whether they stay separate (pages routed by content layout vs assets
+routed by hash).
 
-Module `twyla::diff`. CLI `twyla-diff <expected.html> <actual.html>`
-exits 0 on equivalence, 1 on drift (with a path + reason), 2 on usage error.
+=== Resolution pass
 
-*Default normalizations* (applied at parse time, no opt-in needed):
+Twyla owns a post-compile *resolution pass* — a walk over the bundle's
+serialized output that finds placeholder markers and substitutes their
+final form. Inspired by the future/promise pattern: typst emits a
+deferred value; Rust resolves it later. This is the seam between "things
+typst can express" and "things we want in the output."
 
-- tag and attribute names lowercased
-- attributes sorted by name
-- `class` attribute tokens sorted alphabetically
-- whitespace runs in text nodes collapsed to a single space, then trimmed
-- pure-whitespace text nodes dropped (inter-block indentation)
-- comments dropped entirely (not just ignored at compare time)
-- text inside `<pre>`, `<code>`, `<script>`, `<style>`, `<textarea>` is
-  *preserved verbatim* — none of the above whitespace rules apply
+Phase 1 has one placeholder: *raw HTML*. Typst has no `html.raw`; only
+`<script>` and `<style>` bodies are emitted unescaped (verified:
+`typst-html::tag::is_raw`). We exploit that: user typst calls
+`raw-html(content)` which emits
+`<script type="x-twyla-raw-html">..bytes..</script>`; the resolution pass
+replaces each match with the inner content spliced inline. Used by the
+`svg`/`diagram` shortcodes to embed external SVG files.
 
-*Relaxation framework* (`src/diff/relax.rs`). A `RelaxConfig` is a list of
-`(Matcher, RelaxationRule)` pairs. First match wins. The default config has
-zero rules — porting starts strict.
+Anticipated placeholders, each earned by a use case:
+
+- *Image optimization* — `<twyla-image data-src=".." data-sizes="..">`
+  resolves to `<picture>`/`<img srcset>` after webp/avif encoding.
+- *Asset-as-content* — sub-compile registered typst content to SVG,
+  splice inline.
+- *Feed expansion* — `<twyla-feed-entries data-query="..">` resolves to N
+  siblings driven by introspector query results.
+
+Implementation strategy: keep the str-replace pattern until we have ≥ 2
+marker kinds, then generalize to a typed handler registry.
+
+The resolution pass is *the* reason twyla doesn't need to fork typst —
+it's pure post-processing of typst output, no internals touched.
+
+== Tooling
+
+=== Porting binaries
+
+Three CLI binaries + a shell driver, all in this repo:
+
+- *`twyla-render-page [--root <dir>] <entrypoint.typ>`* — compile as
+  bundle, run resolution pass, print the single document's HTML.
+- *`twyla-extract <selector> <input.html>`* — print inner HTML of the
+  first matching element. Selectors: `class:<name>`, `tag:<name>`.
+- *`twyla-diff [--textonly-pre] [--ignore-attr <tag>:<attr>]... <expected> <actual>`*
+  — structural AST diff with optional porting relaxations.
+- *`port-page.sh`* — render + extract + diff for a single page.
+  Hardcoded to guis-2; generalize when we port the second page.
+
+=== AST diff harness (`twyla::diff`)
+
+Library + CLI. Parses both sides via html5ever, normalizes (lowercase
+tags/attrs, sort attrs and class tokens, collapse inter-block whitespace,
+preserve `<pre>`/`<code>`/`<script>`/`<style>`/`<textarea>` text
+verbatim, drop comments), walks both trees in lockstep, reports the
+first structural divergence.
+
+Relaxations are opt-in `(Matcher, RelaxationRule)` pairs, first-match
+wins. Defaults to zero — porting starts strict.
 
 #table(
   columns: (auto, 1fr),
-  table.header[*`Matcher` variant*][*Matches*],
+  table.header[*`Matcher`*][*Matches*],
   [`Tag("p")`], [every `<p>` element],
   [`TagAttr { tag, attr, value }`], [matching tag with `attr == value`],
-  [`TagAttrExists { tag, attr }`], [matching tag with `attr` set (any value)],
+  [`TagAttrExists { tag, attr }`], [matching tag with `attr` set],
 )
 
 #table(
   columns: (auto, 1fr),
-  table.header[*`RelaxationRule` variant*][*Effect*],
-  [`IgnoreEntirely`], [treat the subtree as equal regardless of content],
-  [`IgnoreAttribute(name)`], [skip that attribute on this element when comparing],
-  [`TextOnly`], [compare concatenated text only; ignore structure + attrs of children],
+  table.header[*`RelaxationRule`*][*Effect*],
+  [`IgnoreEntirely`], [subtree considered equal regardless],
+  [`IgnoreAttribute(name)`], [skip one attribute on matched element],
+  [`TextOnly`], [compare concatenated text only; ignore structure],
 )
 
-Adding a relaxation:
+*Standing rule:* every new relaxation is a place twyla and zola
+diverge. Run them by Sam first.
 
-```rust
-let cfg = RelaxConfig::new()
-    .relax(Matcher::Tag("pre".into()), RelaxationRule::TextOnly);
-```
+*Deliberately deferred:* per-section relaxations (different rules under
+different ancestors), multi-divergence reporting (today: bails on first
+divergence), attribute-value matchers ("ignore `style` only when value =
+`color: red`").
 
-*Standing rule:* run new relaxations by Sam before adding them. The
-harness is the porting honesty mechanism — every relaxation is a place
-where twyla and zola diverge, and that divergence should be deliberate.
+== Status
 
-*Capacities deliberately deferred:*
++ #strike[*HTML-export prototype*] — done (experiment 1).
++ #strike[*Multi-document bundle output*] — done (experiment 2).
++ #strike[*AST-diff harness*] — done (`twyla::diff`).
++ #strike[*Port one page, body only (guis-2)*] — done. `port-page.sh`
+  matches under two relaxations: `--textonly-pre` (code blocks) and
+  `--ignore-attr td:style --ignore-attr th:style` (typst tables don't
+  emit alignment as CSS).
++ *Port guis-2 full page* — base + page templates. Next.
++ *Generalize* — routing, asset pipeline, feed, dev server. After.
 
-- Per-section relaxations (different rules under different ancestors).
-- Multi-divergence reporting (today: bails on first divergence).
-- Attribute-value matchers (e.g. "ignore `style` only when it equals
-  `color: red`"). Add when a real porting case demands it.
+== Roadmap
 
-*Cross-checking against zola EXAMPLES.* Future task: rather than relying
-solely on samsartor.com, fetch a few real Zola sites from
-#link("https://github.com/getzola/zola/blob/master/EXAMPLES.md")[getzola's
-EXAMPLES] and run the same diff workflow against representative pages.
-Gives us a much broader test of feature coverage and surfaces zola
-behaviors the personal site doesn't exercise. Not yet started.
+Working assumption: walk from "one page, body" outward, adding twyla
+infrastructure only when a porting case forces it.
 
-== Findings — experiment 1 (2026-05-17)
+=== Near term — finish guis-2
 
-Throwaway harness at `src/main.rs` + `experiment.typ`, ~115 lines of Rust
-total. Implements the minimal `World`, compiles with typst 0.14.2 + html
-feature, dumps document info, metadata, asset requests, and rendered HTML.
++ *Page templates as typst functions.* Port `base.html` + `page.html` to
+  a typst module the user imports. The function takes `title`,
+  `description`, `body`, and any page-extra fields as parameters, emits
+  via `#show: page-template.with(..)`. Open: does twyla auto-apply
+  templates via its generated `main.typ` (saves the user one line per
+  page) or do we ask users to `#show: …` themselves (more honest, less
+  magic)? Resolve by writing the explicit version first; revisit when
+  the boilerplate-per-page hurts.
++ *Second page.* Port `guis-1` or `guis-3` to validate the workflow
+  generalizes. Will surface what was guis-2-specific in
+  `port-page.sh`/`shortcodes.typ` — drives the first round of
+  generalization.
 
-*Confirmed:*
+=== Medium term — twyla becomes an SSG
 
-- *Class control is exact.* `#html.div(class: "container --large")` emits
-  `<div class="container --large">` verbatim. CSS-class-driven porting
-  from zola is unblocked.
-- *Document metadata round-trips.* `#set document(title:, author:)` lands
-  in `HtmlDocument::info.title` / `.author` as expected.
-- *`metadata((..))` round-trips with full structured payloads.* Dicts,
-  datetimes, arrays all survive. Query selector: `Selector::Elem(
-  MetadataElem::ELEM, None)`; unpack via `Content::to_packed::<MetadataElem>()`
-  to read the `value` field. Label-based lookup also works. *Note:*
-  `Selector::can::<MetadataElem>()` returns 0 hits — wrong matcher despite
-  compiling; use `Selector::Elem` instead.
-- *HTML escaping is automatic.* A literal `<` inside `#raw(..)` came out
-  as `<code>&lt;</code>`.
-- *World::file is the asset hook.* `image("teaser.svg")` triggered exactly
-  one call with `path = "teaser.svg"`. The FileId carries `vpath` (the
-  rootless requested path) — enough to drive a content-addressed asset
-  pipeline.
-- *Library construction gotcha.* HTML export is gated on
-  `Library::builder().with_features([Feature::Html])`. Not a Cargo feature.
-  Without it, compile errors with "html export is only available when
-  `--features html` is passed" (misleading — there is no such Cargo flag).
-  Always emits a warning even when enabled; that's fine.
++ *Multi-entrypoint routing.* Replace the
+  one-`#document`-per-render-call constraint with twyla scanning
+  `content/*.typ`, generating an in-memory `main.typ` that emits one
+  `#document(..)` per source. Path derives from filesystem layout, with
+  per-page `metadata()` override.
++ *Real `asset-url` primitive.* Drop the hardcoded `base_url` in
+  `templates/shortcodes.typ`. Comes from a twyla config layer (TOML or
+  typst-side). This is the moment we promote our one resolution-pass
+  placeholder into a registry, because the URL primitive needs hooks for
+  fingerprinting/dedup.
++ *Image optimization pipeline.* Webp/avif encoding, srcset generation,
+  in Rust as a resolution-pass handler. User typst calls one function;
+  the registered handler does the byte transforms and emits the
+  resolved `<picture>`.
++ *Feed generation.* `#document("atom.xml", ..)` in twyla's library,
+  querying `bundle.introspector` for `kind: "post"` entries.
 
-*Surprise — and a design fork:* `image("teaser.svg")` in HTML mode does
-*not* emit `<img src="teaser.svg">`. Typst reads the bytes via our World,
-then base64-encodes them into a `<img src="data:image/svg+xml;base64,...">`
-data URL inline in the HTML. Twyla cannot just intercept `image()` and
-rewrite the URL — typst owns the rendering. Three viable paths:
+=== Longer term
 
-+ Define a twyla-provided `asset("foo.svg")` function in the library that
-  *does not* call `image()` — instead, it returns content built from
-  `html.img(src: <our-derived-url>)`. We do asset interning at the
-  function-call site, emit external `<img>` tags, and never use typst's
-  `image()` for HTML output. *Probably the right answer* — gives us
-  explicit control of class names, srcset, lazy-loading, captions, etc.
-+ Post-process the HTML: walk the DOM, extract every `data:` URL, hash
-  the bytes, write them to disk, rewrite the `src` to the new URL. Works
-  but feels brittle — any future typst optimization to elide tiny images
-  or fold multiple references would silently change our output.
-+ Let typst inline assets and accept the data-URL bloat. Fine for tiny
-  decorative SVGs, terrible for the site's ~50KB SVG diagrams. Not
-  serious for our content.
++ *Dev server with live reload.* Open question: do we own it (twyla
+  watches sources, serves with WS reload script) or shell out to
+  `vite dev` for now and revisit?
++ *Incremental rebuilds.* Hold one `World` across watch cycles; lean on
+  comemo memoization. Revisit if cold-start becomes a perf wall.
++ *Sass / JS bundling.* Probably shell out (vite or esbuild) rather than
+  reimplement. Twyla orchestrates, doesn't compile.
 
-Lean: option 1. The asset/resource/page custom-content-type idea from
-the earlier sketch maps cleanly here — `asset()` is one of those types,
-and it bypasses `image()` entirely.
+=== Validation
 
-*Other observations:*
++ *EXAMPLES-corpus test.* Run a port-page-style diff against
+  representative pages from
+  #link("https://github.com/getzola/zola/blob/master/EXAMPLES.md")[getzola's
+  EXAMPLES]. Catches feature breadth the personal site doesn't exercise.
+  Should produce a corpus of `(zola-html, twyla-html, relaxations)`
+  triples that we keep green on CI.
 
-- Typst emits a full HTML5 document by default (doctype, `<html>`,
-  `<head>` with `meta charset`, viewport meta, `<title>`, author meta).
-  For matching the zola output we'll need to either suppress this and
-  emit our own `<head>` shell, or replace the auto-emitted `<head>`
-  contents via... some mechanism not yet discovered.
-- Output is pretty-printed with 2-space indentation. The AST-diff
-  harness can ignore this trivially but worth knowing.
-- typst-kit's `Fonts::searcher().include_system_fonts(true).search()`
-  is one line and gave us system fonts with zero ceremony — keep using
-  it during development.
+== Lessons (from porting guis-2 body)
 
-== Findings — experiment 2 (2026-05-17)
+Compact gotcha list; details in commits.
 
-Repointed at typst main (commit `de6f400`, 2026-04-11) for the bundle export
-feature merged in #7964. Plan: switch back to crates.io 0.15.x once it ships.
+- *Smart quotes* — leave typst's `smartquote` on; matches zola's
+  `smart_punctuation = true` character-for-character.
+- *Show rules fire in HTML mode* (verified de6f400). Folk claim
+  otherwise; not true for content-transformation rules. Layout-specific
+  rules (positioning, frame production) may not, untested.
+- *Pulldown auto-wraps inline content in `<p>` inside containers*
+  (`<div>`, `<blockquote>`, `<td>`); typst's HTML export doesn't. Wrap
+  manually with `#html.p[..]` until we find a cleaner pattern.
+- *Native `#table`* works for HTML. Only divergence: `align: (..)`
+  doesn't reflect into per-cell `style="text-align:.."` (typst treats
+  it as layout-only). Relax `--ignore-attr td:style --ignore-attr
+  th:style` to absorb.
+- *Show rules can't replace typst's auto-generated wrapper.* A `show
+  table.cell.where(x: 0): it => html.elem("td", ..)` produces
+  `<td><td ..>..</td></td>`. Same hazard expected on `list.item`,
+  `enum.item`, etc.
+- *`html.a(rel: ..)`* takes an array of enum tokens, not a
+  space-joined string: `rel: ("noopener", "external")`.
+- *External-link auto-attrs* (`rel="noopener external" target="_blank"`)
+  via `show link: it => …` checking `type(it.dest) == str` and prefix.
+- *`html.elem` for non-typed attrs.* `html.div` doesn't expose `align`;
+  use `html.elem("div", attrs: (align: "center"), ..)`.
+- *Inline SVG via the resolution pass.* `<script type="x-twyla-raw-html">`
+  falls into `RawMode::Keep` because the type attribute isn't
+  `text/javascript`.
+- *Typst `#let` chain-across-newlines hazard.* `#let f(s) = s\n
+  .replace(..)` parses as identity-of-`s` with the dot-calls as orphan
+  markup, no error. Wrap multi-line chains in `(…)`.
 
-Three `#document(path, title: ..)` calls + one `#asset(path, bytes)` in
-`experiment.typ`. Compiled as `typst::compile::<Bundle>(&world)` with
-`Library::builder().with_features([Feature::Html, Feature::Bundle])`.
+== Upstream-watch list
 
-*Worked first try (after API breakage cleanup — see below):*
+Worth raising upstream (or watching for) on typst:
 
-- *Four files emitted from one compile:* `index.html`, `blog/index.html`,
-  `blog/guis-2.html`, `style.css`. The router question is *closed*:
-  `#document(path, ..)` is the primitive. We don't need filesystem-mirror
-  conventions or manifest files; we can build sugar on top later.
-- *Cross-document linking is automatic and path-correct.* Labels in one
-  doc, referenced from another:
-  - `index.html`     → `<a href="blog/index.html#blog">`
-  - `blog/index.html` → `<a href="../index.html#home-meta">` _(uses `..`!)_
-  - `blog/index.html` → `<a href="guis-2.html#post-1">`     _(sibling)_
++ `html.raw(content)` — first-class verbatim HTML. Today the resolution
+  pass abuses `<script>`. Likely controversial (typst values structured
+  output) but every HTML consumer hits this.
++ `#table(align: ..)` reflecting into `style="text-align: .."` on
+  `<th>`/`<td>` in HTML mode. Same for `colspan`/`rowspan` attributes.
++ Show rules on `table.cell`/`list.item`/`enum.item` that can *replace*
+  typst's auto-generated wrapper in HTML, not just decorate its body.
++ Hook on `image()` to emit external `src` instead of data URLs in HTML
+  mode — would benefit anyone doing HTML export at scale.
++ Per-document defaults override (e.g. document-level
+  `smartquote(enabled: false)` declared once).
++ Introspector exposure of cross-document link resolution data — useful
+  for fingerprint-then-rewrite passes.
 
-  Typst computes relative paths. Zero URL construction work for us.
-- *Labels auto-emit as HTML `id` anchors.* `<my-label>` placed in content
-  becomes `<span id="my-label"></span>` inline. Good enough for `#link()`
-  to work; placement is up to the author (typst attaches to the closest
-  preceding element).
-- *Per-document metadata isolation works.* `doc.introspector().query(..)`
-  on each `BundleDocument::Html` returns only that doc's metadata.
-- *Bundle-wide metadata also works.* `bundle.introspector.query(..)`
-  returns metadata from across all docs. This is the *primitive for feed
-  generation:* query all `kind: "post"` entries → emit the feed.
-- *Assets are direct.* `#asset("style.css", bytes("body { ... }"))`
-  produces a `BundleFile::Asset(Bytes)` at the requested path. For
-  optimized images we'll preprocess bytes in Rust, then hand them to
-  typst via `#asset`.
+== Fork vs library
 
-*Surprises / notes:*
+Standing assumption: *do not fork typst.* Twyla is a Rust binary that
+consumes typst as a library, supplies a custom `World`, ships a small
+typst library of helpers, and post-processes the bundle. If something is
+genuinely better as an upstream change, *upstream it* before forking.
+Fork threshold: library + upstreaming both proven inadequate.
 
-- *Smart quotes default on:* `"Aren't"` rendered as `"Aren't"` (U+2019).
-  Disable per-document with `#set smartquote(enabled: false)` if matching
-  Zola output requires it.
-- *Heading level offset:* `= Heading` emits `<h2>`, not `<h1>` — typst
-  reserves `<h1>` for the document title (configurable via
-  `html.frame` rules; revisit during porting).
-- *`<html lang="en">` is auto-set* on main (was missing in 0.14.2). Good
-  default.
-- *Only warning:* "bundle export is experimental." Same status as HTML
-  export — fine for our purposes.
-- *Asset hook (`World::file`) was not called* this experiment because we
-  used `bytes("...")` (literal) for the CSS. Already verified in
-  experiment 1 that `image("foo")` triggers it.
+Why: typst's HTML/bundle work is actively evolving in main. A fork puts
+us permanently downstream of grammar, library, and HTML-output changes —
+a real maintenance tax paid forever for benefits mostly reachable from
+outside.
 
-*Architectural decisions confirmed:*
+Decisions to date (every feature considered has landed on "library"):
+asset fingerprinting (post-export DOM walk), image optimization (twyla
+function bypassing `image()`), pretty URLs (`#document(..)` paths), path
+computation, hot reload (WebSocket-inject during dev), RSS/sitemap,
+per-document smartquote/lang (already configurable), incremental compile
+(comemo), file mtime via `sys.inputs`, async/HTTP at compile (pre-fetch
+in Rust). No fork: HTML-syntax-mode (the JSX-style sugar isn't worth
+shadowing typst's grammar).
 
-+ Router primitive: `#document(path, ..)` (typst-owned, not twyla-owned).
-+ Cross-doc links: typst-owned.
-+ Feed generation: written as `#document("atom.xml", ...)` in twyla's
-  library, querying `bundle.introspector` for posts.
-+ Multi-entrypoint sugar: twyla scans `content/*.typ`, generates a
-  `main.typ` in memory that emits one `#document(..)` per file, compiles
-  the bundle.
-+ Asset optimization: still twyla's job. Either (a) Rust scans
-  references and preprocesses before exposing via World::file, or
-  (b) custom typst functions in twyla's library (e.g. `optimized-image`)
-  that do the work and emit `html.img(src: <hashed-url>)` + `#asset`.
-
-*Breaking changes between 0.14.2 and main (for future-us pinning bumps):*
-
-- `typst-kit`: feature `fonts` → split into `scan-fonts` + `embedded-fonts`.
-  API: `Fonts::searcher()` → gone. New: `FontStore::new()` +
-  `extend(typst_kit::fonts::embedded())` + `extend(typst_kit::fonts::system())`.
-- `FileId::new(None, vpath)` → `FileId::new(RootedPath::new(VirtualRoot::Project, vpath))`.
-- `VirtualPath::new(s)` now returns `Result<Self, PathError>`.
-- `VirtualPath::as_rootless_path()` deprecated → `get_without_slash()`
-  (returns `&str`, not `&Path`).
-- `HtmlDocument::{info, introspector}` fields → private; use methods
-  `.info()` and `.introspector()`. Requires `use typst_library::model::Document;`.
-- `World::today(_offset: Option<i64>)` → `Option<typst::foundations::Duration>`.
-- `bundle.introspector` is `Arc<BundleIntrospector>`; `.query()` requires
-  `use typst::introspection::Introspector;` in scope.
-- New crate: `typst-bundle` (pinned same rev).
-- New `Feature::Bundle` enum variant alongside `Feature::Html`.
-
-== Fork vs library: tracked decisions
-
-Standing assumption: *do not fork typst.* Build twyla as a Rust binary that
-consumes typst as a library, supplies a custom `World`, ships a small typst
-library of helper functions, and post-processes the bundle. If something is
-genuinely better as an upstream change, *upstream it* before forking. The
-fork threshold should be "library + upstreaming both proven inadequate."
-
-Why this default: typst's HTML/bundle work is actively evolving in main.
-A fork puts us permanently downstream of grammar, library, and HTML-output
-changes — that's a real maintenance tax, paid forever, for benefits that
-are mostly reachable from outside.
-
-Per-feature analysis below. If we ever hit a real wall, *update this table*
-with what we tried and why it didn't work — that's the evidence base for
-reconsidering.
-
-#table(
-  columns: (1fr, 1fr, 1fr, 0.75fr),
-  align: (left, left, left, center),
-  table.header[*Feature*][*Upstream-friendly path*][*Fork would buy us*][*Verdict*],
-
-  [Asset fingerprinting (e.g. `style.abc.css` + ref rewriting)],
-  [Post-export pass over bundle: walk `VirtualFs`, hash bytes, rewrite paths
-  in both HTML strings and asset names. Use html5ever for parsing.],
-  [Cleaner integration with introspector for ref resolution.],
-  [*Library*],
-
-  [Image optimization (AVIF/WebP, srcset, responsive sizes)],
-  [Twyla-provided `image(..)` function that bypasses typst's `image()`,
-  preprocesses bytes, emits `html.img(srcset: ..)` + `#asset(..)`.],
-  [Could replace typst's default `image()` behavior in HTML mode (currently
-  data-URL inlines).],
-  [*Library + maybe upstream*],
-
-  [Pretty URLs (`/post/foo/` not `/post/foo.html`)],
-  [Emit `#document("post/foo/index.html", ..)` in generated `main.typ`.],
-  [Nothing — equivalent.],
-  [*Library*],
-
-  [Path computation / lang prefixes / trailing-slash policy],
-  [All happens in our generated `main.typ` before compile.],
-  [Nothing — equivalent.],
-  [*Library*],
-
-  [HTML syntax mode (JSX-style `<div>..</div>`)],
-  [`html.div(class: "..")[..]` is already fine.],
-  [Minor ergonomic win, large maintenance cost (parser + AST + downstream
-  of all grammar evolution).],
-  [*No fork*],
-
-  [Hot reload / live preview],
-  [Inject WebSocket script into HTML during dev-server post-processing.],
-  [Nothing — wrong layer.],
-  [*Library*],
-
-  [RSS/Atom/sitemap generation],
-  [`#document("atom.xml", ..)` querying `bundle.introspector` for posts.],
-  [Nothing — wrong layer.],
-  [*Library*],
-
-  [Per-document smartquote / language / heading-offset control],
-  [Already configurable via `#set smartquote(..)` etc per document.],
-  [Possibly: nicer defaults for HTML mode. Worth upstreaming.],
-  [*Library or upstream*],
-
-  [Incremental compilation across watch cycles],
-  [Hold one `World` across runs; lean on comemo memoization.],
-  [Finer-grained invalidation hooks; persistent on-disk cache.],
-  [*Library; revisit if cold-start becomes a perf wall*],
-
-  [Reading file mtime / external metadata inside typst],
-  [Supply data via `sys.inputs` from Rust-side directory scan.],
-  [Direct filesystem stat exposure. Probably *bad* for sandboxing.],
-  [*Library*],
-
-  [Async / HTTP during compile (OpenGraph fetches, etc.)],
-  [Do it in Rust pre-compile, inject results via `sys.inputs`.],
-  [Async typst — large architectural change, probably never wanted.],
-  [*No fork*],
-)
-
-*Things we should at least keep an eye on for upstreaming:*
-
-+ Optional hook for `image()` to emit external `src` instead of data URLs
-  in HTML mode — would benefit anyone doing HTML export at scale.
-+ Per-document defaults override (e.g. default `smartquote(enabled: false)`
-  for a specific bundle target).
-+ Introspector exposure of cross-document link resolution data, useful for
-  asset-fingerprinting passes.
-
-If we open issues for these, link them here so the next person reading this
-section can see whether the calculus has changed.
+If we ever hit a real wall, document what we tried and why it didn't
+work — that's the evidence base for reconsidering.
 
 == Notes
 
 - VCS: both `~/Src/twyla` and `~/Src/site` are managed with jj. *Rule:*
-  always `jj new` *before* editing — jj has no staging area, so edits
-  land in whatever revision the working copy points at. Recovering from
-  an accidental commit requires `jj split`, which is interactive and
-  cannot be driven from a non-interactive shell.
-- Typst version: TBD (pin when starting milestone 1).
+  always `jj new` before editing — jj has no staging area, so edits
+  land in whatever revision the working copy points at.
+- Typst pinned to main `de6f400` (2026-04-11) for the bundle export
+  feature (PR #7964). Switch back to crates.io once 0.15.x ships.
 - Tera shortcodes in scope for porting: `centered`, `diagram`, `image`,
   `math`, `svg`, `tagline`, `var` (`~/Src/site/templates/shortcodes/`).
+  Phase 1 covered the first four; `math`/`tagline`/`var` come with
+  pages that use them.
 - Tera templates in scope: `base.html`, `page.html`, `section.html`,
   `index.html`, `components.html`, `404.html`, `atom.xml`,
   `paperpills.html`.
 - Known porting hazards: ROT13-encoded email obfuscation in footer,
   conditional asset loading (`page.extra.tilings`), SVG inlining with
-  font-family rewriting.
+  font-family rewriting (handled by the `svg`/`diagram` shortcodes).

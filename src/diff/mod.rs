@@ -24,12 +24,16 @@
 pub mod compare;
 pub mod parse;
 pub mod relax;
+pub mod select;
+pub mod serialize;
 
 use std::collections::BTreeMap;
 
 pub use compare::{Divergence, DivergenceReason, PathStep, diff};
 pub use parse::parse_html;
 pub use relax::{Matcher, RelaxConfig, RelaxationRule};
+pub use select::{Selector, find_inner};
+pub use serialize::{serialize, serialize_fragment};
 
 /// A node in the normalized HTML tree.
 #[derive(Debug, Clone, PartialEq, Eq)]

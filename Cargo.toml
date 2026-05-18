@@ -3,6 +3,10 @@ name = "twyla"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "twyla-render-page"
+path = "src/main.rs"
+
 [dependencies]
 # Pinned to typst main for the bundle export feature (multi-document output,
 # `#document(path)` + `#asset()`). Switch back to crates.io once 0.15 ships.
