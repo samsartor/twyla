@@ -79,15 +79,16 @@ crate gives us room to shape the output rather than living with the default.
 
 == Milestones
 
-+ *HTML-export prototype.* Pin a typst version. Write three throwaway
-  documents that exercise: heading + paragraph, `<div class="...">` with
-  arbitrary class control, inline raw SVG. Verify each survives HTML export
-  cleanly. If class control or raw-SVG injection is weak, the design
-  changes — find out now.
++ #strike[*HTML-export prototype.*] _Done — experiment 1 (and experiment 2
+  on main, which superseded it). Class control, metadata round-trip, asset
+  hook all confirmed._
 
-+ *AST-diff harness.* Standalone Rust binary that takes two HTML files and
-  reports structural equivalence (whitespace + attribute order normalized).
-  Reused throughout porting; written once.
++ #strike[*AST-diff harness.*] _Done — see the `twyla::diff` module
+  (`src/diff/`) and the `twyla-diff` CLI binary. 17 unit tests covering
+  identity, whitespace, attribute / class-token ordering, structural drift,
+  text / tag / attribute mismatches, comment dropping, and each of the three
+  relaxation rules. See the *AST diff harness* section below for the
+  relaxation framework._
 
 + *Port one page end-to-end.* Target: `guis-2`. Exercises TOML frontmatter,
   code blocks with syntax highlighting, tables with embedded shortcodes in
@@ -96,6 +97,67 @@ crate gives us room to shape the output rather than living with the default.
 
 + *Generalize.* Only after guis-2 matches: routing convention, asset
   collection, feed generation, dev server.
+
+== AST diff harness
+
+Module `twyla::diff`. CLI `twyla-diff <expected.html> <actual.html>`
+exits 0 on equivalence, 1 on drift (with a path + reason), 2 on usage error.
+
+*Default normalizations* (applied at parse time, no opt-in needed):
+
+- tag and attribute names lowercased
+- attributes sorted by name
+- `class` attribute tokens sorted alphabetically
+- whitespace runs in text nodes collapsed to a single space, then trimmed
+- pure-whitespace text nodes dropped (inter-block indentation)
+- comments dropped entirely (not just ignored at compare time)
+- text inside `<pre>`, `<code>`, `<script>`, `<style>`, `<textarea>` is
+  *preserved verbatim* — none of the above whitespace rules apply
+
+*Relaxation framework* (`src/diff/relax.rs`). A `RelaxConfig` is a list of
+`(Matcher, RelaxationRule)` pairs. First match wins. The default config has
+zero rules — porting starts strict.
+
+#table(
+  columns: (auto, 1fr),
+  table.header[*`Matcher` variant*][*Matches*],
+  [`Tag("p")`], [every `<p>` element],
+  [`TagAttr { tag, attr, value }`], [matching tag with `attr == value`],
+  [`TagAttrExists { tag, attr }`], [matching tag with `attr` set (any value)],
+)
+
+#table(
+  columns: (auto, 1fr),
+  table.header[*`RelaxationRule` variant*][*Effect*],
+  [`IgnoreEntirely`], [treat the subtree as equal regardless of content],
+  [`IgnoreAttribute(name)`], [skip that attribute on this element when comparing],
+  [`TextOnly`], [compare concatenated text only; ignore structure + attrs of children],
+)
+
+Adding a relaxation:
+
+```rust
+let cfg = RelaxConfig::new()
+    .relax(Matcher::Tag("pre".into()), RelaxationRule::TextOnly);
+```
+
+*Standing rule:* run new relaxations by Sam before adding them. The
+harness is the porting honesty mechanism — every relaxation is a place
+where twyla and zola diverge, and that divergence should be deliberate.
+
+*Capacities deliberately deferred:*
+
+- Per-section relaxations (different rules under different ancestors).
+- Multi-divergence reporting (today: bails on first divergence).
+- Attribute-value matchers (e.g. "ignore `style` only when it equals
+  `color: red`"). Add when a real porting case demands it.
+
+*Cross-checking against zola EXAMPLES.* Future task: rather than relying
+solely on samsartor.com, fetch a few real Zola sites from
+#link("https://github.com/getzola/zola/blob/master/EXAMPLES.md")[getzola's
+EXAMPLES] and run the same diff workflow against representative pages.
+Gives us a much broader test of feature coverage and surfaces zola
+behaviors the personal site doesn't exercise. Not yet started.
 
 == Findings — experiment 1 (2026-05-17)
 
