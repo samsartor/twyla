@@ -248,6 +248,100 @@ Three `#document(path, title: ..)` calls + one `#asset(path, bytes)` in
 - New crate: `typst-bundle` (pinned same rev).
 - New `Feature::Bundle` enum variant alongside `Feature::Html`.
 
+== Fork vs library: tracked decisions
+
+Standing assumption: *do not fork typst.* Build twyla as a Rust binary that
+consumes typst as a library, supplies a custom `World`, ships a small typst
+library of helper functions, and post-processes the bundle. If something is
+genuinely better as an upstream change, *upstream it* before forking. The
+fork threshold should be "library + upstreaming both proven inadequate."
+
+Why this default: typst's HTML/bundle work is actively evolving in main.
+A fork puts us permanently downstream of grammar, library, and HTML-output
+changes — that's a real maintenance tax, paid forever, for benefits that
+are mostly reachable from outside.
+
+Per-feature analysis below. If we ever hit a real wall, *update this table*
+with what we tried and why it didn't work — that's the evidence base for
+reconsidering.
+
+#table(
+  columns: (1fr, 1fr, 1fr, 0.75fr),
+  align: (left, left, left, center),
+  table.header[*Feature*][*Upstream-friendly path*][*Fork would buy us*][*Verdict*],
+
+  [Asset fingerprinting (e.g. `style.abc.css` + ref rewriting)],
+  [Post-export pass over bundle: walk `VirtualFs`, hash bytes, rewrite paths
+  in both HTML strings and asset names. Use html5ever for parsing.],
+  [Cleaner integration with introspector for ref resolution.],
+  [*Library*],
+
+  [Image optimization (AVIF/WebP, srcset, responsive sizes)],
+  [Twyla-provided `image(..)` function that bypasses typst's `image()`,
+  preprocesses bytes, emits `html.img(srcset: ..)` + `#asset(..)`.],
+  [Could replace typst's default `image()` behavior in HTML mode (currently
+  data-URL inlines).],
+  [*Library + maybe upstream*],
+
+  [Pretty URLs (`/post/foo/` not `/post/foo.html`)],
+  [Emit `#document("post/foo/index.html", ..)` in generated `main.typ`.],
+  [Nothing — equivalent.],
+  [*Library*],
+
+  [Path computation / lang prefixes / trailing-slash policy],
+  [All happens in our generated `main.typ` before compile.],
+  [Nothing — equivalent.],
+  [*Library*],
+
+  [HTML syntax mode (JSX-style `<div>..</div>`)],
+  [`html.div(class: "..")[..]` is already fine.],
+  [Minor ergonomic win, large maintenance cost (parser + AST + downstream
+  of all grammar evolution).],
+  [*No fork*],
+
+  [Hot reload / live preview],
+  [Inject WebSocket script into HTML during dev-server post-processing.],
+  [Nothing — wrong layer.],
+  [*Library*],
+
+  [RSS/Atom/sitemap generation],
+  [`#document("atom.xml", ..)` querying `bundle.introspector` for posts.],
+  [Nothing — wrong layer.],
+  [*Library*],
+
+  [Per-document smartquote / language / heading-offset control],
+  [Already configurable via `#set smartquote(..)` etc per document.],
+  [Possibly: nicer defaults for HTML mode. Worth upstreaming.],
+  [*Library or upstream*],
+
+  [Incremental compilation across watch cycles],
+  [Hold one `World` across runs; lean on comemo memoization.],
+  [Finer-grained invalidation hooks; persistent on-disk cache.],
+  [*Library; revisit if cold-start becomes a perf wall*],
+
+  [Reading file mtime / external metadata inside typst],
+  [Supply data via `sys.inputs` from Rust-side directory scan.],
+  [Direct filesystem stat exposure. Probably *bad* for sandboxing.],
+  [*Library*],
+
+  [Async / HTTP during compile (OpenGraph fetches, etc.)],
+  [Do it in Rust pre-compile, inject results via `sys.inputs`.],
+  [Async typst — large architectural change, probably never wanted.],
+  [*No fork*],
+)
+
+*Things we should at least keep an eye on for upstreaming:*
+
++ Optional hook for `image()` to emit external `src` instead of data URLs
+  in HTML mode — would benefit anyone doing HTML export at scale.
++ Per-document defaults override (e.g. default `smartquote(enabled: false)`
+  for a specific bundle target).
++ Introspector exposure of cross-document link resolution data, useful for
+  asset-fingerprinting passes.
+
+If we open issues for these, link them here so the next person reading this
+section can see whether the calculus has changed.
+
 == Notes
 
 - VCS: both `~/Src/twyla` and `~/Src/site` are managed with jj. *Rule:*
