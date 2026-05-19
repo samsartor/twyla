@@ -14,6 +14,14 @@ use crate::diff::{Element, Node};
 /// collapsing, no dropping of pure-whitespace children.
 const PRESERVE_TEXT_TAGS: &[&str] = &["pre", "code", "script", "style", "textarea"];
 
+/// Subset of `PRESERVE_TEXT_TAGS` whose pretty-printer artifact whitespace
+/// is dropped at parse time. `<script>`/`<style>` bodies are either external
+/// (src/href) and meant to be empty, or inline code where surrounding
+/// whitespace is semantically irrelevant. `<pre>`/`<code>`/`<textarea>` are
+/// not on this list — inter-token whitespace inside syntax-highlighted code
+/// is significant and must survive.
+const STRIP_WHITESPACE_NODES_TAGS: &[&str] = &["script", "style"];
+
 /// Parse an HTML document string into a normalized [`Node::Document`].
 ///
 /// Panics on malformed UTF-8. html5ever itself is permissive and will not
@@ -24,6 +32,11 @@ pub fn parse_html(s: &str) -> Node {
         ParseOpts {
             tree_builder: TreeBuilderOpts {
                 drop_doctype: false,
+                // Parse `<noscript>` contents as HTML elements rather than
+                // text. Otherwise zola's pretty-formatted `<link>` siblings
+                // and typst's tightly-packed siblings produce diverging text
+                // nodes despite being structurally identical.
+                scripting_enabled: false,
                 ..Default::default()
             },
             ..Default::default()
@@ -82,7 +95,17 @@ fn convert(handle: &Handle, preserve_text: bool) -> Option<Node> {
                 }
             }
 
-            let children = if !new_preserve {
+            // Non-preserve: drop text nodes that became empty after the
+            // whitespace collapse above. `<script>`/`<style>`: drop pure-
+            // whitespace text — typst's pretty-printer wraps even empty
+            // `<script src="...">` bodies in a newline+indent, but zola
+            // emits them as bare `<script></script>`. Other preserve-text
+            // tags (`<pre>`, `<code>`, `<textarea>`) keep all text including
+            // inter-token spaces, since syntax-highlighted code blocks emit
+            // significant whitespace between adjacent `<span>` tokens.
+            let children = if STRIP_WHITESPACE_NODES_TAGS.contains(&tag.as_str()) {
+                filter_pure_whitespace_text(children)
+            } else if !new_preserve {
                 filter_block_whitespace(children)
             } else {
                 children
@@ -123,6 +146,20 @@ fn filter_block_whitespace(nodes: Vec<Node>) -> Vec<Node> {
         .into_iter()
         .filter(|n| match n {
             Node::Text(t) => !t.is_empty(),
+            _ => true,
+        })
+        .collect()
+}
+
+/// Drop text nodes whose raw content is 100% ASCII whitespace. Significant
+/// text (anything containing non-whitespace) is left untouched, including
+/// its surrounding whitespace. Used inside preserve-text tags where the
+/// distinction matters.
+fn filter_pure_whitespace_text(nodes: Vec<Node>) -> Vec<Node> {
+    nodes
+        .into_iter()
+        .filter(|n| match n {
+            Node::Text(t) => t.chars().any(|c| !c.is_whitespace()),
             _ => true,
         })
         .collect()

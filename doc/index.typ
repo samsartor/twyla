@@ -146,10 +146,13 @@ Three CLI binaries + a shell driver, all in this repo:
 - *`twyla-render-page [--root <dir>] <entrypoint.typ>`* — compile as
   bundle, run resolution pass, print the single document's HTML.
 - *`twyla-extract <selector> <input.html>`* — print inner HTML of the
-  first matching element. Selectors: `class:<name>`, `tag:<name>`.
+  first matching element. Selectors: `class:<name>`, `tag:<name>`. Was
+  used to scope the diff to a body subtree; unused now that the diff
+  runs full-page. Kept until the second-page port confirms we don't need
+  it again.
 - *`twyla-diff [--textonly-pre] [--ignore-attr <tag>:<attr>]... <expected> <actual>`*
   — structural AST diff with optional porting relaxations.
-- *`port-page.sh`* — render + extract + diff for a single page.
+- *`port-page.sh`* — render + full-page diff for a single page.
   Hardcoded to guis-2; generalize when we port the second page.
 
 === AST diff harness (`twyla::diff`)
@@ -159,6 +162,21 @@ tags/attrs, sort attrs and class tokens, collapse inter-block whitespace,
 preserve `<pre>`/`<code>`/`<script>`/`<style>`/`<textarea>` text
 verbatim, drop comments), walks both trees in lockstep, reports the
 first structural divergence.
+
+Two parser quirks applied symmetrically to both sides — not opt-in
+relaxations, since they're tool artifacts on the typst side that
+correspond to no authorial intent on either:
+
+- `<noscript>` content is parsed as HTML, not text. html5ever defaults
+  to "scripting on," which turns noscript bodies into text nodes; we
+  flip `scripting_enabled: false`. Otherwise zola's pretty-formatted
+  `<link>` siblings diverge from typst's tightly-packed ones.
+- Pure-whitespace text inside `<script>`/`<style>` is dropped. Typst's
+  pretty-printer wraps even an empty `<script src="...">` body in a
+  newline + indent; zola emits `<script src="..."></script>`. Significant
+  text inside the same tags is left untouched. Doesn't apply to `<pre>`/
+  `<code>`/`<textarea>`, where inter-token whitespace inside highlighted
+  code is meaningful.
 
 Relaxations are opt-in `(Matcher, RelaxationRule)` pairs, first-match
 wins. Defaults to zero — porting starts strict.
@@ -192,11 +210,15 @@ divergence), attribute-value matchers ("ignore `style` only when value =
 + #strike[*HTML-export prototype*] — done (experiment 1).
 + #strike[*Multi-document bundle output*] — done (experiment 2).
 + #strike[*AST-diff harness*] — done (`twyla::diff`).
-+ #strike[*Port one page, body only (guis-2)*] — done. `port-page.sh`
-  matches under two relaxations: `--textonly-pre` (code blocks) and
-  `--ignore-attr td:style --ignore-attr th:style` (typst tables don't
-  emit alignment as CSS).
-+ *Port guis-2 full page* — base + page templates. Next.
++ #strike[*Port one page, body only (guis-2)*] — done. Two relaxations:
+  `--textonly-pre` (code blocks) and `--ignore-attr td:style --ignore-attr
+   th:style` (typst tables don't emit alignment as CSS).
++ #strike[*Port guis-2 full page*] — done. `templates/page.typ` in the
+  site repo ports `base.html` + `page.html` + `components.html::mainpills`;
+  `guis-2.typ` opens with `#show: page-template.with(url-path, title,
+  description, date, ...)`. Same two relaxations as the body milestone.
++ *Second page* — port `guis-1` or `guis-3` to validate the workflow
+  generalizes. Next.
 + *Generalize* — routing, asset pipeline, feed, dev server. After.
 
 == Roadmap
@@ -204,20 +226,18 @@ divergence), attribute-value matchers ("ignore `style` only when value =
 Working assumption: walk from "one page, body" outward, adding twyla
 infrastructure only when a porting case forces it.
 
-=== Near term — finish guis-2
+=== Near term
 
-+ *Page templates as typst functions.* Port `base.html` + `page.html` to
-  a typst module the user imports. The function takes `title`,
-  `description`, `body`, and any page-extra fields as parameters, emits
-  via `#show: page-template.with(..)`. Open: does twyla auto-apply
-  templates via its generated `main.typ` (saves the user one line per
-  page) or do we ask users to `#show: …` themselves (more honest, less
-  magic)? Resolve by writing the explicit version first; revisit when
-  the boilerplate-per-page hurts.
 + *Second page.* Port `guis-1` or `guis-3` to validate the workflow
-  generalizes. Will surface what was guis-2-specific in
-  `port-page.sh`/`shortcodes.typ` — drives the first round of
-  generalization.
+  generalizes. Will surface what was guis-2-specific in `port-page.sh`,
+  `shortcodes.typ`, and `page.typ` — drives the first round of
+  generalization. `_mainpills` in `page.typ` is already in place but
+  untested; a paper page will exercise it.
++ *Open: who applies the page template?* Today `guis-2.typ` opens with
+  `#show: page-template.with(..)` — explicit, one line of boilerplate
+  per page. Alternative: twyla's eventual generated `main.typ` auto-
+  applies a template per content file (less magic visible to the
+  author). Defer until enough pages exist that the boilerplate hurts.
 
 === Medium term — twyla becomes an SSG
 
@@ -257,7 +277,7 @@ infrastructure only when a porting case forces it.
   Should produce a corpus of `(zola-html, twyla-html, relaxations)`
   triples that we keep green on CI.
 
-== Lessons (from porting guis-2 body)
+== Lessons (from porting guis-2)
 
 Compact gotcha list; details in commits.
 
@@ -289,6 +309,16 @@ Compact gotcha list; details in commits.
 - *Typst `#let` chain-across-newlines hazard.* `#let f(s) = s\n
   .replace(..)` parses as identity-of-`s` with the dot-calls as orphan
   markup, no error. Wrap multi-line chains in `(…)`.
+- *Bypass typst's auto-`<head>`/`<body>` by emitting your own `<html>`.*
+  `finalize_dom` (typst-html/document.rs:252) short-circuits when the
+  single top-level element is `<html>` — uses ours verbatim, skipping
+  the default head. Cost: footnotes are unsupported in that mode.
+- *Reserved-word attrs need string keys.* `attrs: (as: "style", ...)`
+  is a parse error; `as` is reserved, `type` is a builtin. Quote them:
+  `("as": "style", "type": "...")`.
+- *`[#]` in markup is a parse error.* `#` starts a code expression, so
+  `[#]` opens an expression with no content. Escape as `[\#]` to emit a
+  literal hash character (used in the `description__hash` span).
 
 == Upstream-watch list
 
@@ -346,7 +376,8 @@ work — that's the evidence base for reconsidering.
   pages that use them.
 - Tera templates in scope: `base.html`, `page.html`, `section.html`,
   `index.html`, `components.html`, `404.html`, `atom.xml`,
-  `paperpills.html`.
+  `paperpills.html`. Phase 1 covered `base.html` + `page.html` +
+  `components.html::mainpills` (the last untested until a paper page).
 - Known porting hazards: ROT13-encoded email obfuscation in footer,
   conditional asset loading (`page.extra.tilings`), SVG inlining with
   font-family rewriting (handled by the `svg`/`diagram` shortcodes).
