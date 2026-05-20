@@ -139,21 +139,23 @@ it's pure post-processing of typst output, no internals touched.
 
 == Tooling
 
-=== Porting binaries
+=== Porting binary
 
-Three CLI binaries + a shell driver, all in this repo:
+Single `twyla` binary, clap-driven, three subcommands:
 
-- *`twyla-render-page [--root <dir>] <entrypoint.typ>`* — compile as
-  bundle, run resolution pass, print the single document's HTML.
-- *`twyla-extract <selector> <input.html>`* — print inner HTML of the
-  first matching element. Selectors: `class:<name>`, `tag:<name>`. Was
-  used to scope the diff to a body subtree; unused now that the diff
-  runs full-page. Kept until the second-page port confirms we don't need
-  it again.
-- *`twyla-diff [--textonly-pre] [--ignore-attr <tag>:<attr>]... <expected> <actual>`*
+- *`twyla render [--root <dir>] <entrypoint.typ>`* — compile as bundle,
+  run resolution pass, print the single document's HTML.
+- *`twyla diff [--textonly-pre] [--ignore-attr <tag>:<attr>]... <expected> <actual>`*
   — structural AST diff with optional porting relaxations.
-- *`port-page.sh`* — render + full-page diff for a single page.
-  Hardcoded to guis-2; generalize when we port the second page.
+- *`twyla port [--site-root <dir>]`* — render + full-page diff for a
+  single page. Today: hardcoded to guis-2 (entrypoint, expected HTML,
+  and relaxations baked in); becomes arg-driven when a second page lands.
+
+The render pipeline is exposed as a library function
+(`twyla::render::render_to_html`) so `port` calls it in-process. Diff
+likewise — no shell glue, no rebuild step. Earlier iterations shipped
+three separate bins (`twyla-render-page`, `twyla-diff`, `twyla-extract`)
+plus a `port-page.sh` driver; all consolidated.
 
 === AST diff harness (`twyla::diff`)
 
@@ -217,6 +219,10 @@ divergence), attribute-value matchers ("ignore `style` only when value =
   site repo ports `base.html` + `page.html` + `components.html::mainpills`;
   `guis-2.typ` opens with `#show: page-template.with(url-path, title,
   description, date, ...)`. Same two relaxations as the body milestone.
++ #strike[*CLI consolidation*] — done. Single clap-driven `twyla` binary
+  with `render`/`diff`/`port` subcommands; render pipeline exposed as a
+  library so `port` calls it in-process. Old triple-bin + shell driver
+  removed.
 + *Second page* — port `guis-1` or `guis-3` to validate the workflow
   generalizes. Next.
 + *Generalize* — routing, asset pipeline, feed, dev server. After.
