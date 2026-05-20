@@ -18,6 +18,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff, parse_html};
+use twyla::import::import_md;
 use twyla::render::render_to_html;
 
 #[derive(Parser)]
@@ -67,6 +68,18 @@ enum Cmd {
         /// `public/guis-2/index.html`.
         slug: String,
     },
+    /// Convert a zola markdown post to a typst draft on stdout.
+    ///
+    /// Best-effort scaffolding — handles the common shape of the
+    /// personal-site corpus (frontmatter, headings, paragraphs,
+    /// blockquotes, fenced code, links, centered/svg/image/diagram
+    /// shortcodes). Manual cleanup is expected for raw HTML, custom
+    /// shortcodes, and per-page link quirks. Pipe through `> foo.typ`
+    /// and iterate against `twyla check`.
+    Import {
+        /// Path to the source markdown file.
+        input: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -77,6 +90,27 @@ fn main() -> ExitCode {
             cmd_diff(textonly_pre, &ignore_attr, &expected, &actual)
         }
         Cmd::Check { site_root, slug } => cmd_check(site_root, &slug),
+        Cmd::Import { input } => cmd_import(&input),
+    }
+}
+
+fn cmd_import(input: &Path) -> ExitCode {
+    let src = match std::fs::read_to_string(input) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error reading {}: {e}", input.display());
+            return ExitCode::from(2);
+        }
+    };
+    match import_md(&src) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::from(0)
+        }
+        Err(e) => {
+            eprintln!("import error: {e}");
+            ExitCode::from(1)
+        }
     }
 }
 

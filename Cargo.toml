@@ -20,3 +20,7 @@ ecow = "0.2"
 # HTML AST diff harness (porting verification)
 html5ever = "0.39"
 markup5ever_rcdom = "0.39"
+
+# Markdown → typst draft generator (`twyla import`).
+pulldown-cmark = { version = "0.13", default-features = false }
+toml = "0.9"

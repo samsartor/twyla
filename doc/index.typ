@@ -152,8 +152,12 @@ Single `twyla` binary, clap-driven, three subcommands:
   `content/<slug>.typ` vs `public/<slug>/index.html`. Relaxations are
   the cumulative universal set found across ported pages so far
   (`textonly-pre`, `ignore-attr td/th:style`); no per-page config yet.
-  Anticipated companion verb: `twyla import <md>` for md→typ porting
-  scaffolding — separate from `check`, no shared story.
+- *`twyla import <md>`* — best-effort md→typ draft generator on stdout.
+  Pulldown-cmark walk plus a shortcode pre/postprocess pass; handles
+  the common shape of the personal-site corpus. Two manual fixes per
+  page (`_page-url` and `url-path` placeholders); raw HTML and unusual
+  shortcodes get a `// TODO twyla-import: …` comment. Separate verb
+  from `check` — no shared story.
 
 The render pipeline is exposed as a library function
 (`twyla::render::render_to_html`) so `check` calls it in-process. Diff
@@ -236,14 +240,12 @@ divergence), attribute-value matchers ("ignore `style` only when value =
   (zola layout is the manifest; relaxations are universal defaults).
   Two new porting hazards surfaced (below): typst paragraph-wrap of
   bare inline elements, and zola's anchor-only-link absolutization.
-+ *Port guis-1 via `twyla import`* — the next page is the use case
-  forcing the md→typ porting helper. ~2500-line zola output, but
-  structurally similar to guis-2/guis-3 — manual line-by-line port is
-  the wrong tool. Build a one-shot pulldown-cmark → typst draft
-  generator that handles the common shape (headings, paragraphs,
-  blockquotes, fenced code, shortcodes, links), emits a `.typ.draft`,
-  and leaves manual cleanups (link rules, raw HTML quirks, the
-  anchor-wrap thing) to the porter.
++ #strike[*Port guis-1 via `twyla import`*] — done. Import generated a
+  near-complete draft; two iterations on the import binary itself
+  (centered-block trailing whitespace causing nested `<p>`s,
+  ordered-list `<ol>` vs `<ul>` from `Tag::List(Some(_))`) then a
+  two-line manual fixup (`_page-url` + `url-path` placeholders) got
+  it to match zola.
 + *Generalize* — routing, asset pipeline, feed, dev server. After.
 
 == Roadmap
@@ -253,14 +255,16 @@ infrastructure only when a porting case forces it.
 
 === Near term
 
-+ *`twyla import <md>`.* One-shot pulldown-cmark → typst draft
-  generator. Handles the common shape (frontmatter → `page-template`
-  invocation, headings → `h1`/`h2` helpers with auto-slug, paragraphs,
-  blockquotes, fenced code, shortcodes, internal/external links), emits
-  a `.typ.draft`. Doesn't try to be a maintained md↔typ sync —
-  shortcodes and raw HTML are too varied to chase in a converter. Path:
-  draft → manual cleanup → `twyla check` until green. First customer:
-  guis-1 (~2500-line zola output, would be miserable to hand-port).
++ #strike[*`twyla import <md>`.*] — done. Pulldown-cmark walk + a
+  shortcode pre/postprocess pass (HTML-comment markers around
+  `{% … %}` / `{{ … }}` so pulldown emits them as discrete `Html`
+  events). Coverage: frontmatter → `page-template` boilerplate,
+  ATX headings → `h1`/`h2` helpers + slug, paragraphs, blockquotes,
+  ATX rules, lists (ordered + unordered), fenced/inline code, links
+  (external + anchor + root-relative), emphasis/strong, the four
+  ported shortcodes (`centered`/`svg`/`image`/`diagram`). Unknown
+  tags/shortcodes get a `// TODO twyla-import: …` flag. Two
+  placeholders the porter fills (`_page-url`, `url-path`).
 + *Open: who applies the page template?* Today `guis-2.typ` /
   `guis-3.typ` open with `#show: page-template.with(..)` — explicit,
   one line of boilerplate per page. Alternative: twyla's eventual
@@ -311,7 +315,7 @@ infrastructure only when a porting case forces it.
   Should produce a corpus of `(zola-html, twyla-html, relaxations)`
   triples that we keep green on CI.
 
-== Lessons (from porting guis-2 + guis-3)
+== Lessons (from porting guis-1 + guis-2 + guis-3)
 
 Compact gotcha list; details in commits.
 
