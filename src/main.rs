@@ -6,10 +6,11 @@
 //!   resolved HTML to stdout.
 //! - `twyla diff [--textonly-pre] [--ignore-attr <tag>:<attr>]...
 //!   <expected.html> <actual.html>` — structural AST diff.
-//! - `twyla port [--site-root <dir>]` — render `<site>/content/guis-2.typ`
-//!   and diff against `<site>/public/guis-2/index.html` under the porting
-//!   relaxations. Hardcoded to guis-2 today; grows arguments when more
-//!   pages land.
+//! - `twyla check [--site-root <dir>] <slug>` — render
+//!   `<site>/content/<slug>.typ` and diff against
+//!   `<site>/public/<slug>/index.html` under the porting relaxations. Zola
+//!   layout is inferred from `<slug>`; per-page relaxations are the
+//!   universal defaults today (see `cmd_check`).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -52,12 +53,19 @@ enum Cmd {
         expected: PathBuf,
         actual: PathBuf,
     },
-    /// Render guis-2.typ and diff against the zola-built version.
-    Port {
+    /// Render a ported page and diff it against the zola-built version.
+    ///
+    /// Zola's content/public layout is the manifest: given a slug, the
+    /// inputs are `<site>/content/<slug>.typ` and
+    /// `<site>/public/<slug>/index.html`. No per-page configuration today.
+    Check {
         /// Site repo root (zola side). Defaults to `$SITE_ROOT` then
         /// `$HOME/Src/site`.
         #[arg(long, env = "SITE_ROOT")]
         site_root: Option<PathBuf>,
+        /// Page slug — `guis-2` for `content/guis-2.typ` and
+        /// `public/guis-2/index.html`.
+        slug: String,
     },
 }
 
@@ -68,7 +76,7 @@ fn main() -> ExitCode {
         Cmd::Diff { textonly_pre, ignore_attr, expected, actual } => {
             cmd_diff(textonly_pre, &ignore_attr, &expected, &actual)
         }
-        Cmd::Port { site_root } => cmd_port(site_root),
+        Cmd::Check { site_root, slug } => cmd_check(site_root, &slug),
     }
 }
 
@@ -151,10 +159,14 @@ fn cmd_diff(
     }
 }
 
-/// `port-page.sh`'s workflow, in-process. Today: guis-2 only — entrypoint
-/// path, zola output path, and relaxations are hardcoded. When we port a
-/// second page these become arguments.
-fn cmd_port(site_root: Option<PathBuf>) -> ExitCode {
+/// Render `<site>/content/<slug>.typ` and diff against
+/// `<site>/public/<slug>/index.html` under the porting relaxations.
+///
+/// Relaxations applied are the cumulative set found necessary across pages
+/// ported so far. New ones get added here (after Sam-approves the
+/// divergence) until enough pages need page-specific overrides to justify
+/// a manifest.
+fn cmd_check(site_root: Option<PathBuf>, slug: &str) -> ExitCode {
     let site_root = match resolve_site_root(site_root) {
         Ok(p) => p,
         Err(e) => {
@@ -163,8 +175,8 @@ fn cmd_port(site_root: Option<PathBuf>) -> ExitCode {
         }
     };
 
-    let entrypoint = site_root.join("content/guis-2.typ");
-    let zola_html_path = site_root.join("public/guis-2/index.html");
+    let entrypoint = site_root.join(format!("content/{slug}.typ"));
+    let zola_html_path = site_root.join(format!("public/{slug}/index.html"));
 
     eprintln!(">>> rendering {}", entrypoint.display());
     let typst_html = match render_to_html(&site_root, &entrypoint) {
@@ -183,11 +195,12 @@ fn cmd_port(site_root: Option<PathBuf>) -> ExitCode {
         }
     };
 
-    // Hardcoded porting relaxations for guis-2.
-    // - `<pre>` blocks differ in syntax-highlighter span structure but
-    //   match as concatenated text (see `doc/index.typ` § Lessons).
-    // - typst `#table(align: ..)` is layout-only; zola emits per-cell
-    //   `style="text-align:.."`. Ignore that style on td/th.
+    // Universal relaxations — each is a known structural divergence
+    // between typst's HTML export and zola's pulldown+tera output. See
+    // `doc/index.typ` § Lessons for the full reasoning per item.
+    // - `<pre>`: zola syntect spans vs typst's verbatim text body.
+    // - `td`/`th` `style`: typst `#table(align: ..)` is layout-only and
+    //   doesn't reflect into per-cell `style="text-align:.."`.
     let cfg = RelaxConfig::new()
         .relax(Matcher::Tag("pre".to_string()), RelaxationRule::TextOnly)
         .relax(

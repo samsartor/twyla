@@ -147,15 +147,24 @@ Single `twyla` binary, clap-driven, three subcommands:
   run resolution pass, print the single document's HTML.
 - *`twyla diff [--textonly-pre] [--ignore-attr <tag>:<attr>]... <expected> <actual>`*
   — structural AST diff with optional porting relaxations.
-- *`twyla port [--site-root <dir>]`* — render + full-page diff for a
-  single page. Today: hardcoded to guis-2 (entrypoint, expected HTML,
-  and relaxations baked in); becomes arg-driven when a second page lands.
+- *`twyla check [--site-root <dir>] <slug>`* — render + full-page diff
+  for a ported page. Inputs inferred from zola's layout:
+  `content/<slug>.typ` vs `public/<slug>/index.html`. Relaxations are
+  the cumulative universal set found across ported pages so far
+  (`textonly-pre`, `ignore-attr td/th:style`); no per-page config yet.
+  Anticipated companion verb: `twyla import <md>` for md→typ porting
+  scaffolding — separate from `check`, no shared story.
 
 The render pipeline is exposed as a library function
-(`twyla::render::render_to_html`) so `port` calls it in-process. Diff
+(`twyla::render::render_to_html`) so `check` calls it in-process. Diff
 likewise — no shell glue, no rebuild step. Earlier iterations shipped
 three separate bins (`twyla-render-page`, `twyla-diff`, `twyla-extract`)
 plus a `port-page.sh` driver; all consolidated.
+
+`check` stays zola-specific by design; the eventual EXAMPLES-corpus
+verifier may want a manifest, but with one site the directory layout
+*is* the manifest. Revisit when ≥ 5 pages need page-specific overrides
+or when adding a second corpus.
 
 === AST diff harness (`twyla::diff`)
 
@@ -223,8 +232,18 @@ divergence), attribute-value matchers ("ignore `style` only when value =
   with `render`/`diff`/`port` subcommands; render pipeline exposed as a
   library so `port` calls it in-process. Old triple-bin + shell driver
   removed.
-+ *Second page* — port `guis-1` or `guis-3` to validate the workflow
-  generalizes. Next.
++ #strike[*Port guis-3*] — done. `port` generalized to `check <slug>`
+  (zola layout is the manifest; relaxations are universal defaults).
+  Two new porting hazards surfaced (below): typst paragraph-wrap of
+  bare inline elements, and zola's anchor-only-link absolutization.
++ *Port guis-1 via `twyla import`* — the next page is the use case
+  forcing the md→typ porting helper. ~2500-line zola output, but
+  structurally similar to guis-2/guis-3 — manual line-by-line port is
+  the wrong tool. Build a one-shot pulldown-cmark → typst draft
+  generator that handles the common shape (headings, paragraphs,
+  blockquotes, fenced code, shortcodes, links), emits a `.typ.draft`,
+  and leaves manual cleanups (link rules, raw HTML quirks, the
+  anchor-wrap thing) to the porter.
 + *Generalize* — routing, asset pipeline, feed, dev server. After.
 
 == Roadmap
@@ -234,16 +253,25 @@ infrastructure only when a porting case forces it.
 
 === Near term
 
-+ *Second page.* Port `guis-1` or `guis-3` to validate the workflow
-  generalizes. Will surface what was guis-2-specific in `port-page.sh`,
-  `shortcodes.typ`, and `page.typ` — drives the first round of
-  generalization. `_mainpills` in `page.typ` is already in place but
-  untested; a paper page will exercise it.
-+ *Open: who applies the page template?* Today `guis-2.typ` opens with
-  `#show: page-template.with(..)` — explicit, one line of boilerplate
-  per page. Alternative: twyla's eventual generated `main.typ` auto-
-  applies a template per content file (less magic visible to the
-  author). Defer until enough pages exist that the boilerplate hurts.
++ *`twyla import <md>`.* One-shot pulldown-cmark → typst draft
+  generator. Handles the common shape (frontmatter → `page-template`
+  invocation, headings → `h1`/`h2` helpers with auto-slug, paragraphs,
+  blockquotes, fenced code, shortcodes, internal/external links), emits
+  a `.typ.draft`. Doesn't try to be a maintained md↔typ sync —
+  shortcodes and raw HTML are too varied to chase in a converter. Path:
+  draft → manual cleanup → `twyla check` until green. First customer:
+  guis-1 (~2500-line zola output, would be miserable to hand-port).
++ *Open: who applies the page template?* Today `guis-2.typ` /
+  `guis-3.typ` open with `#show: page-template.with(..)` — explicit,
+  one line of boilerplate per page. Alternative: twyla's eventual
+  generated `main.typ` auto-applies a template per content file (less
+  magic visible to the author). Defer until enough pages exist that
+  the boilerplate hurts.
++ *Open: link show rule home.* Each ported page repeats the same
+  external-link + anchor-link show rule, parameterized on `_page-url`.
+  Pull into `page.typ` once we have three pages and a non-guessed
+  config layer for the page URL. The anchor absolutization is a zola/
+  pulldown quirk we may not want to keep once the site is fully ported.
 
 === Medium term — twyla becomes an SSG
 
@@ -283,7 +311,7 @@ infrastructure only when a porting case forces it.
   Should produce a corpus of `(zola-html, twyla-html, relaxations)`
   triples that we keep green on CI.
 
-== Lessons (from porting guis-2)
+== Lessons (from porting guis-2 + guis-3)
 
 Compact gotcha list; details in commits.
 
@@ -325,6 +353,30 @@ Compact gotcha list; details in commits.
 - *`[#]` in markup is a parse error.* `#` starts a code expression, so
   `[#]` opens an expression with no content. Escape as `[\#]` to emit a
   literal hash character (used in the `description__hash` span).
+- *Pulldown auto-slugifies headings; typst's `=` doesn't.* For zola
+  parity each section heading needs an explicit `id`. The slug rule is
+  lowercase + non-alnum → `-`. Wrap with a tiny `#let h1(id, body) =
+  html.elem("h1", attrs: (id: id), body)` helper per page; promote to
+  the template once we have a slugify routine.
+- *Inline `<br>` is auto-paragraph-wrapped.* `#html.br()` on its own
+  line produces `<p><br></p>` — typst treats `<br>` as inline content.
+  `<hr>` is block, so `#html.hr()` doesn't wrap. For a bare sibling
+  `<br>` (zola/pulldown emits this between adjacent block shortcodes),
+  splice via `raw-html("<br>")`.
+- *Anchor-wrapping-block + soft-break + empty `<a>`.* Pulldown can't
+  nest a block inside an inline `<a>`, so `<a>[fenced code]</a>` in MD
+  emits broken HTML (`<p>text\n<a></p><pre>..</pre></a>`) that
+  html5ever then adoption-agencies into "empty `<a>` trapped in the
+  prior `<p>`, sibling `<a>` reconstructed around the `<pre>`". Two
+  typst hazards block clean reproduction: `#html.a()` outside a
+  paragraph gets `<p>`-wrapped, and a soft break before any inline
+  element injects a `<span style="white-space: pre-wrap">` to preserve
+  whitespace. Easiest fix: splice both halves via `raw-html`.
+- *Zola absolutizes anchor-only links.* `[text](#frag)` in MD becomes
+  `<a href="<base_url>/<slug>/#frag">` in zola output, not
+  `href="#frag"`. Extend the link show rule to prepend a per-page
+  `_page-url`. Hardcoded for now; lift into `page.typ` once twyla has
+  a config layer.
 
 == Upstream-watch list
 
@@ -343,6 +395,13 @@ Worth raising upstream (or watching for) on typst:
   `smartquote(enabled: false)` declared once).
 + Introspector exposure of cross-document link resolution data — useful
   for fingerprint-then-rewrite passes.
++ Opt-out for the paragraph auto-wrap of bare inline elements (`<br>`,
+  empty `<a>`, etc.) when they appear at block context. Today the only
+  escape is to splice via raw-html — fine as a workaround, ugly when the
+  motivation is just "don't put this in a `<p>`."
++ Suppress the `<span style="white-space: pre-wrap">` whitespace shim
+  in HTML output. Useful for SVG/serif typography, but for porting
+  parity with non-typst HTML it's pure noise.
 
 == Fork vs library
 
