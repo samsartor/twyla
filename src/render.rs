@@ -19,7 +19,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use typst::diag::{FileError, FileResult, Warned};
+use typst::diag::{FileError, FileResult, SourceDiagnostic, Warned};
 use typst::foundations::{Bytes, Datetime, Duration};
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
@@ -85,7 +85,10 @@ pub fn render_to_html(root: &Path, entrypoint: &Path) -> Result<String, RenderEr
     }
 
     let bundle = output.map_err(|errors| RenderError {
-        messages: errors.iter().map(|e| format!("error: {}", e.message)).collect(),
+        messages: errors
+            .iter()
+            .map(|e| format_diagnostic(&world, e))
+            .collect(),
         kind: RenderErrorKind::Compile,
     })?;
 
@@ -119,7 +122,10 @@ pub fn render_to_html(root: &Path, entrypoint: &Path) -> Result<String, RenderEr
     };
 
     let raw_html = typst_html::html(doc).map_err(|errors| RenderError {
-        messages: errors.iter().map(|e| format!("error: {}", e.message)).collect(),
+        messages: errors
+            .iter()
+            .map(|e| format_diagnostic(&world, e))
+            .collect(),
         kind: RenderErrorKind::Compile,
     })?;
 
@@ -204,6 +210,35 @@ impl RenderWorld {
             _ => FileError::Other(Some(e.to_string().into())),
         })
     }
+}
+
+/// Format a typst diagnostic with the file path and line/col of the
+/// reported span — the default `e.message` omits both, which makes the
+/// "expected string, found content" kind of message hard to act on.
+fn format_diagnostic(world: &dyn World, e: &SourceDiagnostic) -> String {
+    let span = e.span;
+    let Some(id) = span.id() else {
+        return format!("error: {}", e.message);
+    };
+    let Ok(src) = world.source(id) else {
+        return format!("error: {}", e.message);
+    };
+    let Some(range) = src.range(span) else {
+        return format!("error: {}", e.message);
+    };
+    // line/col of the start of the range.
+    let (line, col) = src
+        .lines()
+        .byte_to_line_column(range.start)
+        .unwrap_or((0, 0));
+    let path = id.vpath().get_without_slash();
+    format!(
+        "error: {} ({}:{}:{})",
+        e.message,
+        path,
+        line + 1,
+        col + 1
+    )
 }
 
 fn file_id_for(root: &Path, path: &Path) -> Result<FileId, String> {

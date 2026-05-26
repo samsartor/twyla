@@ -154,10 +154,10 @@ Single `twyla` binary, clap-driven, three subcommands:
   (`textonly-pre`, `ignore-attr td/th:style`); no per-page config yet.
 - *`twyla import <md>`* — best-effort md→typ draft generator on stdout.
   Pulldown-cmark walk plus a shortcode pre/postprocess pass; handles
-  the common shape of the personal-site corpus. Two manual fixes per
-  page (`_page-url` and `url-path` placeholders); raw HTML and unusual
-  shortcodes get a `// TODO twyla-import: …` comment. Separate verb
-  from `check` — no shared story.
+  the common shape of the personal-site corpus. One manual fix per
+  page (`url-path` placeholder); raw HTML and unusual shortcodes get
+  a `// TODO twyla-import: …` comment. Separate verb from `check` —
+  no shared story.
 
 The render pipeline is exposed as a library function
 (`twyla::render::render_to_html`) so `check` calls it in-process. Diff
@@ -271,11 +271,15 @@ infrastructure only when a porting case forces it.
   generated `main.typ` auto-applies a template per content file (less
   magic visible to the author). Defer until enough pages exist that
   the boilerplate hurts.
-+ *Open: link show rule home.* Each ported page repeats the same
-  external-link + anchor-link show rule, parameterized on `_page-url`.
-  Pull into `page.typ` once we have three pages and a non-guessed
-  config layer for the page URL. The anchor absolutization is a zola/
-  pulldown quirk we may not want to keep once the site is fully ported.
++ #strike[*Open: link show rule home.*] — done. The external-link +
+  anchor-link rule lives in `page-template`, which derives `_page-url`
+  from `url-path` (strip `.html`, prepend `_base-url`, append `/`).
+  Same scope grew to cover `set smartquote(enabled: true)` and the
+  heading auto-slugifier (`show heading: it => html.elem("h" + level,
+  attrs: (id: slug), it.body)` with a small `_text-of` + `_slugify`
+  pair in the template). Net: a ported page's prelude is now three
+  lines (two imports + `#show: page-template.with(..)`); `= Heading`
+  syntax replaces `#h1("slug")[..]` helpers.
 
 === Medium term — twyla becomes an SSG
 
@@ -358,10 +362,18 @@ Compact gotcha list; details in commits.
   `[#]` opens an expression with no content. Escape as `[\#]` to emit a
   literal hash character (used in the `description__hash` span).
 - *Pulldown auto-slugifies headings; typst's `=` doesn't.* For zola
-  parity each section heading needs an explicit `id`. The slug rule is
-  lowercase + non-alnum → `-`. Wrap with a tiny `#let h1(id, body) =
-  html.elem("h1", attrs: (id: id), body)` helper per page; promote to
-  the template once we have a slugify routine.
+  parity each section heading needs an explicit `id`. Solved by a
+  `show heading` rule in `page-template` that emits `<h{level}
+  id="<slug>">..</h{level}>`. With that, plain `= Heading` / `==
+  Heading` markup matches zola's output. Two more notes from the
+  cleanup: in HTML mode typst-html shifts `=` to `<h2>` by default
+  (the document title takes `<h1>`); a show rule using `it.level`
+  bypasses that. And labels: `= Foo <bar>` sets `id="bar"` and
+  `#link(<bar>)[anchor text]` works without `set heading(numbering:
+  ..)` — `@bar` is the form that needs numbering (for the auto-
+  generated reference text). Labels could replace text-slugs for
+  cross-doc references once the corpus has drifted from zola; for now,
+  matching zola slugs is what we need.
 - *Inline `<br>` is auto-paragraph-wrapped.* `#html.br()` on its own
   line produces `<p><br></p>` — typst treats `<br>` as inline content.
   `<hr>` is block, so `#html.hr()` doesn't wrap. For a bare sibling

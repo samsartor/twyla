@@ -324,16 +324,12 @@ impl<'a> Walker<'a> {
             TagEnd::Heading(_) => {
                 self.stack.pop();
                 if let Some(h) = self.heading.take() {
-                    let slug = slugify(&h.text);
-                    let helper = match h.level {
-                        HeadingLevel::H1 => "h1",
-                        HeadingLevel::H2 => "h2",
-                        HeadingLevel::H3 => "h3",
-                        HeadingLevel::H4 => "h4",
-                        HeadingLevel::H5 => "h5",
-                        HeadingLevel::H6 => "h6",
-                    };
-                    writeln!(self.out, "#{helper}(\"{slug}\")[{}]\n", h.text).unwrap();
+                    // `page.typ`'s `show heading` rule slugifies the
+                    // heading text into an `id=`, matching pulldown's
+                    // auto-ID behavior. Plain `= ..` / `== ..` is all
+                    // we need to emit; no helper, no explicit slug.
+                    let prefix = "=".repeat(h.level as usize);
+                    writeln!(self.out, "{prefix} {}\n", h.text).unwrap();
                 }
             }
             TagEnd::BlockQuote(_) => {
@@ -508,26 +504,6 @@ fn split_top_commas(s: &str) -> Vec<&str> {
 
 // ---- helpers -------------------------------------------------------------
 
-fn slugify(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last_dash = true;
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() {
-            for lc in c.to_lowercase() {
-                out.push(lc);
-            }
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
-}
-
 fn escape_typst_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -536,33 +512,12 @@ fn escape_typst_string(s: &str) -> String {
 
 fn assemble(meta: &Meta, body: &str) -> String {
     let mut out = String::new();
-    writeln!(out, "// twyla-import draft. Manual cleanup expected.").unwrap();
-    writeln!(out, "//").unwrap();
-    writeln!(out, "// Per-page hand-fixes likely needed:").unwrap();
-    writeln!(out, "// - URL path / slug in `page-template.with(..)`").unwrap();
-    writeln!(out, "// - `_page-url` for anchor-link absolutization").unwrap();
-    writeln!(out, "// - any raw-HTML sections flagged TODO below").unwrap();
+    writeln!(out, "// twyla-import draft. Manual cleanup expected:").unwrap();
+    writeln!(out, "// - fill in `url-path` (replace PAGE-SLUG)").unwrap();
+    writeln!(out, "// - inspect any `// TODO twyla-import:` markers below").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "#import \"/templates/shortcodes.typ\": *").unwrap();
     writeln!(out, "#import \"/templates/page.typ\": page-template").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "#set smartquote(enabled: true)").unwrap();
-    writeln!(out).unwrap();
-    writeln!(
-        out,
-        "#let _page-url = \"https://samsartor.com/PAGE-SLUG/\" // TODO twyla-import: real slug"
-    )
-    .unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "#show link: it => {{").unwrap();
-    writeln!(out, "  if type(it.dest) == str {{").unwrap();
-    writeln!(out, "    if it.dest.starts-with(\"http://\") or it.dest.starts-with(\"https://\") {{").unwrap();
-    writeln!(out, "      html.a(href: it.dest, rel: (\"noopener\", \"external\"), target: \"_blank\", it.body)").unwrap();
-    writeln!(out, "    }} else if it.dest.starts-with(\"#\") {{").unwrap();
-    writeln!(out, "      html.a(href: _page-url + it.dest, it.body)").unwrap();
-    writeln!(out, "    }} else {{ it }}").unwrap();
-    writeln!(out, "  }} else {{ it }}").unwrap();
-    writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "#show: page-template.with(").unwrap();
     writeln!(out, "  url-path: \"PAGE-SLUG.html\", // TODO twyla-import").unwrap();
@@ -587,22 +542,6 @@ fn assemble(meta: &Meta, body: &str) -> String {
     }
     writeln!(out, ")").unwrap();
     writeln!(out).unwrap();
-    writeln!(
-        out,
-        "// Slug helpers — pulldown auto-IDs headings, typst doesn't."
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "#let h1(id, body) = html.elem(\"h1\", attrs: (id: id), body)"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "#let h2(id, body) = html.elem(\"h2\", attrs: (id: id), body)"
-    )
-    .unwrap();
-    writeln!(out).unwrap();
     out.push_str(body);
     out
 }
@@ -610,12 +549,6 @@ fn assemble(meta: &Meta, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn slug_basic() {
-        assert_eq!(slugify("Category 1: Concurrency"), "category-1-concurrency");
-        assert_eq!(slugify("Single-threaded Execution"), "single-threaded-execution");
-    }
 
     #[test]
     fn frontmatter_split() {
