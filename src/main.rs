@@ -1,16 +1,18 @@
 //! `twyla` — the CLI.
 //!
-//! Subcommands:
+//! Two audiences. End-user (zero-flag, cwd-driven):
 //!
-//! - `twyla render [--site-root <dir>] <slug>` — compile a single page
-//!   from `<site>/content/<slug>.typ` and print resolved HTML.
-//! - `twyla diff [--textonly-pre] [--ignore-attr <tag>:<attr>]...
-//!   <expected.html> <actual.html>` — structural AST diff.
-//! - `twyla check [--site-root <dir>] <slug>` — render
-//!   `<site>/content/<slug>.typ` and diff against
+//! - `twyla serve` — dev server on port 1111.
+//!
+//! Porting harness (flag-driven):
+//!
+//! - `twyla render [--site-root <dir>] <slug>` — compile a single page.
+//! - `twyla check  [--site-root <dir>] <slug>` — render + diff against
 //!   `<site>/public/<slug>/index.html` under the porting relaxations.
+//! - `twyla diff   <expected> <actual>` — structural AST diff.
 //! - `twyla import <md>` — md→typ draft generator.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -19,6 +21,7 @@ use clap::{Parser, Subcommand};
 use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff, parse_html};
 use twyla::import::import_md;
 use twyla::render::render_slug;
+use twyla::serve::{Serve, run as serve_run};
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +36,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Start the dev server. Zero flags — operates on the current
+    /// working directory. Binds to port 1111.
+    Serve,
     /// Compile a single page, run the resolution pass, print HTML.
     Render {
         /// Site repo root. Defaults to `$SITE_ROOT` then `$HOME/Src/site`.
@@ -83,12 +89,39 @@ enum Cmd {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Serve => cmd_serve(),
         Cmd::Render { site_root, slug } => cmd_render(site_root, &slug),
         Cmd::Diff { textonly_pre, ignore_attr, expected, actual } => {
             cmd_diff(textonly_pre, &ignore_attr, &expected, &actual)
         }
         Cmd::Check { site_root, slug } => cmd_check(site_root, &slug),
         Cmd::Import { input } => cmd_import(&input),
+    }
+}
+
+fn cmd_serve() -> ExitCode {
+    let site_root = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cannot read current directory: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if !site_root.join("content").is_dir() {
+        eprintln!(
+            "error: no `content/` directory under {} — run `twyla serve` \
+             from the project root.",
+            site_root.display(),
+        );
+        return ExitCode::from(2);
+    }
+    let addr: SocketAddr = "127.0.0.1:1111".parse().unwrap();
+    match serve_run(Serve { site_root, addr }) {
+        Ok(()) => ExitCode::from(0),
+        Err(e) => {
+            eprintln!("serve error: {e}");
+            ExitCode::from(1)
+        }
     }
 }
 
