@@ -54,11 +54,35 @@ per emitted HTML file. Cross-document links use labels; typst computes
 relative paths automatically. `#asset(path, bytes)` writes raw files into
 the same bundle output.
 
-Twyla's job, eventually: scan `content/*.typ`, generate a `main.typ` in
-memory that emits one `#document(..)` per source file (path derived from
-filesystem layout with `metadata()` override), compile the bundle,
-post-process. Today the render binary handles a single user-supplied
-entrypoint at a time, no scan-and-generate yet.
+Every compile goes through a synthesized virtual `main.typ` — never on
+disk, just an in-memory `Source` pre-populated in the `World` cache at
+`/__twyla_main.typ`. Twyla scans `cwd/content/*.typ`, derives a slug per
+file from its stem (`foo.typ` → `/foo/`), and emits one `#document(..)`
+call per slug. The single-page case (`render_slug`, used by `check`,
+`render`, and dev-server per-request compile) is the same machinery
+with one entry.
+
+Per-document routing context is carried via a labelled metadata
+marker. The generated main inserts `#metadata((url-path: "foo"))
+<twyla-page>` inside each document body; `page-template` reads its own
+slug with `context query(<twyla-page>).first().value.url-path`. The
+query is *per-document scope* — each routed output sees only its own
+marker, verified by `render_site_smoke` in `tests`. This is the
+load-bearing pattern; everything else that needs per-document data
+from twyla into typst (title for `<head>`, date for feed entries,
+etc.) will reuse the same shape.
+
+Bundle output paths *are* URLs: `#document("foo/index.html")` lands a
+file at `foo/index.html` in the build output. The dev server reads
+`bundle.files`; `twyla build` writes them under `output_dir/`.
+
+Single-document files are *not* valid entrypoints anymore — content
+files no longer call `#document(..)` themselves (the template did,
+previously). Twyla owns routing now.
+
+Underscore-prefixed names are reserved for special routes: `_index.typ`
+(home / section index) and drafts. Today everything `_*` is skipped;
+home-page wiring is the next revision.
 
 === Asset model
 
@@ -139,31 +163,47 @@ it's pure post-processing of typst output, no internals touched.
 
 == Tooling
 
-=== Porting binary
+Single `twyla` binary, clap-driven. Two audiences.
 
-Single `twyla` binary, clap-driven, three subcommands:
+=== End-user commands (turn-key, cwd-driven)
 
-- *`twyla render [--root <dir>] <entrypoint.typ>`* — compile as bundle,
-  run resolution pass, print the single document's HTML.
-- *`twyla diff [--textonly-pre] [--ignore-attr <tag>:<attr>]... <expected> <actual>`*
-  — structural AST diff with optional porting relaxations.
+- *`twyla serve`* — dev server on `127.0.0.1:1111`. Zero flags. Routes
+  `/<slug>/` to `render_slug`, falls back to `cwd/static/` then
+  `cwd/content/` (zola colocated-asset convention) for everything
+  else. `/` is a placeholder index until the home page is wired.
+  Single-threaded accept loop, hand-rolled HTTP/1.1 over `std::net`
+  — no async, no extra deps. No watch / no HMR yet.
+- *`twyla build [-o <dir>]`* — compile every page, write
+  `<dir>/<slug>/index.html` per routed doc, copy `static/` verbatim
+  and `content/*.{!typ,!md}` (the asset bridge). Default output
+  `./public/`, matching zola. Existing files are overwritten in
+  place; nothing is removed. Will conflict with zola's `public/` in
+  the site repo today — pass `-o /tmp/twyla-test/` to keep them
+  separate until twyla has its own sass/JS story.
+
+=== Porting harness (flag-driven)
+
+- *`twyla render [--site-root <dir>] <slug>`* — compile one slug as a
+  single-document bundle, run resolution pass, print HTML. Debug tool;
+  same code path as the dev server's per-request compile.
 - *`twyla check [--site-root <dir>] <slug>`* — render + full-page diff
   for a ported page. Inputs inferred from zola's layout:
   `content/<slug>.typ` vs `public/<slug>/index.html`. Relaxations are
   the cumulative universal set found across ported pages so far
   (`textonly-pre`, `ignore-attr td/th:style`); no per-page config yet.
+- *`twyla diff [--textonly-pre] [--ignore-attr <tag>:<attr>]... <expected> <actual>`*
+  — structural AST diff with optional porting relaxations.
 - *`twyla import <md>`* — best-effort md→typ draft generator on stdout.
   Pulldown-cmark walk plus a shortcode pre/postprocess pass; handles
-  the common shape of the personal-site corpus. One manual fix per
-  page (`url-path` placeholder); raw HTML and unusual shortcodes get
-  a `// TODO twyla-import: …` comment. Separate verb from `check` —
-  no shared story.
+  the common shape of the personal-site corpus. Raw HTML and unusual
+  shortcodes get a `// TODO twyla-import: …` comment.
 
-The render pipeline is exposed as a library function
-(`twyla::render::render_to_html`) so `check` calls it in-process. Diff
-likewise — no shell glue, no rebuild step. Earlier iterations shipped
-three separate bins (`twyla-render-page`, `twyla-diff`, `twyla-extract`)
-plus a `port-page.sh` driver; all consolidated.
+The render pipeline is exposed as library functions
+(`twyla::render::{render_site, render_slug}`) so `check`, `serve`,
+and `build` all call it in-process. No shell glue, no rebuild step.
+Earlier iterations shipped three separate bins
+(`twyla-render-page`, `twyla-diff`, `twyla-extract`) plus a
+`port-page.sh` driver; all consolidated.
 
 `check` stays zola-specific by design; the eventual EXAMPLES-corpus
 verifier may want a manifest, but with one site the directory layout
@@ -246,7 +286,27 @@ divergence), attribute-value matchers ("ignore `style` only when value =
   ordered-list `<ol>` vs `<ul>` from `Tag::List(Some(_))`) then a
   two-line manual fixup (`_page-url` + `url-path` placeholders) got
   it to match zola.
-+ *Generalize* — routing, asset pipeline, feed, dev server. After.
++ #strike[*Multi-entrypoint compile + `url-path` scope shift*] — done.
+  Every compile goes through a synthesized virtual `main.typ` that
+  emits one `#document(..)` per `content/*.typ` and a per-document
+  `<twyla-page>` metadata marker. `page-template` no longer takes a
+  `url-path` parameter and no longer calls `#document(..)` itself;
+  it reads its slug from the bundle introspector via
+  `context query(<twyla-page>)`. `cmd_render`/`cmd_check` switched
+  from path to slug. Verified end-to-end (`render_site_smoke`):
+  compiling all three `guis-*` pages in one bundle, no label-scope
+  leak between docs.
++ #strike[*Dev server (`twyla serve`)*] — done. Zero-flag,
+  `127.0.0.1:1111`, hand-rolled HTTP/1.1 over `std::net`, no extra
+  deps. Compiles per request (~3s debug, sub-second `--release`,
+  ms with the shared-`World` revision still queued). Static fallback
+  is `cwd/static/` then `cwd/content/` (mirrors zola's colocated
+  assets). `/` is a placeholder index until the home page is ported.
++ #strike[*`twyla build`*] — done. Walks `render_site` output,
+  writes `<output>/<slug>/index.html`, copies `static/` verbatim and
+  `content/` minus `.typ`/`.md`. Default `./public/`, override via
+  `-o`. Verified: `twyla build -o /tmp/twyla-test/` produces output
+  whose `guis-2/index.html` matches zola through the porting diff.
 
 == Roadmap
 
@@ -283,32 +343,59 @@ infrastructure only when a porting case forces it.
 
 === Medium term — twyla becomes an SSG
 
-+ *Multi-entrypoint routing.* Replace the
-  one-`#document`-per-render-call constraint with twyla scanning
-  `content/*.typ`, generating an in-memory `main.typ` that emits one
-  `#document(..)` per source. Path derives from filesystem layout, with
-  per-page `metadata()` override.
+Queued, in the order we plan to land them:
+
++ *Home page (`content/_index.typ` → `/`).* First special-route. Two
+  knock-on concerns: scan must stop skipping `_index.typ` and route
+  it to the bundle root; the index needs cross-doc post data (title,
+  date, description, slug) which means the virtual `main.typ` writes
+  one `<twyla-post>`-labelled metadata block per document with those
+  fields, and `_index.typ` queries them. Same per-document-scope
+  shape as `<twyla-page>`; first second-marker for the resolution
+  registry argument.
++ *Shared `World` + comemo carry + `dependencies()` invalidation.*
+  One `RenderWorld` lives behind a `Mutex` across requests; the
+  `typst_kit::watcher::Watcher` thread waits on `World::dependencies()`
+  changes and runs `world.reset()` + `comemo::evict(10)` on each
+  batched event. Single-doc compiles become fast (ms) on warm cache.
+  No browser-side reload yet — manual refresh after the watcher
+  prints a recompile line. Mirrors typst's own CLI watch loop
+  (`crates/typst-cli/src/watch.rs`, `typst_kit::watcher`) — same
+  crate, same pattern, no fork.
++ *WS-driven hot reload.* Server injects a tiny `<script>` into served
+  HTML that opens a websocket; watcher revision signals "recompiled,
+  reload" over it. Clean split from the shared-World revision —
+  rollback story stays simple if the WS layer misbehaves.
 + *Real `asset-url` primitive.* Drop the hardcoded `base_url` in
   `templates/shortcodes.typ`. Comes from a twyla config layer (TOML or
   typst-side). This is the moment we promote our one resolution-pass
   placeholder into a registry, because the URL primitive needs hooks for
   fingerprinting/dedup.
++ *Sass / JS bundling.* Today twyla's dev workflow detours back through
+  zola (`zola build --drafts` for `public/site.css`, `yarn build` for
+  `public/scripts/*.js`); `static/` holds symlinks pointing at those
+  outputs. Real fix: twyla shells out to `sass` and `vite`/`esbuild`,
+  or just `dart-sass` as a library, and owns these directly. Until
+  then the symlink hack is the bridge.
 + *Image optimization pipeline.* Webp/avif encoding, srcset generation,
   in Rust as a resolution-pass handler. User typst calls one function;
   the registered handler does the byte transforms and emits the
   resolved `<picture>`.
 + *Feed generation.* `#document("atom.xml", ..)` in twyla's library,
-  querying `bundle.introspector` for `kind: "post"` entries.
+  querying `bundle.introspector` for `kind: "post"` entries. Reuses
+  the same `<twyla-post>` metadata the home page reads.
 
 === Longer term
 
-+ *Dev server with live reload.* Open question: do we own it (twyla
-  watches sources, serves with WS reload script) or shell out to
-  `vite dev` for now and revisit?
-+ *Incremental rebuilds.* Hold one `World` across watch cycles; lean on
-  comemo memoization. Revisit if cold-start becomes a perf wall.
-+ *Sass / JS bundling.* Probably shell out (vite or esbuild) rather than
-  reimplement. Twyla orchestrates, doesn't compile.
++ *Port more pages.* `coroutines-1` / `coroutines-2` (similar shape
+  to `guis-*`), `matfusion` (first paper page — exercises `_mainpills`
+  which is carried but untested), `what-is-color/` (first nested
+  section, exercises subdirectory routing), `dissertation`,
+  `self-referential`, etc. Each is a use case for `twyla import`
+  followed by `twyla check` iteration.
++ *Twyla config layer (`twyla.toml`).* `base_url`, deploy overrides.
+  All keys optional — empty file is still turn-key. Probably forced
+  by the `asset-url` primitive.
 
 === Validation
 
@@ -393,6 +480,42 @@ Compact gotcha list; details in commits.
   `href="#frag"`. Extend the link show rule to prepend a per-page
   `_page-url`. Hardcoded for now; lift into `page.typ` once twyla has
   a config layer.
+- *Virtual `main.typ` is dead-cheap to inject.* `RenderWorld::source()`
+  consults an in-memory `HashMap<FileId, Source>` before reading from
+  disk; pre-populate that map with the synthesized main keyed at
+  `/__twyla_main.typ` (any vpath that's not a real file works). No
+  custom World trait impl changes beyond this; typst's bundle compile
+  doesn't care that the entrypoint isn't on disk.
+- *Per-document `<label>` query is the routing-context primitive.*
+  `#document(path)[..]` scopes `query(<label>)` to the document body,
+  so each routed output sees only its own marker — exactly what
+  per-page-config wants. Markup-mode label syntax
+  (`#metadata((..)) <label>`) is the one that parses; emit your main
+  with `[..]` content blocks rather than code-mode `{..}` blocks
+  when labelling.
+- *`bundle.files` is `Arc<IndexMap<VirtualPath, BundleFile>>`.* Iterate
+  with `.iter()` (`for x in &bundle.files` won't auto-deref through
+  `Arc`). Each entry is a `BundleFile` enum; match
+  `BundleFile::Document(BundleDocument::Html(doc))` for HTML pages.
+  `path.get_without_slash()` gives the slash-relative `&str` that
+  matches the `#document(..)` path string.
+- *Show rules from `#include`d files stay scoped to that include's
+  body.* A multi-document virtual main can include N content files
+  whose `#show: page-template.with(..)` rules don't leak between
+  documents. Verified by compiling guis-{1,2,3} in one bundle and
+  diffing each against zola (`render_site_smoke`).
+- *Page-template doesn't call `document()` when twyla owns routing.*
+  Returning the `html.elem("html", ..)` content from page-template is
+  enough; the generated main's `#document(path, body)` wraps it.
+  Title/description args on `#document(..)` are typst-level
+  metadata, not HTML — we set the HTML `<title>` ourselves and
+  the document-arg metadata is unused today (will matter for feeds).
+- *`context` blocks compose inside show-rule transformers.* The
+  anchor-link branch of the link show rule wraps `html.a(href: ..)`
+  in `context { let slug = query(<twyla-page>)...; .. }` — the lazy
+  evaluation point per link is acceptable (no perf issue at our
+  scale) and avoids restructuring page-template around top-level
+  context.
 
 == Upstream-watch list
 
@@ -462,3 +585,16 @@ work — that's the evidence base for reconsidering.
 - Known porting hazards: ROT13-encoded email obfuscation in footer,
   conditional asset loading (`page.extra.tilings`), SVG inlining with
   font-family rewriting (handled by the `svg`/`diagram` shortcodes).
+- Dev-asset bootstrap (until twyla owns sass/JS): `~/Src/site/static/`
+  holds symlinks pointing at zola/vite outputs in `~/Src/site/public/`
+  — `static/site.css -> ../public/site.css`,
+  `static/scripts/{earlysite,site,style}.{js,css} -> ../../public/scripts/...`.
+  Recompile CSS by re-running `zola build --drafts` (or
+  `sass sass/site.sass public/site.css` directly if `sass` is on
+  PATH); JS via `yarn build`. `static/scripts/` is in `.gitignore`
+  so only `static/site.css` is tracked.
+- `twyla serve` recompiles the requested page per request — ~3s
+  debug, sub-second `--release`. Shared-`World` + comemo carry is
+  the queued revision that fixes this; until then prefer
+  `cargo build --release && ./target/release/twyla serve` for
+  iteration.
