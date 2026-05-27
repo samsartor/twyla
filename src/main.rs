@@ -21,7 +21,10 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use twyla::build::{Build, run as build_run};
-use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff, parse_html};
+use twyla::diff::{
+    Matcher, RelaxConfig, RelaxationRule, diff, parse_html,
+    rewrite_own_page_anchor_hrefs,
+};
 use twyla::import::import_md;
 use twyla::render::render_slug;
 use twyla::serve::{Serve, run as serve_run};
@@ -321,7 +324,18 @@ fn cmd_check(site_root: Option<PathBuf>, slug: &str) -> ExitCode {
             RelaxationRule::IgnoreAttribute("style".to_string()),
         );
 
-    let expected = parse_html(&zola_html);
+    let mut expected = parse_html(&zola_html);
+    // Zola absolutizes anchor-only links (`[t](#frag)`) against the
+    // page's base URL: `<a href="<base>/<slug>/#frag">`. Typst's
+    // label-based `#link(<frag>)` emits the unabsolutized form
+    // `<a href="#frag">`. Both resolve to the same target, so for
+    // diff purposes rewrite the zola form back to the fragment-only
+    // form before comparison. Hardcoded base — replace with config
+    // once twyla has a config layer.
+    rewrite_own_page_anchor_hrefs(
+        &mut expected,
+        &format!("https://samsartor.com/{slug}/#"),
+    );
     let actual = parse_html(&typst_html);
 
     eprintln!(">>> diff");

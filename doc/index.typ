@@ -307,6 +307,34 @@ divergence), attribute-value matchers ("ignore `style` only when value =
   `content/` minus `.typ`/`.md`. Default `./public/`, override via
   `-o`. Verified: `twyla build -o /tmp/twyla-test/` produces output
   whose `guis-2/index.html` matches zola through the porting diff.
++ #strike[*Templates refactor + state-based per-doc context.*] — done.
+  `templates/page.typ` split into `base.typ` (shared
+  head/header/footer, `apply-base-rules` show wrapper, per-doc state)
+  + `page.typ` (blog/paper shape) + `home.typ` (home-template,
+  `post-list`, `pagesum`, `tagline` shortcode). Per-doc metadata lives
+  in a `state("twyla-page")` object updated by `set-page(..)` near
+  the top of each body; `current-page()` inside a `context` block
+  reads it. The earlier `query(<twyla-page>)` design turned out to be
+  bundle-scope, not per-doc — see the lesson below.
++ #strike[*Internal links via labels.*] — done. `[text](#frag)` →
+  `#link(<frag>)[text]`; `# Heading` → `= Heading <slug>`. typst-html
+  resolves labels natively (same-doc → `href="#frag"`, cross-doc →
+  `href="../doc/index.html#frag"`). Drops the slug-aware
+  anchor-absolutize branch of the link show rule and the
+  `_text-of`/`_slugify` helpers. Diff harness has a per-page anchor
+  href rewrite (`rewrite_own_page_anchor_hrefs`) that undoes zola's
+  absolutization before comparison so the strict diff still applies.
++ #strike[*Home page (`content/_index.typ` → `/`).*] — done. Scanner
+  un-skips `_index.typ` specifically (other `_*` stay reserved);
+  `generate_main` maps `_index` to `index.html` via
+  `bundle_path_for_slug`. `home-template` shares base.typ's
+  head/header/footer; `post-list()` enumerates cross-doc via
+  `query(<twyla-post>)`, filtering drafts and sorting by date desc.
+  `set-page` (always called) and `mark-as-post` (only by blog/paper
+  templates) split keeps the home page out of its own listing. Dev
+  server routes `/` through `render_site` (full-bundle compile) so
+  the home page's cross-doc query sees every post; single-slug
+  rendering would surface an empty listing.
 
 == Roadmap
 
@@ -345,14 +373,6 @@ infrastructure only when a porting case forces it.
 
 Queued, in the order we plan to land them:
 
-+ *Home page (`content/_index.typ` → `/`).* First special-route. Two
-  knock-on concerns: scan must stop skipping `_index.typ` and route
-  it to the bundle root; the index needs cross-doc post data (title,
-  date, description, slug) which means the virtual `main.typ` writes
-  one `<twyla-post>`-labelled metadata block per document with those
-  fields, and `_index.typ` queries them. Same per-document-scope
-  shape as `<twyla-page>`; first second-marker for the resolution
-  registry argument.
 + *Shared `World` + comemo carry + `dependencies()` invalidation.*
   One `RenderWorld` lives behind a `Mutex` across requests; the
   `typst_kit::watcher::Watcher` thread waits on `World::dependencies()`
@@ -448,19 +468,12 @@ Compact gotcha list; details in commits.
 - *`[#]` in markup is a parse error.* `#` starts a code expression, so
   `[#]` opens an expression with no content. Escape as `[\#]` to emit a
   literal hash character (used in the `description__hash` span).
-- *Pulldown auto-slugifies headings; typst's `=` doesn't.* For zola
-  parity each section heading needs an explicit `id`. Solved by a
-  `show heading` rule in `page-template` that emits `<h{level}
-  id="<slug>">..</h{level}>`. With that, plain `= Heading` / `==
-  Heading` markup matches zola's output. Two more notes from the
-  cleanup: in HTML mode typst-html shifts `=` to `<h2>` by default
-  (the document title takes `<h1>`); a show rule using `it.level`
-  bypasses that. And labels: `= Foo <bar>` sets `id="bar"` and
-  `#link(<bar>)[anchor text]` works without `set heading(numbering:
-  ..)` — `@bar` is the form that needs numbering (for the auto-
-  generated reference text). Labels could replace text-slugs for
-  cross-doc references once the corpus has drifted from zola; for now,
-  matching zola slugs is what we need.
+- *typst-html shifts `=` to `<h2>` by default* (reserves `<h1>` for
+  the document title). For sites that emit their own `<html>` and
+  treat `=` as the top-level heading, override via a `show heading`
+  rule that uses `it.level`. `set heading(offset: -1)` rejects
+  negative values; `set document(title: ..)` doesn't suppress the
+  shift either.
 - *Inline `<br>` is auto-paragraph-wrapped.* `#html.br()` on its own
   line produces `<p><br></p>` — typst treats `<br>` as inline content.
   `<hr>` is block, so `#html.hr()` doesn't wrap. For a bare sibling
@@ -476,23 +489,60 @@ Compact gotcha list; details in commits.
   element injects a `<span style="white-space: pre-wrap">` to preserve
   whitespace. Easiest fix: splice both halves via `raw-html`.
 - *Zola absolutizes anchor-only links.* `[text](#frag)` in MD becomes
-  `<a href="<base_url>/<slug>/#frag">` in zola output, not
-  `href="#frag"`. Extend the link show rule to prepend a per-page
-  `_page-url`. Hardcoded for now; lift into `page.typ` once twyla has
-  a config layer.
+  `<a href="<base_url>/<slug>/#frag">` in zola output. Twyla emits the
+  unabsolutized `<a href="#frag">` (typst-html's `link(<label>)`
+  resolver). Both forms resolve to the same target; the diff harness
+  reconciles via `rewrite_own_page_anchor_hrefs` in `cmd_check`.
 - *Virtual `main.typ` is dead-cheap to inject.* `RenderWorld::source()`
   consults an in-memory `HashMap<FileId, Source>` before reading from
   disk; pre-populate that map with the synthesized main keyed at
   `/__twyla_main.typ` (any vpath that's not a real file works). No
   custom World trait impl changes beyond this; typst's bundle compile
   doesn't care that the entrypoint isn't on disk.
-- *Per-document `<label>` query is the routing-context primitive.*
-  `#document(path)[..]` scopes `query(<label>)` to the document body,
-  so each routed output sees only its own marker — exactly what
-  per-page-config wants. Markup-mode label syntax
-  (`#metadata((..)) <label>`) is the one that parses; emit your main
-  with `[..]` content blocks rather than code-mode `{..}` blocks
-  when labelling.
+- *`query(<label>)` is BUNDLE-scope in HTML/bundle mode, NOT per-doc.*
+  Earlier notes here claimed `#document(path)[..]` scoped queries to
+  the document body. That's wrong: `query()` from inside any doc's
+  body returns every labelled element across every routed doc in the
+  bundle. The previous `query(<twyla-page>).first().value.url-path`
+  design always returned the FIRST doc's slug alphabetically (so
+  guis-3 anchor-only links silently emitted
+  `samsartor.com/guis-1/#streams`) — a latent bug missed by the smoke
+  test, whose assertion was gated `if doc.html.contains(own-slug-
+  anchor)` and never tripped because the slug was always wrong. Fixed
+  by (a) switching internal links to `#link(<label>)` so typst-html's
+  per-doc URL resolver runs (no slug needed in show rules) and (b)
+  moving current-page metadata to a `state` object. `here().page()` is
+  also useless as a doc discriminator in HTML mode (returns 1 for
+  everything — no pages in the layout sense).
+- *`state` gives per-doc context in bundle mode.* `state.update(dict)`
+  near the top of each routed body publishes that doc's metadata;
+  `state.get()` inside `context` returns the value at the call's
+  source location. typst's source-order traversal means each doc sees
+  its own update (subsequent docs' updates override only for code
+  AFTER their position). Used by `base.typ`'s
+  `set-page`/`current-page` pair to replace the broken `<twyla-page>`
+  design. Markup-mode label syntax (`#metadata((..)) <label>`) is
+  still useful for cross-doc enumeration (`mark-as-post` for home-
+  page listings); emit with `[..]` content blocks.
+- *typst-html resolves `link(<label>)` per-bundle.* Same-doc target →
+  `href="#frag"`; cross-doc target → `href="../other/index.html#frag"`.
+  No slug-aware show rule, no `_page-url` lift. Replaces zola's
+  pulldown `[text](#frag)` → `<base_url>/<slug>/#frag` form. Diff
+  harness has `rewrite_own_page_anchor_hrefs` (called from `cmd_check`
+  with the current slug) to undo zola's absolutization in the
+  expected tree before strict comparison.
+- *Heading `id` from labels is link-driven, not label-driven.*
+  typst-html emits `id="label"` on a heading only when there's an
+  incoming `#link(<label>)`. Labels without an incoming link stay
+  implicit (no `id`). For zola parity (zola auto-IDs every heading)
+  `apply-base-rules` re-emits each heading with an explicit `id` read
+  from `it.fields().label`. Headings without a label still get no
+  `id` — porting hazard since pulldown auto-slugifies un-labeled
+  headings; `twyla import` auto-adds `<slug>` to every heading to
+  match.
+- *`heading.label` errors on un-labeled headings.* `it.label` isn't a
+  guaranteed field. Use `it.fields()` and check `"label" in fields`;
+  the label value stringifies via `str(label)`.
 - *`bundle.files` is `Arc<IndexMap<VirtualPath, BundleFile>>`.* Iterate
   with `.iter()` (`for x in &bundle.files` won't auto-deref through
   `Arc`). Each entry is a `BundleFile` enum; match
@@ -510,12 +560,12 @@ Compact gotcha list; details in commits.
   Title/description args on `#document(..)` are typst-level
   metadata, not HTML — we set the HTML `<title>` ourselves and
   the document-arg metadata is unused today (will matter for feeds).
-- *`context` blocks compose inside show-rule transformers.* The
-  anchor-link branch of the link show rule wraps `html.a(href: ..)`
-  in `context { let slug = query(<twyla-page>)...; .. }` — the lazy
-  evaluation point per link is acceptable (no perf issue at our
-  scale) and avoids restructuring page-template around top-level
-  context.
+- *`context` blocks compose inside show-rule transformers.* A show
+  rule can wrap its body in `context { state.get(); .. }` to defer
+  the lookup until the introspector has populated state — useful
+  whenever per-doc metadata needs to flow into deep code (rare now
+  that internal links are label-resolved, but the pattern remains
+  the escape hatch).
 
 == Upstream-watch list
 
@@ -576,12 +626,13 @@ work — that's the evidence base for reconsidering.
   feature (PR #7964). Switch back to crates.io once 0.15.x ships.
 - Tera shortcodes in scope for porting: `centered`, `diagram`, `image`,
   `math`, `svg`, `tagline`, `var` (`~/Src/site/templates/shortcodes/`).
-  Phase 1 covered the first four; `math`/`tagline`/`var` come with
-  pages that use them.
+  Done: `centered`, `diagram`, `image`, `svg`, `tagline`. Pending:
+  `math`/`var` — wait for a page that uses them.
 - Tera templates in scope: `base.html`, `page.html`, `section.html`,
   `index.html`, `components.html`, `404.html`, `atom.xml`,
-  `paperpills.html`. Phase 1 covered `base.html` + `page.html` +
-  `components.html::mainpills` (the last untested until a paper page).
+  `paperpills.html`. Done: `base.html` + `page.html` + `index.html`
+  (via `home.typ`) + `components.html::{pagesum, mainpills}` (the
+  latter still untested against a paper page).
 - Known porting hazards: ROT13-encoded email obfuscation in footer,
   conditional asset loading (`page.extra.tilings`), SVG inlining with
   font-family rewriting (handled by the `svg`/`diagram` shortcodes).

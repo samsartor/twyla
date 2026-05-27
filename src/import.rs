@@ -283,8 +283,16 @@ impl<'a> Walker<'a> {
                 self.stack.push(Block::Strong);
             }
             Tag::Link { dest_url, .. } => {
-                let url = escape_typst_string(&dest_url);
-                write!(self.out, "#link(\"{url}\")[").unwrap();
+                // Anchor-only links (`[t](#frag)`) become label links
+                // (`#link(<frag>)[t]`) — typst-html resolves them
+                // natively via the bundle introspector, matching
+                // pulldown's behavior without a show-rule hack.
+                if let Some(frag) = dest_url.strip_prefix('#') {
+                    write!(self.out, "#link(<{frag}>)[").unwrap();
+                } else {
+                    let url = escape_typst_string(&dest_url);
+                    write!(self.out, "#link(\"{url}\")[").unwrap();
+                }
                 self.stack.push(Block::Link);
                 self.in_link_text += 1;
             }
@@ -324,12 +332,15 @@ impl<'a> Walker<'a> {
             TagEnd::Heading(_) => {
                 self.stack.pop();
                 if let Some(h) = self.heading.take() {
-                    // `page.typ`'s `show heading` rule slugifies the
-                    // heading text into an `id=`, matching pulldown's
-                    // auto-ID behavior. Plain `= ..` / `== ..` is all
-                    // we need to emit; no helper, no explicit slug.
+                    // `base.typ`'s `show heading` rule reads `it.label`
+                    // and emits `<h{level} id="<label>">..</h{level}>`,
+                    // matching pulldown's auto-id behavior. Emit an
+                    // explicit `<slug>` label per heading so link
+                    // targets are queryable via `#link(<slug>)`.
                     let prefix = "=".repeat(h.level as usize);
-                    writeln!(self.out, "{prefix} {}\n", h.text).unwrap();
+                    let slug = slugify(&h.text);
+                    writeln!(self.out, "{prefix} {} <{}>\n", h.text, slug)
+                        .unwrap();
                 }
             }
             TagEnd::BlockQuote(_) => {
@@ -508,19 +519,42 @@ fn escape_typst_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Slugify a heading's plain text into a typst label name. Matches
+/// zola's auto-slug rule for the corpus (no diacritics): lowercase,
+/// runs of non-alphanumeric collapse to one `-`, trailing `-` stripped.
+/// Used by `Walker::end` to emit `= Heading <slug>` so the heading is
+/// link-targetable via `#link(<slug>)`.
+fn slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_dash = true;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.extend(ch.to_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
 // ---- assembly ------------------------------------------------------------
 
 fn assemble(meta: &Meta, body: &str) -> String {
     let mut out = String::new();
     writeln!(out, "// twyla-import draft. Manual cleanup expected:").unwrap();
-    writeln!(out, "// - fill in `url-path` (replace PAGE-SLUG)").unwrap();
+    writeln!(out, "// - fill in `path` (replace PAGE-SLUG)").unwrap();
     writeln!(out, "// - inspect any `// TODO twyla-import:` markers below").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "#import \"/templates/shortcodes.typ\": *").unwrap();
     writeln!(out, "#import \"/templates/page.typ\": page-template").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "#show: page-template.with(").unwrap();
-    writeln!(out, "  url-path: \"PAGE-SLUG.html\", // TODO twyla-import").unwrap();
+    writeln!(out, "  path: \"PAGE-SLUG\", // TODO twyla-import").unwrap();
     writeln!(
         out,
         "  title: \"{}\",",

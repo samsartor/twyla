@@ -35,6 +35,10 @@ pub use relax::{Matcher, RelaxConfig, RelaxationRule};
 pub use select::{Selector, find_inner};
 pub use serialize::{serialize, serialize_fragment};
 
+// Re-exported as a free function for callers that want to mutate a
+// parsed tree in place (e.g. cmd_check undoing zola's absolutization).
+// Defined in this module body below.
+
 /// A node in the normalized HTML tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
@@ -68,5 +72,34 @@ impl Node {
             Node::Text(_) => "text",
             Node::Comment(_) => "comment",
         }
+    }
+}
+
+/// Rewrite `<a href="<prefix>FRAG">` to `<a href="#FRAG">` everywhere
+/// in the tree. Used by `cmd_check` to undo zola's anchor-only-link
+/// absolutization (`[text](#frag)` → `<a href="<base>/<slug>/#frag">`)
+/// so the strict diff matches typst's label-based form (`#link(<frag>)`
+/// → `<a href="#frag">`). Both resolve to the same target.
+pub fn rewrite_own_page_anchor_hrefs(node: &mut Node, prefix: &str) {
+    match node {
+        Node::Element(el) => {
+            if el.name == "a" {
+                if let Some(href) = el.attrs.get("href") {
+                    if let Some(frag) = href.strip_prefix(prefix) {
+                        let new_href = format!("#{frag}");
+                        el.attrs.insert("href".to_string(), new_href);
+                    }
+                }
+            }
+            for child in &mut el.children {
+                rewrite_own_page_anchor_hrefs(child, prefix);
+            }
+        }
+        Node::Document(children) => {
+            for child in children {
+                rewrite_own_page_anchor_hrefs(child, prefix);
+            }
+        }
+        _ => {}
     }
 }

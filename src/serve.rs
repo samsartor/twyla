@@ -20,7 +20,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::render::{render_slug, scan_pages};
+use crate::render::{render_site, render_slug, scan_pages};
 
 pub struct Serve {
     pub site_root: PathBuf,
@@ -152,6 +152,36 @@ fn dispatch(serve: &Serve, path: &str) -> Response {
 }
 
 fn render_index(serve: &Serve) -> Response {
+    // If the author has written content/_index.typ, route `/` through
+    // the full-bundle render path (so the home page's post-list can
+    // query <twyla-post> markers from every sibling doc — single-slug
+    // rendering would put only _index in the bundle, listing nothing).
+    // Falls back to a placeholder slug-index when _index.typ is absent.
+    let index_typ = serve.site_root.join("content/_index.typ");
+    if index_typ.is_file() {
+        return match render_site(&serve.site_root) {
+            Ok(docs) => match docs
+                .into_iter()
+                .find(|d| d.path == Path::new("index.html"))
+            {
+                Some(doc) => Response::html(200, doc.html),
+                None => Response::html(
+                    500,
+                    "render_site produced no index.html".to_string(),
+                ),
+            },
+            Err(e) => {
+                eprintln!("render error (/):\n{e}");
+                let body = format!(
+                    "<!doctype html><html><body><h1>twyla: render error</h1>\
+                     <pre style=\"white-space:pre-wrap\">{}</pre></body></html>",
+                    html_escape(&e.to_string()),
+                );
+                Response::html(500, body)
+            }
+        };
+    }
+
     let slugs = match scan_pages(&serve.site_root) {
         Ok(s) => s,
         Err(e) => {
@@ -167,7 +197,7 @@ fn render_index(serve: &Serve) -> Response {
          </head><body>\n",
     );
     out.push_str("<h1>twyla dev</h1>\n");
-    out.push_str("<p>placeholder index — home page not yet ported.</p>\n");
+    out.push_str("<p>placeholder index — content/_index.typ not present.</p>\n");
     out.push_str("<ul>\n");
     for s in &slugs {
         out.push_str(&format!(
