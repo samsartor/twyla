@@ -2,15 +2,14 @@
 //!
 //! Subcommands:
 //!
-//! - `twyla render [--root <dir>] <entrypoint.typ>` — compile and print
-//!   resolved HTML to stdout.
+//! - `twyla render [--site-root <dir>] <slug>` — compile a single page
+//!   from `<site>/content/<slug>.typ` and print resolved HTML.
 //! - `twyla diff [--textonly-pre] [--ignore-attr <tag>:<attr>]...
 //!   <expected.html> <actual.html>` — structural AST diff.
 //! - `twyla check [--site-root <dir>] <slug>` — render
 //!   `<site>/content/<slug>.typ` and diff against
-//!   `<site>/public/<slug>/index.html` under the porting relaxations. Zola
-//!   layout is inferred from `<slug>`; per-page relaxations are the
-//!   universal defaults today (see `cmd_check`).
+//!   `<site>/public/<slug>/index.html` under the porting relaxations.
+//! - `twyla import <md>` — md→typ draft generator.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -19,7 +18,7 @@ use clap::{Parser, Subcommand};
 
 use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff, parse_html};
 use twyla::import::import_md;
-use twyla::render::render_to_html;
+use twyla::render::render_slug;
 
 #[derive(Parser)]
 #[command(
@@ -34,14 +33,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Compile a typst entrypoint, run the resolution pass, print HTML.
+    /// Compile a single page, run the resolution pass, print HTML.
     Render {
-        /// Typst project root (`/foo.typ` resolves here). Defaults to
-        /// the entrypoint's parent — usually wrong for any real project,
-        /// so pass `--root` explicitly.
-        #[arg(long)]
-        root: Option<PathBuf>,
-        entrypoint: PathBuf,
+        /// Site repo root. Defaults to `$SITE_ROOT` then `$HOME/Src/site`.
+        #[arg(long, env = "SITE_ROOT")]
+        site_root: Option<PathBuf>,
+        /// Page slug — `guis-2` for `content/guis-2.typ`.
+        slug: String,
     },
     /// Structurally diff two HTML files.
     Diff {
@@ -85,7 +83,7 @@ enum Cmd {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Render { root, entrypoint } => cmd_render(root.as_deref(), &entrypoint),
+        Cmd::Render { site_root, slug } => cmd_render(site_root, &slug),
         Cmd::Diff { textonly_pre, ignore_attr, expected, actual } => {
             cmd_diff(textonly_pre, &ignore_attr, &expected, &actual)
         }
@@ -114,21 +112,17 @@ fn cmd_import(input: &Path) -> ExitCode {
     }
 }
 
-fn cmd_render(root: Option<&Path>, entrypoint: &Path) -> ExitCode {
-    let resolved_root = match root {
-        Some(r) => r.to_path_buf(),
-        None => match entrypoint.parent() {
-            Some(p) => p.to_path_buf(),
-            None => {
-                eprintln!("error: entrypoint has no parent directory");
-                return ExitCode::from(2);
-            }
-        },
+fn cmd_render(site_root: Option<PathBuf>, slug: &str) -> ExitCode {
+    let site_root = match resolve_site_root(site_root) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
     };
-
-    match render_to_html(&resolved_root, entrypoint) {
-        Ok(html) => {
-            print!("{html}");
+    match render_slug(&site_root, slug) {
+        Ok(doc) => {
+            print!("{}", doc.html);
             ExitCode::from(0)
         }
         Err(e) => {
@@ -209,12 +203,11 @@ fn cmd_check(site_root: Option<PathBuf>, slug: &str) -> ExitCode {
         }
     };
 
-    let entrypoint = site_root.join(format!("content/{slug}.typ"));
     let zola_html_path = site_root.join(format!("public/{slug}/index.html"));
 
-    eprintln!(">>> rendering {}", entrypoint.display());
-    let typst_html = match render_to_html(&site_root, &entrypoint) {
-        Ok(s) => s,
+    eprintln!(">>> rendering {slug}");
+    let typst_html = match render_slug(&site_root, slug) {
+        Ok(doc) => doc.html,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(1);

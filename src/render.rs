@@ -1,18 +1,25 @@
-//! Render a typst entrypoint to an HTML string.
+//! Render typst content to HTML via the bundle export feature.
 //!
-//! The pipeline:
+//! Every compile goes through the same shape: twyla generates a virtual
+//! `main.typ` in memory containing one `#document(path, body)` call per
+//! routed page, then compiles that as a bundle and walks the HTML
+//! documents out.
 //!
-//! 1. Build a [`RenderWorld`] rooted at the typst project directory.
-//! 2. Compile as a [`Bundle`] (multi-document export). The bundle export
-//!    feature is what unlocks `#document(path, ..)`.
-//! 3. Filter the bundle for HTML documents; today only single-doc
-//!    entrypoints are supported (the routing story is in
-//!    `doc/index.typ` § Architecture).
-//! 4. Run the resolution pass over the serialized HTML — see
-//!    [`resolve_raw_html_placeholders`].
+//! Two public entry points:
 //!
-//! Errors are formatted into pre-rendered strings so the caller doesn't
-//! need to depend on `typst::diag` to print them.
+//! - [`render_site`] — scan `<root>/content/*.typ`, emit one `#document`
+//!   per file, compile, return every routed HTML.
+//! - [`render_slug`] — same machinery, single-entry virtual main. Used
+//!   by `cmd_check`, `cmd_render`, and the dev server's per-request
+//!   compile.
+//!
+//! Per-document routing context (the URL slug page-template needs for
+//! the anchor-absolutize link rule) is injected as a `<twyla-page>`
+//! metadata label, queryable from within each document's content.
+//!
+//! After typst-html serializes, the resolution pass replaces every
+//! `<script type="x-twyla-raw-html">..</script>` with its inner body —
+//! the workaround for the missing `html.raw` primitive.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -35,6 +42,10 @@ use typst_library::Feature;
 /// inlined.
 const RAW_HTML_MARKER: &str = r#"<script type="x-twyla-raw-html">"#;
 
+/// Virtual path for the generated main. Lives only in the in-memory
+/// source map — never read from disk.
+const VIRTUAL_MAIN_VPATH: &str = "/__twyla_main.typ";
+
 /// Pre-formatted errors. Caller prints these on stderr and exits.
 #[derive(Debug)]
 pub struct RenderError {
@@ -48,7 +59,7 @@ pub enum RenderErrorKind {
     Setup,
     /// Typst compilation failed. `messages` holds the diagnostics.
     Compile,
-    /// The bundle didn't contain exactly one HTML document.
+    /// The bundle didn't contain the expected HTML documents.
     Bundle,
 }
 
@@ -66,70 +77,48 @@ impl fmt::Display for RenderError {
 
 impl std::error::Error for RenderError {}
 
-/// Compile a typst entrypoint to a fully-resolved HTML string.
-///
-/// `root` is the typst project root (`/foo.typ` paths resolve against it).
-/// `entrypoint` must live under `root` and be the file to compile.
-///
-/// Warnings are printed to stderr; only hard errors bail.
-pub fn render_to_html(root: &Path, entrypoint: &Path) -> Result<String, RenderError> {
-    let world = RenderWorld::new(root, entrypoint).map_err(|e| RenderError {
-        messages: vec![e],
-        kind: RenderErrorKind::Setup,
-    })?;
+/// One routed page emerging from the bundle compile.
+#[derive(Debug, Clone)]
+pub struct RoutedDoc {
+    /// The bundle-relative output path, e.g., `guis-2/index.html`.
+    pub path: PathBuf,
+    /// Fully resolved HTML (placeholders already substituted).
+    pub html: String,
+}
 
-    let Warned { output, warnings } = typst::compile::<Bundle>(&world);
-
-    for w in &warnings {
-        eprintln!("warning: {}", w.message);
+/// Compile every page under `<root>/content/`.
+///
+/// Top-level `*.typ` files map to slugs by filename. `_index.typ` and
+/// any other underscore-prefixed file are skipped today (drafts /
+/// section-index need design; not in revision-1 scope).
+pub fn render_site(root: &Path) -> Result<Vec<RoutedDoc>, RenderError> {
+    let pages = scan_pages(root).map_err(setup_err)?;
+    if pages.is_empty() {
+        return Err(setup_err(format!(
+            "no pages found under {}/content/",
+            root.display()
+        )));
     }
+    let main_src = generate_main(&pages);
+    render_virtual_main(root, &main_src)
+}
 
-    let bundle = output.map_err(|errors| RenderError {
-        messages: errors
-            .iter()
-            .map(|e| format_diagnostic(&world, e))
-            .collect(),
-        kind: RenderErrorKind::Compile,
-    })?;
-
-    let html_docs: Vec<_> = bundle
-        .files
-        .iter()
-        .filter_map(|(path, file)| match file {
-            BundleFile::Document(BundleDocument::Html(doc)) => Some((path, doc)),
-            _ => None,
-        })
-        .collect();
-
-    let (_path, doc) = match html_docs.as_slice() {
-        [one] => *one,
-        [] => {
-            return Err(RenderError {
-                messages: vec!["bundle produced no HTML documents".to_string()],
-                kind: RenderErrorKind::Bundle,
-            });
-        }
-        many => {
-            return Err(RenderError {
-                messages: vec![format!(
-                    "bundle produced {} HTML documents; only single-doc \
-                     entrypoints are supported today",
-                    many.len()
-                )],
-                kind: RenderErrorKind::Bundle,
-            });
-        }
-    };
-
-    let raw_html = typst_html::html(doc).map_err(|errors| RenderError {
-        messages: errors
-            .iter()
-            .map(|e| format_diagnostic(&world, e))
-            .collect(),
-        kind: RenderErrorKind::Compile,
-    })?;
-
-    Ok(resolve_raw_html_placeholders(&raw_html))
+/// Compile a single page identified by slug. Slug must correspond to
+/// `<root>/content/<slug>.typ`.
+pub fn render_slug(root: &Path, slug: &str) -> Result<RoutedDoc, RenderError> {
+    let pages = vec![Page::from_slug(slug)];
+    let main_src = generate_main(&pages);
+    let mut docs = render_virtual_main(root, &main_src)?;
+    if docs.len() != 1 {
+        return Err(RenderError {
+            messages: vec![format!(
+                "expected exactly 1 HTML document for slug {slug:?}, got {}",
+                docs.len()
+            )],
+            kind: RenderErrorKind::Bundle,
+        });
+    }
+    Ok(docs.pop().unwrap())
 }
 
 /// Replace every `<script type="x-twyla-raw-html">..</script>` with its
@@ -155,6 +144,130 @@ pub fn resolve_raw_html_placeholders(input: &str) -> String {
     out
 }
 
+#[derive(Debug, Clone)]
+struct Page {
+    /// `guis-2`, etc. Used for the URL slug, the bundle output path
+    /// (`<slug>/index.html`), and to locate the source file
+    /// (`/content/<slug>.typ`).
+    slug: String,
+}
+
+impl Page {
+    fn from_slug(slug: &str) -> Self {
+        Self { slug: slug.to_string() }
+    }
+}
+
+/// Discover routed pages from the filesystem layout. Top-level
+/// `content/*.typ` only — no subdirectory recursion yet (the corpus
+/// doesn't need it).
+fn scan_pages(root: &Path) -> Result<Vec<Page>, String> {
+    let content_dir = root.join("content");
+    let entries = std::fs::read_dir(&content_dir)
+        .map_err(|e| format!("cannot read {}: {e}", content_dir.display()))?;
+    let mut pages = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("scan error: {e}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("typ") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem.starts_with('_') {
+            // `_index.typ`, drafts, etc. Out of scope for revision 1.
+            continue;
+        }
+        pages.push(Page::from_slug(stem));
+    }
+    pages.sort_by(|a, b| a.slug.cmp(&b.slug));
+    Ok(pages)
+}
+
+/// Synthesize the virtual `main.typ` body.
+///
+/// Each page becomes one `#document(<slug>/index.html, ..)` call. The
+/// body opens with a `<twyla-page>`-labelled `metadata((url-path: ..))`
+/// so the included file's page-template can read its own routed slug
+/// via a per-document `query(<twyla-page>)`.
+fn generate_main(pages: &[Page]) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "// Generated by twyla. Each #document() emits one routed HTML\n\
+         // file; the <twyla-page> metadata exposes the slug to the\n\
+         // included page-template.\n\n",
+    );
+    for page in pages {
+        // The metadata-label syntax is markup-mode (`#metadata(..) <label>`),
+        // so the document body uses a `[..]` content block.
+        out.push_str(&format!(
+            "#document(\"{slug}/index.html\")[\n  \
+             #metadata((url-path: \"{slug}\")) <twyla-page>\n  \
+             #include \"/content/{slug}.typ\"\n]\n\n",
+            slug = page.slug,
+        ));
+    }
+    out
+}
+
+fn render_virtual_main(
+    root: &Path,
+    main_src: &str,
+) -> Result<Vec<RoutedDoc>, RenderError> {
+    let world = RenderWorld::new(root, main_src).map_err(setup_err)?;
+
+    let Warned { output, warnings } = typst::compile::<Bundle>(&world);
+
+    for w in &warnings {
+        eprintln!("warning: {}", w.message);
+    }
+
+    let bundle = output.map_err(|errors| RenderError {
+        messages: errors
+            .iter()
+            .map(|e| format_diagnostic(&world, e))
+            .collect(),
+        kind: RenderErrorKind::Compile,
+    })?;
+
+    let mut docs = Vec::new();
+    for (path, file) in bundle.files.iter() {
+        let doc = match file {
+            BundleFile::Document(BundleDocument::Html(doc)) => doc,
+            _ => continue,
+        };
+        let raw = typst_html::html(doc).map_err(|errors| RenderError {
+            messages: errors
+                .iter()
+                .map(|e| format_diagnostic(&world, e))
+                .collect(),
+            kind: RenderErrorKind::Compile,
+        })?;
+        docs.push(RoutedDoc {
+            path: PathBuf::from(path.get_without_slash()),
+            html: resolve_raw_html_placeholders(&raw),
+        });
+    }
+
+    if docs.is_empty() {
+        return Err(RenderError {
+            messages: vec!["bundle produced no HTML documents".to_string()],
+            kind: RenderErrorKind::Bundle,
+        });
+    }
+
+    docs.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(docs)
+}
+
+fn setup_err(msg: impl Into<String>) -> RenderError {
+    RenderError {
+        messages: vec![msg.into()],
+        kind: RenderErrorKind::Setup,
+    }
+}
+
 struct RenderWorld {
     root: PathBuf,
     main_id: FileId,
@@ -165,26 +278,25 @@ struct RenderWorld {
 }
 
 impl RenderWorld {
-    fn new(root: &Path, entrypoint: &Path) -> Result<Self, String> {
+    /// `root` is the typst project root (where `/foo.typ` resolves);
+    /// `virtual_main_src` is the synthetic main.typ body that drives
+    /// the bundle compile.
+    fn new(root: &Path, virtual_main_src: &str) -> Result<Self, String> {
         let root = root.canonicalize().map_err(|e| {
             format!("cannot canonicalize root {}: {e}", root.display())
         })?;
-        let entrypoint = entrypoint.canonicalize().map_err(|e| {
-            format!("cannot canonicalize entrypoint {}: {e}", entrypoint.display())
-        })?;
-        if !entrypoint.starts_with(&root) {
-            return Err(format!(
-                "entrypoint {} is not under root {}",
-                entrypoint.display(),
-                root.display()
-            ));
-        }
 
         let mut fonts = FontStore::new();
         fonts.extend(typst_kit::fonts::embedded());
         fonts.extend(typst_kit::fonts::system());
 
-        let main_id = file_id_for(&root, &entrypoint)?;
+        let vpath = VirtualPath::new(VIRTUAL_MAIN_VPATH)
+            .map_err(|e| format!("invalid virtual main path: {e:?}"))?;
+        let main_id =
+            FileId::new(RootedPath::new(VirtualRoot::Project, vpath));
+        let main_source = Source::new(main_id, virtual_main_src.to_string());
+        let mut sources = HashMap::new();
+        sources.insert(main_id, main_source);
 
         Ok(Self {
             root,
@@ -197,7 +309,7 @@ impl RenderWorld {
                     .build(),
             ),
             fonts,
-            sources: Mutex::new(HashMap::new()),
+            sources: Mutex::new(sources),
             files: Mutex::new(HashMap::new()),
         })
     }
@@ -239,18 +351,6 @@ fn format_diagnostic(world: &dyn World, e: &SourceDiagnostic) -> String {
         line + 1,
         col + 1
     )
-}
-
-fn file_id_for(root: &Path, path: &Path) -> Result<FileId, String> {
-    let rel = path
-        .strip_prefix(root)
-        .map_err(|_| format!("{} not under {}", path.display(), root.display()))?;
-    let s = rel
-        .to_str()
-        .ok_or_else(|| format!("non-utf8 path: {}", rel.display()))?;
-    let vpath = VirtualPath::new(format!("/{s}"))
-        .map_err(|e| format!("invalid virtual path: {e:?}"))?;
-    Ok(FileId::new(RootedPath::new(VirtualRoot::Project, vpath)))
 }
 
 impl World for RenderWorld {
@@ -323,5 +423,70 @@ mod tests {
     fn resolve_preserves_internal_newlines() {
         let s = "<script type=\"x-twyla-raw-html\"><svg>\n  <path/>\n</svg></script>";
         assert_eq!(resolve_raw_html_placeholders(s), "<svg>\n  <path/>\n</svg>");
+    }
+
+    #[test]
+    fn generate_main_emits_one_document_per_page() {
+        let pages =
+            vec![Page::from_slug("guis-1"), Page::from_slug("guis-2")];
+        let src = generate_main(&pages);
+        assert!(src.contains("#document(\"guis-1/index.html\")"));
+        assert!(src.contains("#document(\"guis-2/index.html\")"));
+        assert!(src.contains("<twyla-page>"));
+        assert!(src.contains("#include \"/content/guis-1.typ\""));
+    }
+
+    /// Exercises the multi-document case end-to-end: scan content/,
+    /// compile every page in one bundle, verify each routed doc lands
+    /// at the expected path. Catches metadata-label scope leaks between
+    /// documents — the per-doc `query(<twyla-page>)` in page-template
+    /// would otherwise return wrong values for all but one slug.
+    ///
+    /// Opt-in via `cargo test -- --ignored` because it depends on the
+    /// site repo being present at `$SITE_ROOT` / `~/Src/site`.
+    #[test]
+    #[ignore]
+    fn render_site_smoke() {
+        let site = std::env::var_os("SITE_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| {
+                    let mut p = PathBuf::from(h);
+                    p.push("Src/site");
+                    p
+                })
+            })
+            .expect("SITE_ROOT or HOME");
+        let docs = render_site(&site).expect("render_site");
+        let paths: Vec<_> = docs.iter().map(|d| d.path.clone()).collect();
+        assert!(
+            paths.contains(&PathBuf::from("guis-1/index.html")),
+            "missing guis-1 in {paths:?}",
+        );
+        assert!(
+            paths.contains(&PathBuf::from("guis-2/index.html")),
+            "missing guis-2 in {paths:?}",
+        );
+        assert!(
+            paths.contains(&PathBuf::from("guis-3/index.html")),
+            "missing guis-3 in {paths:?}",
+        );
+        // Per-document `<twyla-page>` scoping: each doc's anchor-only
+        // links should absolutize against ITS slug, not another's.
+        for doc in &docs {
+            let slug = doc.path.parent().unwrap().to_str().unwrap();
+            let foreign_anchor = format!(
+                "samsartor.com/{}/#",
+                if slug == "guis-1" { "guis-2" } else { "guis-1" },
+            );
+            if doc.html.contains(&format!("samsartor.com/{slug}/#")) {
+                // Has anchor-only links — must NOT also contain a
+                // foreign-slug anchor URL.
+                assert!(
+                    !doc.html.contains(&foreign_anchor),
+                    "{slug} contains foreign anchor URL — label scope leak",
+                );
+            }
+        }
     }
 }
