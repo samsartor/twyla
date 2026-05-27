@@ -1,8 +1,10 @@
 //! `twyla` — the CLI.
 //!
-//! Two audiences. End-user (zero-flag, cwd-driven):
+//! Two audiences. End-user (cwd-driven, no flags required):
 //!
 //! - `twyla serve` — dev server on port 1111.
+//! - `twyla build [-o <dir>]` — write the static site to `./public/`
+//!   (or wherever `-o` points).
 //!
 //! Porting harness (flag-driven):
 //!
@@ -18,6 +20,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use twyla::build::{Build, run as build_run};
 use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff, parse_html};
 use twyla::import::import_md;
 use twyla::render::render_slug;
@@ -39,6 +42,15 @@ enum Cmd {
     /// Start the dev server. Zero flags — operates on the current
     /// working directory. Binds to port 1111.
     Serve,
+    /// Compile every page under `content/` and write the static site
+    /// to disk. Default output `./public/` (matches zola). Operates
+    /// on the current working directory.
+    Build {
+        /// Output directory. Defaults to `./public/` (zola-compatible).
+        /// Existing files are overwritten in place; nothing is removed.
+        #[arg(long, short = 'o', default_value = "public")]
+        output_dir: PathBuf,
+    },
     /// Compile a single page, run the resolution pass, print HTML.
     Render {
         /// Site repo root. Defaults to `$SITE_ROOT` then `$HOME/Src/site`.
@@ -90,12 +102,49 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Serve => cmd_serve(),
+        Cmd::Build { output_dir } => cmd_build(output_dir),
         Cmd::Render { site_root, slug } => cmd_render(site_root, &slug),
         Cmd::Diff { textonly_pre, ignore_attr, expected, actual } => {
             cmd_diff(textonly_pre, &ignore_attr, &expected, &actual)
         }
         Cmd::Check { site_root, slug } => cmd_check(site_root, &slug),
         Cmd::Import { input } => cmd_import(&input),
+    }
+}
+
+fn cmd_build(output_dir: PathBuf) -> ExitCode {
+    let site_root = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cannot read current directory: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if !site_root.join("content").is_dir() {
+        eprintln!(
+            "error: no `content/` directory under {} — run `twyla build` \
+             from the project root.",
+            site_root.display(),
+        );
+        return ExitCode::from(2);
+    }
+    let start = std::time::Instant::now();
+    match build_run(Build { site_root, output_dir: output_dir.clone() }) {
+        Ok(summary) => {
+            eprintln!(
+                "twyla build: {} pages, {} static, {} assets → {} ({:.1?})",
+                summary.pages,
+                summary.static_files,
+                summary.content_assets,
+                output_dir.display(),
+                start.elapsed(),
+            );
+            ExitCode::from(0)
+        }
+        Err(e) => {
+            eprintln!("build error: {e}");
+            ExitCode::from(1)
+        }
     }
 }
 
