@@ -18,10 +18,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::project::TwylaContext;
 use crate::render::{RenderError, render_site};
 
 pub struct Build {
-    pub site_root: PathBuf,
+    pub ctx: TwylaContext,
     pub output_dir: PathBuf,
 }
 
@@ -43,7 +44,7 @@ impl std::fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 pub fn run(build: Build) -> Result<BuildSummary, BuildError> {
-    let docs = render_site(&build.site_root).map_err(BuildError::Render)?;
+    let docs = render_site(&build.ctx).map_err(BuildError::Render)?;
 
     fs::create_dir_all(&build.output_dir).map_err(|e| BuildError::Io {
         context: format!("creating {}", build.output_dir.display()),
@@ -64,7 +65,7 @@ pub fn run(build: Build) -> Result<BuildSummary, BuildError> {
         })?;
     }
 
-    let static_dir = build.site_root.join("static");
+    let static_dir = build.ctx.static_dir();
     let static_copied = if static_dir.is_dir() {
         copy_dir_contents(&static_dir, &build.output_dir)?
     } else {
@@ -73,7 +74,7 @@ pub fn run(build: Build) -> Result<BuildSummary, BuildError> {
 
     // Zola-style colocated content assets: anything under `content/`
     // that isn't a `.typ` file gets emitted at its root path.
-    let content_dir = build.site_root.join("content");
+    let content_dir = build.ctx.content_dir();
     let content_copied = if content_dir.is_dir() {
         copy_non_typ_contents(&content_dir, &build.output_dir)?
     } else {

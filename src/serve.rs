@@ -39,12 +39,11 @@ use std::time::Instant;
 
 use typst_kit::watcher::Watcher;
 
-use crate::render::{
-    RenderError, RenderWorld, RoutedDoc, bundle_path_for_slug, scan_pages,
-};
+use crate::project::TwylaContext;
+use crate::render::{RenderError, RenderWorld, RoutedDoc};
 
 pub struct Serve {
-    pub site_root: PathBuf,
+    pub ctx: TwylaContext,
     pub addr: SocketAddr,
 }
 
@@ -53,7 +52,7 @@ pub struct Serve {
 type LastOutput = Mutex<Result<Vec<RoutedDoc>, RenderError>>;
 
 struct ServeState {
-    site_root: PathBuf,
+    ctx: TwylaContext,
     last_output: Arc<LastOutput>,
 }
 
@@ -62,7 +61,7 @@ pub fn run(serve: Serve) -> io::Result<()> {
     // foreground thread. Doing it before bind means a startup error is
     // reported on stderr before any browser sees it, and the first
     // request after bind hits a warm cache.
-    let world = match RenderWorld::new(&serve.site_root) {
+    let world = match RenderWorld::new(&serve.ctx) {
         Ok(w) => Arc::new(Mutex::new(w)),
         Err(e) => {
             eprintln!("twyla serve: setup failed:\n{e}");
@@ -87,7 +86,7 @@ pub fn run(serve: Serve) -> io::Result<()> {
 
     // Spawn the watcher thread. It owns the world from this point on
     // for compile purposes; request handlers only read `last_output`.
-    let content_dir = world.lock().unwrap().content_dir();
+    let content_dir = serve.ctx.content_dir();
     {
         let world = Arc::clone(&world);
         let last_output = Arc::clone(&last_output);
@@ -102,11 +101,11 @@ pub fn run(serve: Serve) -> io::Result<()> {
     eprintln!(
         "twyla serve: http://{}  (site root: {})",
         local,
-        serve.site_root.display(),
+        serve.ctx.root.display(),
     );
 
     let state = ServeState {
-        site_root: serve.site_root,
+        ctx: serve.ctx,
         last_output,
     };
 
@@ -280,21 +279,18 @@ fn dispatch(state: &ServeState, path: &str) -> Response {
     let path = path.split('?').next().unwrap_or(path);
 
     if path == "/" {
-        return serve_doc(state, "index.html");
+        return serve_doc(state, &PathBuf::from("index.html"));
     }
 
     // Page route: single path component, no extension, matching
     // `content/<slug>.typ`. Anything else falls through to static.
     let trimmed = path.trim_start_matches('/').trim_end_matches('/');
-    if !trimmed.is_empty() && !trimmed.contains('/') {
-        let typ_path =
-            state.site_root.join("content").join(format!("{trimmed}.typ"));
-        if typ_path.is_file() {
-            return serve_doc(state, &bundle_path_for_slug(trimmed));
-        }
+    if !trimmed.is_empty() && !trimmed.contains('/') && state.ctx.page_exists(trimmed) {
+        let route = state.ctx.default_route(trimmed);
+        return serve_doc(state, &route.bundle_path);
     }
 
-    serve_static(&state.site_root, path)
+    serve_static(&state.ctx, path)
 }
 
 /// Serve a compiled doc from the cached `last_output`. For `/`,
@@ -305,15 +301,14 @@ fn dispatch(state: &ServeState, path: &str) -> Response {
 /// even though the `.typ` exists (probably the compile errored on that
 /// doc — the error path below handles the compile-error case before
 /// this).
-fn serve_doc(state: &ServeState, bundle_path: &str) -> Response {
-    let target = PathBuf::from(bundle_path);
+fn serve_doc(state: &ServeState, bundle_path: &Path) -> Response {
     let guard = state.last_output.lock().unwrap();
     match &*guard {
-        Ok(docs) => match docs.iter().find(|d| d.path == target) {
+        Ok(docs) => match docs.iter().find(|d| d.path == bundle_path) {
             Some(d) => Response::html(200, d.html.clone()),
             None => {
-                if bundle_path == "index.html" {
-                    placeholder_index(&state.site_root)
+                if bundle_path == Path::new("index.html") {
+                    placeholder_index(&state.ctx)
                 } else {
                     Response::text(404, "page not found in bundle")
                 }
@@ -333,8 +328,8 @@ fn serve_doc(state: &ServeState, bundle_path: &str) -> Response {
 /// Plain-list index of available slugs, served at `/` when no
 /// `content/_index.typ` exists. Stand-in for a real home page during
 /// the early stages of a site.
-fn placeholder_index(site_root: &Path) -> Response {
-    let slugs = match scan_pages(site_root) {
+fn placeholder_index(ctx: &TwylaContext) -> Response {
+    let slugs = match ctx.scan_pages() {
         Ok(s) => s,
         Err(e) => {
             return Response::html(500, format!("<pre>{}</pre>", html_escape(&e)));
@@ -361,7 +356,7 @@ fn placeholder_index(site_root: &Path) -> Response {
     Response::html(200, out)
 }
 
-fn serve_static(site_root: &Path, request_path: &str) -> Response {
+fn serve_static(ctx: &TwylaContext, request_path: &str) -> Response {
     let rel = request_path.trim_start_matches('/');
     // Reject path traversal. Bare `..` segments only — anything embedded
     // in a name is a normal char.
@@ -369,7 +364,7 @@ fn serve_static(site_root: &Path, request_path: &str) -> Response {
         return Response::text(404, "not found");
     }
 
-    let static_path = site_root.join("static").join(rel);
+    let static_path = ctx.static_dir().join(rel);
     if let Ok(body) = std::fs::read(&static_path) {
         return Response::bytes(200, mime_for(&static_path), body);
     }
@@ -377,7 +372,7 @@ fn serve_static(site_root: &Path, request_path: &str) -> Response {
     // Zola colocates assets in `content/` (e.g., `content/foo.svg` →
     // `/foo.svg`). Mirror that for porting; revisit once twyla has a
     // real asset model.
-    let content_path = site_root.join("content").join(rel);
+    let content_path = ctx.content_dir().join(rel);
     let is_typ =
         content_path.extension().and_then(|e| e.to_str()) == Some("typ");
     if !is_typ {

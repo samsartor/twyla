@@ -1,24 +1,30 @@
 //! `twyla` — the CLI.
 //!
-//! Two audiences. End-user (cwd-driven, no flags required):
+//! Every subcommand resolves a [`TwylaContext`] from the shared
+//! `#[command(flatten)] ContextArgs` (defaulting to cwd) and hands it
+//! to the library. Two audiences:
+//!
+//! End-user (cwd-driven, no flags required):
 //!
 //! - `twyla serve` — dev server on port 1111.
 //! - `twyla build [-o <dir>]` — write the static site to `./public/`
 //!   (or wherever `-o` points).
 //!
-//! Porting harness (flag-driven):
+//! Porting harness:
 //!
-//! - `twyla render [--site-root <dir>] <slug>` — compile a single page.
-//! - `twyla check  [--site-root <dir>] <slug>` — render + diff against
-//!   `<site>/public/<slug>/index.html` under the porting relaxations.
-//! - `twyla diff   <expected> <actual>` — structural AST diff.
+//! - `twyla render <slug>` — compile a single page.
+//! - `twyla check  <slug>` — render + diff against
+//!   `<root>/public/<slug>/index.html` under the porting relaxations.
+//!   Requires `--base-url` (or `TWYLA_BASE_URL`) for the
+//!   anchor-link rewrite.
+//! - `twyla diff <expected> <actual>` — structural AST diff.
 //! - `twyla import <md>` — md→typ draft generator.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use twyla::build::{Build, run as build_run};
 use twyla::diff::{
@@ -26,6 +32,7 @@ use twyla::diff::{
     rewrite_own_page_anchor_hrefs,
 };
 use twyla::import::import_md;
+use twyla::project::TwylaContext;
 use twyla::render::render_slug;
 use twyla::serve::{Serve, run as serve_run};
 
@@ -40,25 +47,66 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// Common project-resolution args. Flattened into every subcommand
+/// that operates on a twyla project. Today: `--root` and
+/// `--base-url`. Future: a `--config <PATH>` for a `twyla.toml`.
+#[derive(Args, Clone, Debug)]
+struct ContextArgs {
+    /// Project root. Defaults to the current directory.
+    #[arg(long, env = "TWYLA_ROOT", global = true)]
+    root: Option<PathBuf>,
+    /// Base URL (origin + optional path prefix). Required by `check`
+    /// for anchor-link rewriting; optional elsewhere until typst-side
+    /// asset URLs land.
+    #[arg(long, env = "TWYLA_BASE_URL", global = true)]
+    base_url: Option<String>,
+}
+
+impl ContextArgs {
+    /// Resolve into a [`TwylaContext`]. Falls back to cwd when `--root`
+    /// is absent; verifies `content/` exists before returning so
+    /// downstream errors are about real problems rather than wrong cwd.
+    fn resolve(self) -> Result<TwylaContext, String> {
+        let root = match self.root {
+            Some(p) => p,
+            None => std::env::current_dir()
+                .map_err(|e| format!("cannot read current directory: {e}"))?,
+        };
+        let ctx = TwylaContext::new(&root, self.base_url)?;
+        if !ctx.content_dir().is_dir() {
+            return Err(format!(
+                "no `content/` directory under {} — run twyla from \
+                 the project root, or pass --root <PATH>.",
+                ctx.root.display(),
+            ));
+        }
+        Ok(ctx)
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Start the dev server. Zero flags — operates on the current
-    /// working directory. Binds to port 1111.
-    Serve,
+    /// working directory (or `--root <PATH>`). Binds to port 1111.
+    Serve {
+        #[command(flatten)]
+        ctx: ContextArgs,
+    },
     /// Compile every page under `content/` and write the static site
-    /// to disk. Default output `./public/` (matches zola). Operates
-    /// on the current working directory.
+    /// to disk. Default output `<root>/public/` (matches zola).
     Build {
-        /// Output directory. Defaults to `./public/` (zola-compatible).
-        /// Existing files are overwritten in place; nothing is removed.
-        #[arg(long, short = 'o', default_value = "public")]
-        output_dir: PathBuf,
+        #[command(flatten)]
+        ctx: ContextArgs,
+        /// Output directory. Defaults to `<root>/public/`
+        /// (zola-compatible). Existing files are overwritten in place;
+        /// nothing is removed.
+        #[arg(long, short = 'o')]
+        output_dir: Option<PathBuf>,
     },
     /// Compile a single page, run the resolution pass, print HTML.
     Render {
-        /// Site repo root. Defaults to `$SITE_ROOT` then `$HOME/Src/site`.
-        #[arg(long, env = "SITE_ROOT")]
-        site_root: Option<PathBuf>,
+        #[command(flatten)]
+        ctx: ContextArgs,
         /// Page slug — `guis-2` for `content/guis-2.typ`.
         slug: String,
     },
@@ -76,25 +124,18 @@ enum Cmd {
     /// Render a ported page and diff it against the zola-built version.
     ///
     /// Zola's content/public layout is the manifest: given a slug, the
-    /// inputs are `<site>/content/<slug>.typ` and
-    /// `<site>/public/<slug>/index.html`. No per-page configuration today.
+    /// inputs are `<root>/content/<slug>.typ` and
+    /// `<root>/public/<slug>/index.html`. Requires `--base-url` for
+    /// reconciling zola's absolutized anchor links against twyla's
+    /// fragment-only form.
     Check {
-        /// Site repo root (zola side). Defaults to `$SITE_ROOT` then
-        /// `$HOME/Src/site`.
-        #[arg(long, env = "SITE_ROOT")]
-        site_root: Option<PathBuf>,
+        #[command(flatten)]
+        ctx: ContextArgs,
         /// Page slug — `guis-2` for `content/guis-2.typ` and
         /// `public/guis-2/index.html`.
         slug: String,
     },
     /// Convert a zola markdown post to a typst draft on stdout.
-    ///
-    /// Best-effort scaffolding — handles the common shape of the
-    /// personal-site corpus (frontmatter, headings, paragraphs,
-    /// blockquotes, fenced code, links, centered/svg/image/diagram
-    /// shortcodes). Manual cleanup is expected for raw HTML, custom
-    /// shortcodes, and per-page link quirks. Pipe through `> foo.typ`
-    /// and iterate against `twyla check`.
     Import {
         /// Path to the source markdown file.
         input: PathBuf,
@@ -104,35 +145,36 @@ enum Cmd {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve => cmd_serve(),
-        Cmd::Build { output_dir } => cmd_build(output_dir),
-        Cmd::Render { site_root, slug } => cmd_render(site_root, &slug),
+        Cmd::Serve { ctx } => cmd_serve(ctx),
+        Cmd::Build { ctx, output_dir } => cmd_build(ctx, output_dir),
+        Cmd::Render { ctx, slug } => cmd_render(ctx, &slug),
         Cmd::Diff { textonly_pre, ignore_attr, expected, actual } => {
             cmd_diff(textonly_pre, &ignore_attr, &expected, &actual)
         }
-        Cmd::Check { site_root, slug } => cmd_check(site_root, &slug),
+        Cmd::Check { ctx, slug } => cmd_check(ctx, &slug),
         Cmd::Import { input } => cmd_import(&input),
     }
 }
 
-fn cmd_build(output_dir: PathBuf) -> ExitCode {
-    let site_root = match std::env::current_dir() {
-        Ok(p) => p,
+/// Resolve `ContextArgs` or return ExitCode 2 with the error printed.
+fn resolve_ctx(args: ContextArgs) -> Result<TwylaContext, ExitCode> {
+    match args.resolve() {
+        Ok(c) => Ok(c),
         Err(e) => {
-            eprintln!("cannot read current directory: {e}");
-            return ExitCode::from(2);
+            eprintln!("{e}");
+            Err(ExitCode::from(2))
         }
-    };
-    if !site_root.join("content").is_dir() {
-        eprintln!(
-            "error: no `content/` directory under {} — run `twyla build` \
-             from the project root.",
-            site_root.display(),
-        );
-        return ExitCode::from(2);
     }
+}
+
+fn cmd_build(args: ContextArgs, output_dir: Option<PathBuf>) -> ExitCode {
+    let ctx = match resolve_ctx(args) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let output_dir = output_dir.unwrap_or_else(|| ctx.default_output_dir());
     let start = std::time::Instant::now();
-    match build_run(Build { site_root, output_dir: output_dir.clone() }) {
+    match build_run(Build { ctx, output_dir: output_dir.clone() }) {
         Ok(summary) => {
             eprintln!(
                 "twyla build: {} pages, {} static, {} assets → {} ({:.1?})",
@@ -151,24 +193,13 @@ fn cmd_build(output_dir: PathBuf) -> ExitCode {
     }
 }
 
-fn cmd_serve() -> ExitCode {
-    let site_root = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("cannot read current directory: {e}");
-            return ExitCode::from(2);
-        }
+fn cmd_serve(args: ContextArgs) -> ExitCode {
+    let ctx = match resolve_ctx(args) {
+        Ok(c) => c,
+        Err(code) => return code,
     };
-    if !site_root.join("content").is_dir() {
-        eprintln!(
-            "error: no `content/` directory under {} — run `twyla serve` \
-             from the project root.",
-            site_root.display(),
-        );
-        return ExitCode::from(2);
-    }
     let addr: SocketAddr = "127.0.0.1:1111".parse().unwrap();
-    match serve_run(Serve { site_root, addr }) {
+    match serve_run(Serve { ctx, addr }) {
         Ok(()) => ExitCode::from(0),
         Err(e) => {
             eprintln!("serve error: {e}");
@@ -197,15 +228,12 @@ fn cmd_import(input: &Path) -> ExitCode {
     }
 }
 
-fn cmd_render(site_root: Option<PathBuf>, slug: &str) -> ExitCode {
-    let site_root = match resolve_site_root(site_root) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(2);
-        }
+fn cmd_render(args: ContextArgs, slug: &str) -> ExitCode {
+    let ctx = match resolve_ctx(args) {
+        Ok(c) => c,
+        Err(code) => return code,
     };
-    match render_slug(&site_root, slug) {
+    match render_slug(&ctx, slug) {
         Ok(doc) => {
             print!("{}", doc.html);
             ExitCode::from(0)
@@ -272,26 +300,31 @@ fn cmd_diff(
     }
 }
 
-/// Render `<site>/content/<slug>.typ` and diff against
-/// `<site>/public/<slug>/index.html` under the porting relaxations.
+/// Render `<root>/content/<slug>.typ` and diff against
+/// `<root>/public/<slug>/index.html` under the porting relaxations.
 ///
-/// Relaxations applied are the cumulative set found necessary across pages
-/// ported so far. New ones get added here (after Sam-approves the
-/// divergence) until enough pages need page-specific overrides to justify
-/// a manifest.
-fn cmd_check(site_root: Option<PathBuf>, slug: &str) -> ExitCode {
-    let site_root = match resolve_site_root(site_root) {
-        Ok(p) => p,
+/// Requires `--base-url` (or `TWYLA_BASE_URL`) for
+/// `rewrite_own_page_anchor_hrefs` — zola absolutizes anchor-only
+/// links against the base, typst emits fragment-only, so we rewrite
+/// zola's form back before comparison.
+fn cmd_check(args: ContextArgs, slug: &str) -> ExitCode {
+    let ctx = match resolve_ctx(args) {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+
+    let base_url = match ctx.require_base_url() {
+        Ok(u) => u.trim_end_matches('/').to_string(),
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(2);
         }
     };
 
-    let zola_html_path = site_root.join(format!("public/{slug}/index.html"));
+    let zola_html_path = ctx.root.join(format!("public/{slug}/index.html"));
 
     eprintln!(">>> rendering {slug}");
-    let typst_html = match render_slug(&site_root, slug) {
+    let typst_html = match render_slug(&ctx, slug) {
         Ok(doc) => doc.html,
         Err(e) => {
             eprintln!("{e}");
@@ -330,11 +363,11 @@ fn cmd_check(site_root: Option<PathBuf>, slug: &str) -> ExitCode {
     // label-based `#link(<frag>)` emits the unabsolutized form
     // `<a href="#frag">`. Both resolve to the same target, so for
     // diff purposes rewrite the zola form back to the fragment-only
-    // form before comparison. Hardcoded base — replace with config
-    // once twyla has a config layer.
+    // form before comparison.
+    let route_url = ctx.default_route(slug).url_path;
     rewrite_own_page_anchor_hrefs(
         &mut expected,
-        &format!("https://samsartor.com/{slug}/#"),
+        &format!("{base_url}{route_url}#"),
     );
     let actual = parse_html(&typst_html);
 
@@ -349,13 +382,4 @@ fn cmd_check(site_root: Option<PathBuf>, slug: &str) -> ExitCode {
             ExitCode::from(1)
         }
     }
-}
-
-fn resolve_site_root(arg: Option<PathBuf>) -> Result<PathBuf, String> {
-    if let Some(p) = arg {
-        return Ok(p);
-    }
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| "neither --site-root nor $SITE_ROOT nor $HOME is set".to_string())?;
-    Ok(PathBuf::from(home).join("Src/site"))
 }
