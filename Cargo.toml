@@ -17,6 +17,12 @@ typst-library = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6
 comemo = "0.5"
 ecow = "0.2"
 
+# Path-aware file watcher for `static/` (serve hot-reload). The typst
+# watcher only signals "something changed"; this one surfaces the changed
+# path so the browser can swap a single asset in place. Already in the
+# tree transitively via typst-kit.
+notify = "8"
+
 # HTML AST diff harness (porting verification)
 html5ever = "0.39"
 markup5ever_rcdom = "0.39"

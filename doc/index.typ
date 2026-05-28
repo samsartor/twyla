@@ -167,12 +167,15 @@ Single `twyla` binary, clap-driven. Two audiences.
 
 === End-user commands (turn-key, cwd-driven)
 
-- *`twyla serve`* — dev server on `127.0.0.1:1111`. Zero flags. Routes
-  `/<slug>/` to `render_slug`, falls back to `cwd/static/` then
-  `cwd/content/` (zola colocated-asset convention) for everything
-  else. `/` is a placeholder index until the home page is wired.
-  Single-threaded accept loop, hand-rolled HTTP/1.1 over `std::net`
-  — no async, no extra deps. No watch / no HMR yet.
+- *`twyla serve`* — dev server on `127.0.0.1:1111`. Zero flags. Serves
+  the most recent bundle compile from a shared `World` (request handlers
+  never compile); a watcher thread recompiles incrementally on change.
+  `/` is the compiled home page (placeholder slug-index if no
+  `_index.typ`), `/<slug>/` is the routed doc, everything else falls back
+  to `cwd/static/` then `cwd/content/` (zola colocated-asset convention).
+  Live reload over SSE — edits reload the browser automatically; CSS/image
+  edits swap in place. Single-threaded accept loop, hand-rolled HTTP/1.1
+  over `std::net`; `notify` the only added dep.
 - *`twyla build [-o <dir>]`* — compile every page, write
   `<dir>/<slug>/index.html` per routed doc, copy `static/` verbatim
   and `content/*.{!typ,!md}` (the asset bridge). Default output
@@ -335,6 +338,27 @@ divergence), attribute-value matchers ("ignore `style` only when value =
   server routes `/` through `render_site` (full-bundle compile) so
   the home page's cross-doc query sees every post; single-slug
   rendering would surface an empty listing.
++ #strike[*Shared `World` + watcher-driven incremental recompile.*] —
+  done. One persistent `RenderWorld` behind `Arc<Mutex<..>>`; a
+  `typst_kit::watcher` thread waits on `world.dependencies()` +
+  `content/`, then `refresh_main` + `reset` + `comemo::evict(10)` +
+  `compile_bundle` and publishes to an `Arc<Mutex<LastOutput>>`. Request
+  handlers only clone the matching doc's HTML from the last compile —
+  they never compile — so they're ms regardless of doc size. Mirrors
+  typst's own `typst watch` loop.
++ #strike[*SSE hot reload.*] — done. The browser reloads itself on every
+  recompile. `/__twyla/reload` is a Server-Sent-Events stream; live
+  connections park in an `Arc<Mutex<Vec<TcpStream>>>` registry and the
+  watcher broadcasts a `reload` event after every publish — errors
+  included, so fixing broken typst auto-recovers the page. A `<script>`
+  is spliced before `</body>` of each served HTML response (serve-only;
+  `twyla build` output is untouched). Chose SSE over a websocket: the
+  signal is one-directional, so no handshake hash, no frame masking, and
+  `EventSource` auto-reconnects across a `twyla serve` restart for free.
+  A second `notify` watcher on `static/` — which the typst watcher never
+  sees, since static assets aren't typst dependencies — broadcasts
+  `asset:/<path>`; the client swaps that one stylesheet/image in place,
+  with a full reload as fallback.
 
 == Roadmap
 
@@ -373,19 +397,19 @@ infrastructure only when a porting case forces it.
 
 Queued, in the order we plan to land them:
 
-+ *Shared `World` + comemo carry + `dependencies()` invalidation.*
-  One `RenderWorld` lives behind a `Mutex` across requests; the
++ #strike[*Shared `World` + comemo carry + `dependencies()` invalidation.*]
+  — done. One `RenderWorld` lives behind a `Mutex` across requests; the
   `typst_kit::watcher::Watcher` thread waits on `World::dependencies()`
   changes and runs `world.reset()` + `comemo::evict(10)` on each
   batched event. Single-doc compiles become fast (ms) on warm cache.
-  No browser-side reload yet — manual refresh after the watcher
-  prints a recompile line. Mirrors typst's own CLI watch loop
-  (`crates/typst-cli/src/watch.rs`, `typst_kit::watcher`) — same
-  crate, same pattern, no fork.
-+ *WS-driven hot reload.* Server injects a tiny `<script>` into served
-  HTML that opens a websocket; watcher revision signals "recompiled,
-  reload" over it. Clean split from the shared-World revision —
-  rollback story stays simple if the WS layer misbehaves.
+  Mirrors typst's own CLI watch loop (`crates/typst-cli/src/watch.rs`,
+  `typst_kit::watcher`) — same crate, same pattern, no fork.
++ #strike[*WS-driven hot reload.*] — done, via SSE rather than a
+  websocket (one-directional signal — no handshake/masking, free
+  reconnect; see Status). Server splices a `<script>` into served HTML
+  that subscribes to `/__twyla/reload`; the watcher signals "recompiled,
+  reload" over it. Clean split from the shared-`World` revision kept the
+  rollback story simple.
 + *Real `asset-url` primitive.* Drop the hardcoded `base_url` in
   `templates/shortcodes.typ`. Comes from a twyla config layer (TOML or
   typst-side). This is the moment we promote our one resolution-pass
@@ -566,6 +590,18 @@ Compact gotcha list; details in commits.
   whenever per-doc metadata needs to flow into deep code (rare now
   that internal links are label-resolved, but the pattern remains
   the escape hatch).
+- *`typst_kit::watcher::Watcher::wait()` exposes no changed paths.* It
+  owns the `notify` receiver and returns only `StrResult<()>` —
+  "something relevant changed" — consuming `event.paths` internally (for
+  its inotify implicit-unwatch workaround) and discarding them. Fine for
+  recompile-or-not; useless for per-asset hot-swap. So `static/` (which
+  it doesn't watch anyway — static assets aren't typst dependencies) gets
+  its own `notify` recursive watcher that surfaces the path. Kept the two
+  separate rather than unifying: typst_kit's ~120 lines encode real
+  robustness (event batching, the inotify implicit-unwatch trap,
+  missing-file polling, dynamic dep-set re-subscription per compile), and
+  path info on the typst side buys nothing since any dep change forces a
+  full reload regardless.
 
 == Upstream-watch list
 
@@ -608,7 +644,7 @@ outside.
 Decisions to date (every feature considered has landed on "library"):
 asset fingerprinting (post-export DOM walk), image optimization (twyla
 function bypassing `image()`), pretty URLs (`#document(..)` paths), path
-computation, hot reload (WebSocket-inject during dev), RSS/sitemap,
+computation, hot reload (SSE-inject during dev), RSS/sitemap,
 per-document smartquote/lang (already configurable), incremental compile
 (comemo), file mtime via `sys.inputs`, async/HTTP at compile (pre-fetch
 in Rust). No fork: HTML-syntax-mode (the JSX-style sugar isn't worth
@@ -644,8 +680,7 @@ work — that's the evidence base for reconsidering.
   `sass sass/site.sass public/site.css` directly if `sass` is on
   PATH); JS via `yarn build`. `static/scripts/` is in `.gitignore`
   so only `static/site.css` is tracked.
-- `twyla serve` recompiles the requested page per request — ~3s
-  debug, sub-second `--release`. Shared-`World` + comemo carry is
-  the queued revision that fixes this; until then prefer
-  `cargo build --release && ./target/release/twyla serve` for
-  iteration.
+- `twyla serve` serves from a shared `World` + incremental watcher, so
+  requests are ms regardless of doc size; recompiles run in the
+  background on file change and reload the browser over SSE. (The earlier
+  per-request-compile design was ~3s debug / sub-second `--release`.)

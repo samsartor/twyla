@@ -33,10 +33,12 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
+use notify::{EventKind, RecursiveMode, Watcher as _};
 use typst_kit::watcher::Watcher;
 
 use crate::project::TwylaContext;
@@ -51,9 +53,15 @@ pub struct Serve {
 /// thread, read by request handlers.
 type LastOutput = Mutex<Result<Vec<RoutedDoc>, RenderError>>;
 
+/// Live Server-Sent-Events connections subscribed to `/__twyla/reload`.
+/// Request handlers push new ones; the watcher threads write reload
+/// events and prune any whose socket has closed.
+type ReloadClients = Mutex<Vec<TcpStream>>;
+
 struct ServeState {
     ctx: TwylaContext,
     last_output: Arc<LastOutput>,
+    reload_clients: Arc<ReloadClients>,
 }
 
 pub fn run(serve: Serve) -> io::Result<()> {
@@ -83,16 +91,31 @@ pub fn run(serve: Serve) -> io::Result<()> {
         ),
     }
     let last_output: Arc<LastOutput> = Arc::new(Mutex::new(initial));
+    let reload_clients: Arc<ReloadClients> = Arc::new(Mutex::new(Vec::new()));
 
-    // Spawn the watcher thread. It owns the world from this point on
-    // for compile purposes; request handlers only read `last_output`.
+    // Spawn the typst watcher thread. It owns the world from this point
+    // on for compile purposes; request handlers only read `last_output`.
+    // After each recompile it broadcasts a full-reload event.
     let content_dir = serve.ctx.content_dir();
     {
         let world = Arc::clone(&world);
         let last_output = Arc::clone(&last_output);
+        let reload_clients = Arc::clone(&reload_clients);
         thread::Builder::new()
             .name("twyla-watcher".to_string())
-            .spawn(move || run_watcher(world, last_output, content_dir))
+            .spawn(move || run_watcher(world, last_output, content_dir, reload_clients))
+            .map_err(io::Error::other)?;
+    }
+
+    // Spawn the static-asset watcher thread. Unlike the typst watcher it
+    // surfaces the changed path, so the browser can swap one stylesheet
+    // or image in place instead of doing a full reload.
+    {
+        let static_dir = serve.ctx.static_dir();
+        let reload_clients = Arc::clone(&reload_clients);
+        thread::Builder::new()
+            .name("twyla-static-watcher".to_string())
+            .spawn(move || run_static_watcher(static_dir, reload_clients))
             .map_err(io::Error::other)?;
     }
 
@@ -107,6 +130,7 @@ pub fn run(serve: Serve) -> io::Result<()> {
     let state = ServeState {
         ctx: serve.ctx,
         last_output,
+        reload_clients,
     };
 
     for stream in listener.incoming() {
@@ -132,6 +156,7 @@ fn run_watcher(
     world: Arc<Mutex<RenderWorld>>,
     last_output: Arc<LastOutput>,
     content_dir: PathBuf,
+    reload_clients: Arc<ReloadClients>,
 ) {
     let mut watcher = match Watcher::new(None) {
         Ok(w) => w,
@@ -192,7 +217,81 @@ fn run_watcher(
             ),
         }
         *last_output.lock().unwrap() = docs_result;
+
+        // Tell every connected browser to reload. We signal on *every*
+        // publish, including compile errors, so that fixing broken typst
+        // reloads the error page back to a working one.
+        broadcast(&reload_clients, "reload");
     }
+}
+
+/// Dedicated `notify` watcher for `static/`. The typst watcher only
+/// signals "something changed" and never sees `static/` (static assets
+/// aren't typst dependencies); this fills that gap and, crucially,
+/// surfaces the *changed path* so the browser can swap a single
+/// stylesheet or image in place rather than reloading the whole page.
+fn run_static_watcher(static_dir: PathBuf, reload_clients: Arc<ReloadClients>) {
+    if !static_dir.is_dir() {
+        return; // no static/ → nothing to watch
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = match notify::recommended_watcher(tx) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!(
+                "twyla serve: static watcher unavailable ({e}); \
+                 static asset edits won't hot-reload."
+            );
+            return;
+        }
+    };
+    if let Err(e) = watcher.watch(&static_dir, RecursiveMode::Recursive) {
+        eprintln!(
+            "twyla serve: cannot watch {} ({e}); \
+             static asset edits won't hot-reload.",
+            static_dir.display(),
+        );
+        return;
+    }
+
+    // `watcher` must stay alive for the lifetime of this loop.
+    for res in rx {
+        let event = match res {
+            Ok(ev) => ev,
+            Err(e) => {
+                eprintln!("twyla serve: static watch error: {e}");
+                continue;
+            }
+        };
+        if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+            continue;
+        }
+        for path in &event.paths {
+            let Ok(rel) = path.strip_prefix(&static_dir) else {
+                continue;
+            };
+            // The URL the dev server serves this file at: `static/site.css`
+            // → `/site.css`. The client matches it suffix-wise against
+            // `<link>`/`<img>` URLs, so a `base_url`/version prefix on the
+            // page is tolerated.
+            let url = format!("/{}", rel.to_string_lossy().replace('\\', "/"));
+            eprintln!("twyla serve: static asset changed → {url}");
+            broadcast(&reload_clients, &format!("asset:{url}"));
+        }
+    }
+}
+
+/// Push one Server-Sent-Events message to every connected reload client,
+/// dropping any whose socket has closed.
+fn broadcast(clients: &ReloadClients, data: &str) {
+    let mut clients = clients.lock().unwrap();
+    clients.retain_mut(|s| write_sse(s, data).is_ok());
+}
+
+fn write_sse(stream: &mut TcpStream, data: &str) -> io::Result<()> {
+    write!(stream, "data: {data}\n\n")?;
+    stream.flush()
 }
 
 fn handle(state: &ServeState, mut stream: TcpStream) -> io::Result<()> {
@@ -201,17 +300,105 @@ fn handle(state: &ServeState, mut stream: TcpStream) -> io::Result<()> {
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("/").to_string();
 
+    // The live-reload event stream is a long-lived connection: write the
+    // SSE headers and hand the socket to the registry instead of running
+    // it through the request/response path (which would close it).
+    if method == "GET" && path.split('?').next() == Some("/__twyla/reload") {
+        return accept_reload_client(state, stream);
+    }
+
     let start = Instant::now();
-    let response = if method != "GET" {
+    let mut response = if method != "GET" {
         Response::text(405, "method not allowed")
     } else {
         dispatch(state, &path)
     };
+    // Splice the reload client into every HTML response served (pages,
+    // the error page, the placeholder index, and static `.html`). This
+    // is serve-only — the bundle written by `twyla build` is untouched.
+    if response.content_type.starts_with("text/html") {
+        inject_reload_script(&mut response.body);
+    }
     let elapsed = start.elapsed();
     eprintln!("{method:>4} {path} → {} ({elapsed:.0?})", response.status);
 
     write_response(&mut stream, &response)
 }
+
+/// Upgrade `GET /__twyla/reload` to a Server-Sent-Events stream and park
+/// the socket in the reload registry. The watcher threads write events
+/// to it; we never read from it again. The connection stays open because
+/// the registry owns the stream — returning here does not close it.
+fn accept_reload_client(state: &ServeState, mut stream: TcpStream) -> io::Result<()> {
+    // `retry:` shortens the browser's auto-reconnect delay (default 3s)
+    // so a `twyla serve` restart reconnects quickly.
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/event-stream\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: keep-alive\r\n\
+         \r\n\
+         retry: 1000\n\n",
+    )?;
+    stream.flush()?;
+    eprintln!(" GET /__twyla/reload → 200 (reload client connected)");
+    state.reload_clients.lock().unwrap().push(stream);
+    Ok(())
+}
+
+/// Inject the live-reload client `<script>` just before `</body>`, or
+/// append it if there's no closing body tag.
+fn inject_reload_script(body: &mut Vec<u8>) {
+    const TAG: &[u8] = b"</body>";
+    match body.windows(TAG.len()).rposition(|w| w == TAG) {
+        Some(i) => {
+            let tail = body.split_off(i);
+            body.extend_from_slice(RELOAD_SCRIPT.as_bytes());
+            body.extend_from_slice(&tail);
+        }
+        None => body.extend_from_slice(RELOAD_SCRIPT.as_bytes()),
+    }
+}
+
+/// Client for the `/__twyla/reload` SSE stream. A `reload` event reloads
+/// the page; an `asset:<path>` event swaps a single stylesheet or image
+/// in place (preserving scroll/state), falling back to a full reload for
+/// anything else or when no matching element is found.
+const RELOAD_SCRIPT: &str = r#"<script>
+(() => {
+  const es = new EventSource("/__twyla/reload");
+  const bust = (url) => {
+    const u = new URL(url, location.href);
+    u.searchParams.set("__twyla", Date.now());
+    return u.href;
+  };
+  const matches = (url, path) => {
+    try { return new URL(url, location.href).pathname.endsWith(path); }
+    catch { return false; }
+  };
+  const swap = (sel, attr, path) => {
+    let hit = false;
+    for (const el of document.querySelectorAll(sel)) {
+      if (matches(el[attr], path)) { el[attr] = bust(el[attr]); hit = true; }
+    }
+    return hit;
+  };
+  es.onmessage = (e) => {
+    const m = e.data;
+    if (m.startsWith("asset:")) {
+      const path = m.slice(6);
+      if (path.endsWith(".css")) {
+        if (swap('link[rel="stylesheet"]', "href", path)) return;
+      } else if (/\.(png|jpe?g|gif|webp|svg|ico)$/i.test(path)) {
+        if (swap("img", "src", path)) return;
+      }
+    }
+    location.reload();
+  };
+})();
+</script>
+"#;
 
 /// Read just enough of the request to know the method and path. We
 /// don't care about headers or body for any handler today; drain them
