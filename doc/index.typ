@@ -60,7 +60,7 @@ To do that, use the #link("/reference/pages")[pages] iterator:
 ```typst
 = My Blog
 
-#for page in pages {
+#context for page in pages {
   if !page.draft [
     == #link(page.url, page.title)
     #page.date.display()
@@ -121,7 +121,7 @@ sass/
 #line(length: 100%)
 
 ```typst
-#for page in pages {
+#context for page in pages {
   if !page.draft [
     html.div(
       html.div(
