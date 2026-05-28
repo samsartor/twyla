@@ -44,7 +44,9 @@ pub struct TwylaContext {
 
 impl TwylaContext {
     /// Build a context rooted at `root`. Canonicalizes once so all
-    /// downstream comparisons are against the resolved path.
+    /// downstream comparisons are against the resolved path. Trims
+    /// trailing slashes from `base_url` so concatenation
+    /// (`base_url + "/" + path`) never produces `//`.
     pub fn new(
         root: impl AsRef<Path>,
         base_url: Option<String>,
@@ -53,6 +55,8 @@ impl TwylaContext {
         let root = root.canonicalize().map_err(|e| {
             format!("cannot canonicalize root {}: {e}", root.display())
         })?;
+        let base_url =
+            base_url.map(|s| s.trim_end_matches('/').to_string());
         Ok(Self { root, base_url })
     }
 

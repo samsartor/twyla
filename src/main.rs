@@ -314,7 +314,7 @@ fn cmd_check(args: ContextArgs, slug: &str) -> ExitCode {
     };
 
     let base_url = match ctx.require_base_url() {
-        Ok(u) => u.trim_end_matches('/').to_string(),
+        Ok(u) => u.to_string(),
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(2);

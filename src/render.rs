@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use typst::diag::{FileError, FileResult, SourceDiagnostic, Warned};
-use typst::foundations::{Bytes, Datetime, Duration};
+use typst::foundations::{Bytes, Datetime, Dict, Duration, IntoValue};
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
@@ -230,6 +230,16 @@ impl RenderWorld {
             main_bytes: Mutex::new(main_bytes),
         };
 
+        // Expose project config to typst via `sys.inputs`. Today: just
+        // `base_url` (empty string when unset — site templates read it
+        // with a fallback so relative URLs work out of the box on
+        // localhost). Add more keys here as the config layer grows.
+        let mut inputs = Dict::new();
+        inputs.insert(
+            "base_url".into(),
+            ctx.base_url.as_deref().unwrap_or("").into_value(),
+        );
+
         Ok(Self {
             ctx,
             main_id,
@@ -238,6 +248,7 @@ impl RenderWorld {
                     .with_features(
                         [Feature::Html, Feature::Bundle].into_iter().collect(),
                     )
+                    .with_inputs(inputs)
                     .build(),
             ),
             fonts,
