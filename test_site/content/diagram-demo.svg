@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 60" class="demo-diagram">
+  <rect x="4" y="4" width="112" height="52" rx="6" fill="none" stroke="currentColor"/>
+  <circle cx="32" cy="30" r="14" fill="currentColor"/>
+  <text x="64" y="34" font-size="10">twyla</text>
+</svg>

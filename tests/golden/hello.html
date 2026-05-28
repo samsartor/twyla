@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Hello, twyla</title>
+    <meta name="description" content="The baseline post: headings, slugs, anchors, lists, code.">
+    <link rel="stylesheet" href="https://example.com/style.css">
+  </head>
+  <body>
+    <header><a href="https://example.com/">home</a></header>
+    <article>
+      <h1>Hello, twyla</h1>
+      <p><time datetime="2026-05-20">2026-05-20</time></p>
+      <p>A baseline post. Jump straight to <a href="#anchors">the anchors section</a> to see an intra-document link resolve to a fragment.</p>
+      <h2 id="prose-and-marks">Prose and marks</h2>
+      <p>Text with <em>emphasis</em>, <strong>strong</strong>, and <code>inline code</code>. Smart quotes too: “like this”.</p>
+      <ul>
+        <li>first item</li>
+        <li>second item</li>
+        <li>third item</li>
+      </ul>
+      <pre><code data-lang="rust"><span style="color: #d73948">fn</span> <span style="color: #4b69c6">main</span>() {
+    <span style="color: #16718d">println!</span>(<span style="color: #198810">"</span><span style="color: #198810">fenced code block</span><span style="color: #198810">"</span>);
+}</code></pre>
+      <h2 id="anchors">Anchors</h2>
+      <p>This heading is labeled, and the intro links to it. typst-html resolves the label to this heading’s slug id, so the link is fragment-only (<code>#anchors</code>) rather than an absolutized URL.</p>
+    </article>
+  </body>
+</html>

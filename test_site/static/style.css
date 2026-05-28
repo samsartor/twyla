@@ -1,0 +1,11 @@
+/* test_site static asset — copied verbatim into the build output and
+   served as-is by the dev server. Its presence in public/ is asserted
+   by the build integration test. */
+body {
+  font-family: system-ui, sans-serif;
+  max-width: 42rem;
+  margin: 2rem auto;
+}
+.draft-banner {
+  color: #b00;
+}
