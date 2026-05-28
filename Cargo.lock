@@ -2567,6 +2567,7 @@ dependencies = [
  "typst-html",
  "typst-kit",
  "typst-library",
+ "typst-utils",
 ]
 
 [[package]]

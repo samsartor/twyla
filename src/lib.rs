@@ -13,6 +13,7 @@
 pub mod build;
 pub mod diff;
 pub mod import;
+pub mod prelude;
 pub mod project;
 pub mod render;
 pub mod serve;

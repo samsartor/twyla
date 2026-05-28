@@ -240,17 +240,21 @@ impl RenderWorld {
             ctx.base_url.as_deref().unwrap_or("").into_value(),
         );
 
+        // Build the stdlib, then splice twyla's native builtins into the
+        // global scope before freezing it in a LazyHash. This is the
+        // supported customization path (the library is `build()`-then-
+        // mutate; `global` is a `pub Module` with `scope_mut()`), not a
+        // typst fork. See `crate::prelude`.
+        let mut library = Library::builder()
+            .with_features([Feature::Html, Feature::Bundle].into_iter().collect())
+            .with_inputs(inputs)
+            .build();
+        crate::prelude::install(&mut library);
+
         Ok(Self {
             ctx,
             main_id,
-            library: LazyHash::new(
-                Library::builder()
-                    .with_features(
-                        [Feature::Html, Feature::Bundle].into_iter().collect(),
-                    )
-                    .with_inputs(inputs)
-                    .build(),
-            ),
+            library: LazyHash::new(library),
             fonts,
             files: FileStore::new(loader),
         })
