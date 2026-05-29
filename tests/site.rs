@@ -202,7 +202,9 @@ fn build_emits_pages_static_and_colocated_assets() {
     })
     .expect("build test_site");
 
-    assert_eq!(summary.pages, 3, "expected 3 routed pages");
+    // 3 original fixtures + 2 spike-doc pages (spike fixtures; fold/revert
+    // this count when the overloaded-document work is productionized).
+    assert_eq!(summary.pages, 5, "expected 5 routed pages");
 
     let exists = |rel: &str| out.path().join(rel).is_file();
     assert!(exists("index.html"), "home not written");
@@ -277,4 +279,58 @@ fn build_emits_feed_with_post_entries() {
     assert!(feed.is_file(), "no atom.xml emitted");
     let body = std::fs::read_to_string(&feed).expect("read feed");
     assert!(body.contains("Hello, twyla"), "feed missing post entry");
+}
+
+// --- SPIKE: overloaded `document` element --------------------------------
+
+/// The overloaded `document` binding: `#set document(extra: ..)` targets
+/// twyla's element, and `#context document.extra` reads it back off the
+/// style chain (access_field → field_from_styles). Also confirms routing
+/// still works through the rebound native `__std_document`.
+#[test]
+fn spike_overloaded_document_contextual_read() {
+    let docs = render();
+    let html = page(&docs, "spike-doc/index.html");
+    assert!(html.contains("extra-color=blue"), "contextual extra.color not read: {html}");
+    assert!(html.contains("extra-tag=spike"), "contextual extra.tag not read: {html}");
+    assert!(html.contains("draft=false"), "contextual draft default not read: {html}");
+}
+
+/// The decisive harvest test: read each page's `document.extra`/`draft`
+/// per-document from its body's resolved style chain — even though the
+/// `#set document(..)` lives inside the included file. Proves the
+/// `documents` array can be built without forking `bundle_impl` and
+/// without the redundant explicit-field metadata the old site needed.
+#[test]
+fn spike_harvest_reads_per_doc_extra() {
+    use twyla::harvest::harvest;
+    use twyla::render::RenderWorld;
+
+    let world = RenderWorld::new(&ctx()).expect("world");
+    let docs = harvest(&world).expect("harvest");
+    let spike = docs
+        .iter()
+        .find(|d| d.path == "spike-doc/index.html")
+        .unwrap_or_else(|| panic!("spike-doc not harvested; got {docs:#?}"));
+    let extra = format!("{:?}", spike.extra);
+    assert!(extra.contains("blue"), "extra.color not harvested: {spike:#?}");
+    assert!(extra.contains("spike"), "extra.tag not harvested: {spike:#?}");
+    assert_eq!(spike.draft, false, "draft default wrong: {spike:#?}");
+
+    // Per-doc isolation: a second page sets a different extra + draft:true.
+    let spike2 = docs
+        .iter()
+        .find(|d| d.path == "spike-doc-2/index.html")
+        .unwrap_or_else(|| panic!("spike-doc-2 not harvested; got {docs:#?}"));
+    assert!(format!("{:?}", spike2.extra).contains("red"), "doc2 extra bled: {spike2:#?}");
+    assert!(!format!("{:?}", spike2.extra).contains("blue"), "doc1 extra bled into doc2: {spike2:#?}");
+    assert_eq!(spike2.draft, true, "doc2 draft not harvested: {spike2:#?}");
+
+    // A page that sets no twyla fields harvests the defaults (None/false).
+    let hello = docs
+        .iter()
+        .find(|d| d.path == "hello/index.html")
+        .unwrap_or_else(|| panic!("hello not harvested; got {docs:#?}"));
+    assert_eq!(format!("{:?}", hello.extra), "None", "unset extra not default: {hello:#?}");
+    assert_eq!(hello.draft, false, "unset draft not default: {hello:#?}");
 }

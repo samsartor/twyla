@@ -26,14 +26,10 @@ use comemo::{Track, Tracked};
 use ecow::{EcoVec, eco_vec};
 use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult, Warned};
-use typst::foundations::{Output, StyleChain, Target, TargetElem};
+use typst::foundations::{Output, StyleChain, TargetElem};
 use typst::syntax::Span;
-use typst_library::diag::{bail, warning};
 use typst_library::engine::{Engine, Route, Sink, Traced};
-use typst_library::introspection::{
-    EmptyIntrospector, Introspector, MAX_ITERS, analyze,
-};
-use typst_library::{Feature, Features};
+use typst_library::introspection::{EmptyIntrospector, Introspector, MAX_ITERS, analyze};
 use typst_utils::Protected;
 
 /// Compiles sources into an output. Mirrors `typst::compile`.
@@ -42,9 +38,12 @@ where
     T: Output,
 {
     let mut sink = Sink::new();
-    let output = compile_impl::<T>(world.track(), Traced::default().track(), &mut sink)
-        .map_err(deduplicate);
-    Warned { output, warnings: sink.warnings() }
+    let output =
+        compile_impl::<T>(world.track(), Traced::default().track(), &mut sink).map_err(deduplicate);
+    Warned {
+        output,
+        warnings: sink.warnings(),
+    }
 }
 
 /// The fixed-point relayout loop. Mirrors `typst::compile_impl`.
@@ -54,11 +53,6 @@ fn compile_impl<T: Output>(
     sink: &mut Sink,
 ) -> SourceResult<T> {
     let library = world.library();
-    match T::target() {
-        Target::Paged => {}
-        Target::Html => warn_or_error_for_html(&library.features, sink)?,
-        Target::Bundle => warn_or_error_for_bundle(&library.features, sink)?,
-    }
 
     let base = StyleChain::new(&library.styles);
     let target = TargetElem::target.set(T::target()).wrap();
@@ -68,7 +62,10 @@ fn compile_impl<T: Output>(
     // Fetch the main source file once.
     let main = world.main();
     let main = world.source(main).map_err(|err| {
-        eco_vec![SourceDiagnostic::error(Span::detached(), ecow::EcoString::from(err))]
+        eco_vec![SourceDiagnostic::error(
+            Span::detached(),
+            ecow::EcoString::from(err)
+        )]
     })?;
 
     // First evaluate the main source file into a module.
@@ -112,8 +109,7 @@ fn compile_impl<T: Output>(
         }
 
         if history.len() >= MAX_ITERS - 1 {
-            let mut introspectors =
-                [&empty_introspector as &dyn Introspector; MAX_ITERS + 1];
+            let mut introspectors = [&empty_introspector as &dyn Introspector; MAX_ITERS + 1];
             for i in 1..MAX_ITERS {
                 introspectors[i] = history[i - 1].introspector();
             }
@@ -148,47 +144,4 @@ fn deduplicate(mut diags: EcoVec<SourceDiagnostic>) -> EcoVec<SourceDiagnostic> 
         unique.insert(hash)
     });
     diags
-}
-
-/// HTML export warns or errors depending on the feature flag. Mirrors the
-/// private `typst::warn_or_error_for_html`.
-fn warn_or_error_for_html(features: &Features, sink: &mut Sink) -> SourceResult<()> {
-    const ISSUE: &str = "https://github.com/typst/typst/issues/5512";
-    if features.is_enabled(Feature::Html) {
-        sink.warn(warning!(
-            Span::detached(),
-            "html export is under active development and incomplete";
-            hint: "its behaviour may change at any time";
-            hint: "do not rely on this feature for production use cases";
-            hint: "see {ISSUE} for more information";
-        ));
-    } else {
-        bail!(
-            Span::detached(),
-            "html export is only available when `--features html` is passed";
-            hint: "html export is under active development and incomplete";
-            hint: "see {ISSUE} for more information";
-        );
-    }
-    Ok(())
-}
-
-/// Bundle export warns or errors depending on the feature flag. Mirrors the
-/// private `typst::warn_or_error_for_bundle`.
-fn warn_or_error_for_bundle(features: &Features, sink: &mut Sink) -> SourceResult<()> {
-    if features.is_enabled(Feature::Bundle) {
-        sink.warn(warning!(
-            Span::detached(),
-            "bundle export is experimental";
-            hint: "its behaviour may change at any time";
-            hint: "do not rely on this feature for production use cases";
-        ));
-    } else {
-        bail!(
-            Span::detached(),
-            "bundle export is only available when `--features bundle` is passed";
-            hint: "bundle export is experimental";
-        );
-    }
-    Ok(())
 }

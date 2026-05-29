@@ -22,7 +22,7 @@
 //! the reference — i.e. become the first entry in the resolution-pass
 //! registry. `raw-html` would follow as entry #2.
 
-use typst::foundations::{Str, func};
+use typst::foundations::{Binding, NativeElement, Str, func};
 use typst_library::Library;
 
 /// Spike placeholder for the asset-url primitive. Returns a
@@ -77,4 +77,21 @@ pub fn install(library: &mut Library) {
     crate::rules::install(&mut library.rules);
     let global = library.global.scope_mut();
     global.define_func::<asset_url>();
+
+    // SPIKE — overload `document`. Grab the native binding *first* (so the
+    // routing primitive stays reachable), rebind it as `__std_document` for
+    // `generate_main`, then shadow `document` with twyla's element. Bundle
+    // routing keys on the native `DocumentElem` *type*, not this binding, so
+    // `#__std_document(path)[..]` still routes. `bind` overwrites in place
+    // (unlike `define`/`define_elem`, which dedup-panic on an existing name).
+    let native_document = global
+        .get("document")
+        .expect("native `document` binding present after build")
+        .read()
+        .clone();
+    global.define("__std_document", native_document);
+    global.bind(
+        "document".into(),
+        Binding::detached(crate::twyla_doc::TwylaDocument::ELEM),
+    );
 }

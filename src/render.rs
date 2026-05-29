@@ -173,7 +173,7 @@ fn generate_main(ctx: &TwylaContext, slugs: &[String]) -> String {
     for slug in slugs {
         let route = ctx.default_route(slug);
         out.push_str(&format!(
-            "#document(\"{path}\")[\n  \
+            "#__std_document(\"{path}\")[\n  \
              #include \"/content/{slug}.typ\"\n]\n\n",
             path = route.bundle_path.display(),
         ));
@@ -510,8 +510,8 @@ mod tests {
         let ctx = test_ctx();
         let slugs = vec!["guis-1".to_string(), "guis-2".to_string()];
         let src = generate_main(&ctx, &slugs);
-        assert!(src.contains("#document(\"guis-1/index.html\")"));
-        assert!(src.contains("#document(\"guis-2/index.html\")"));
+        assert!(src.contains("#__std_document(\"guis-1/index.html\")"));
+        assert!(src.contains("#__std_document(\"guis-2/index.html\")"));
         assert!(src.contains("#include \"/content/guis-1.typ\""));
     }
 
@@ -520,9 +520,9 @@ mod tests {
         let ctx = test_ctx();
         let slugs = vec!["_index".to_string(), "guis-1".to_string()];
         let src = generate_main(&ctx, &slugs);
-        assert!(src.contains("#document(\"index.html\")"));
+        assert!(src.contains("#__std_document(\"index.html\")"));
         assert!(src.contains("#include \"/content/_index.typ\""));
-        assert!(src.contains("#document(\"guis-1/index.html\")"));
+        assert!(src.contains("#__std_document(\"guis-1/index.html\")"));
     }
 
     /// Exercises the multi-document case end-to-end: scan content/,
