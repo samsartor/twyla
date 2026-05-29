@@ -3,21 +3,18 @@ current state of the project.
 
 # Twyla
 
-Twyla is a static site generator (SSG) similar to
-[Zola](https://www.getzola.org) but built entirely around the
-[Typst](https://typst.app) typesetting and scripting language.
+Twyla is a static site generator (SSG) similar to [Zola](https://www.getzola.org) but built entirely around the [Typst](https://typst.app) typesetting and scripting language.
 
-Content is written in Typst. Your templates are written in Typst. Your themes
-are written in Typst (and in [SASS](https://sass-lang.com/)). Everything
-is Typst! Except Twyla itself, which is written in Rust.
+Content is written in Typst. Your templates are written in Typst. Your themes are written in Typst (and in [SASS](https://sass-lang.com/)). Everything is Typst! Except Twyla itself, which is written in Rust.
 
-For an example, check out my own personal website. Source at https://gitlab.com/samsartor/site, live at https://samsartor.com.
+For an example, check out my own [personal website](https://samsartor.com) ([Source](https://gitlab.com/samsartor/site)).
 
 > Twyla is still in early development, and mostly vibe-coded. Use for your personal blog, not your company homepage.
 
 ## Installing
 
 Your best option (for now) is to compile Twyla from source:
+
 ```
 cargo install https://github.com/samsartor/twyla
 ```
@@ -25,20 +22,19 @@ cargo install https://github.com/samsartor/twyla
 ## Getting Started
 
 All you need to start using twyla is a single file!
-```
+
+```tree
 content/
 └ main.typ
 ```
 
-If you `twyla serve` and point your browser at http://localhost:1111
-you will see your `main.typ` as HTML. Go ahead and add something,
-possibly your name? The webpage reloads automatically.
+If you `twyla serve` and point your browser at [http://localhost:1111](http://localhost:1111) you will see your `main.typ` as HTML. Go ahead and add something, possibly your name? The webpage reloads automatically.
 
-To deploy your website, simply run `twyla build --base-url https://example.com`
-and copy the `public` dir to the provider of your choice.
+To deploy your website, simply run `twyla build --base-url https://example.com` and copy the `public` dir to the provider of your choice.
 
 Additional pages are just additional files:
-```
+
+```tree
 content/
 ├ main.typ
 ├ rewriting-my-blog.typ
@@ -46,26 +42,27 @@ content/
 └ how-to-bake-bread.typ
 ```
 
-For a blog you will probably want to list your other pages on your home page.
-To do that, use the [pages](/reference/pages) iterator:
+For a blog you will probably want to list your other pages on your home page. To do that, use the [pages](/reference/pages) iterator:
+
 ```typst
 = My Blog
 
 #context for page in pages {
   if !page.draft [
-    == 
+    == #link(page.url, page.title)
     #page.date.display()
     
     #page.description    
-  ](ge.url, page.titl)
+  ]
 }
 
-== other Stuff
+== Other Stuff
 
 I make bread!
 ```
 
 Your other pages should include basic information like `title`, `data`, `kind`, and a `description` as so:
+
 ```typst
 #set document(
   title: "Rewriting My Blog",
@@ -78,12 +75,11 @@ Your other pages should include basic information like `title`, `data`, `kind`, 
 )
 ```
 
-Twyla's [document](reference/document) function supports a number of additional features,
-beyond what are available in normal Typst, including an `extra` field you can fill with whatever
-data you want.
+Twyla’s [document](reference/document) function supports a number of additional features, beyond what are available in normal Typst, including an `extra` field you can fill with whatever data you want.
 
 For the purpose of theming you can also add a SCSS file and [some HTML](https://typst.app/docs/reference/html):
-```
+
+```tree
 content/
 ├ main.typ
 ├ rewriting-my-blog.typ
@@ -93,7 +89,7 @@ sass/
 └ main.sass
 ```
 
-#line(length: 100%)
+---
 
 ```sass
 .post-header
@@ -108,7 +104,7 @@ sass/
   color: grey  
 ```
 
-#line(length: 100%)
+---
 
 ```typst
 #context for page in pages {
@@ -131,9 +127,8 @@ sass/
 }
 ```
 
-If you would like to include an image, you can use either the built-in image
-function or handle it explicitly with Twyla's [asset
-system](/reference/asset):
+If you would like to include an image, you can use either the built-in image function or handle it explicitly with Twyla’s [asset system](/reference/asset):
+
 ```typst
 #image("./pretty.png")
 
@@ -156,17 +151,12 @@ Check out this pretty #html.img(src: asset("icon.svg").data-url) icon.
 )
 ```
 
-If you would like to port your existing website over to Twyla,
-you can follow the guide provided by `typst init`, or download the
-[`TWYLA_SKILL.md`](https://raw.githubusercontent.com/samsartor/twyla/refs/heads/main/TWYLA_SKILL.md)
-and throw your agent of choice at the problem.
+If you would like to port your existing website over to Twyla, you can follow the guide provided by `typst init`, or download the [`TWYLA_SKILL.md`](https://raw.githubusercontent.com/samsartor/twyla/refs/heads/main/TWYLA_S
+KILL.md) and throw your agent of choice at the problem.
 
 ## Customization
 
-Twyla customization and theming is mainly accomplished using Typt's usual
-[show rules](https://typst.app/docs/reference/styling#show-rules). For
-example, you can replace Twyla's default theme and build your own HTML from
-scratch:
+Twyla customization and theming is mainly accomplished using Typt’s usual [show rules](https://typst.app/docs/reference/styling#show-rules). For example, you can replace Twyla’s default theme and build your own HTML from scratch:
 
 ```typst
 #show: body => {
@@ -202,17 +192,11 @@ scratch:
 ...
 ```
 
-Notice the uses of `asset(...).url`. Twyla's [asset system](/reference/asset)
-can automatically convert assets such as SASS to CSS (using
-the [grass](https://github.com/connorskees/grass) library),
-TS to JS (using [rolldown](https://rolldown.rs)), and Typst
-_content_ into PNG/SVG/PDF (using Typst itself). Such transformations
-can also be disabled with `asset(transform: none, ...)` or customized in
-[`Twyla.toml`](/reference/configuration).
+Notice the uses of `asset(...).url`. Twyla’s [asset system](/reference/asset) can automatically convert assets such as SASS to CSS (using the [grass](https://github.com/connorskees/grass) library), TS to JS (using [rolldown](https://rolldown.rs)), and Typst _content_ into PNG/SVG/PDF (using Typst itself). Such transformations can also be disabled with `asset(transform: none, ...)` or customized in [`Twyla.toml`](/reference/configuration).
 
-Instead of stylizing every post separately, you probably want to create
-a common set of templates:
-```
+Instead of stylizing every post separately, you probably want to create a common set of templates:
+
+```tree
 content/
 ├ main.typ
 ├ rewriting-my-blog.typ
@@ -225,6 +209,7 @@ templates/
 ├ home.typ
 └ post.typ
 ```
+
 ```typst
 #import "/templates/post.typ": post-template
 
@@ -239,12 +224,9 @@ templates/
 ```
 
 As a shorthand, you can also add the theme to your `Twyla.toml`:
+
 ```toml
 theme: "/templates/theme.typ"
 ```
 
-Twyla themes can also be arbitrary typst packages such as
-`@samsartor/twyla-pickles` or `@samsartor/twyla-book`. A theme need only expose
-`KIND-template` functions and/or `KIND-default` constants for each supported page
-`KIND` (eg `"page"`, `"root"`, `"dir"`, `"draft"`).
-
+Twyla themes can also be arbitrary typst packages such as `@samsartor/twyla-pickles` or `@samsartor/twyla-book`. A theme need only expose `KIND-template` functions and/or `KIND-default` constants for each supported page `KIND` (eg `"page"`, `"root"`, `"dir"`, `"draft"`).
