@@ -140,6 +140,47 @@ orthogonal axis. Don't conflate them (earlier notes did).
 Subdirectory recursion itself is *not yet* implemented — `scan_pages`
 is top-level only.
 
+== Compile-loop ownership
+
+*Decision (supersedes treating `typst::compile` as a black box).* Twyla
+vendors typst's fixed-point loop — `compile_impl` (`typst/src/lib.rs`)
+reproduced in `src/compile.rs`, a faithful copy minus timing
+instrumentation, landed as a *zero-behavior-change* refactor. The point is
+to sit *inside* the relayout loop.
+
+*Governing principle — eval-time vs realization-time.* `eval` runs *once*
+(baking every eager expression into the `content` tree); the loop then
+re-*realizes* that same content each iteration with the previous
+iteration's introspector swapped in, until introspections stabilize.
+`#context` is exactly the marker that defers a computation from eval-time
+to realization-time — code outside it runs once, code inside re-runs every
+iteration and converges. This one fact governs both `pages` and `asset`
+(see Cruxes).
+
+*What loop ownership buys.* After each iteration twyla holds the realized
+`Bundle`, which already exposes — *verified by spike* — every page's
+*effective* metadata: `Bundle.files[*]` → `BundleFile::Document(bd)` →
+`bd.info()` is the `DocumentInfo` (`title`/`date`/`description`, resolved
+from the `set document` style chain, per document), and
+`Bundle.introspector` (`query(DocumentElem::ELEM)`) enumerates every
+document/asset element. So twyla can *harvest* metadata Rust-side and
+*inject* it into the next iteration (via the style chain, under twyla's own
+convergence condition) so contextual builtins resolve it — no separate
+compile. Don't explode `bundle_impl`: the `Bundle` output already distills
+each per-doc `StyleChain` into `DocumentInfo`.
+
+*Injection trap.* Wrapping an iteration's introspector with synthetic
+query results *breaks stabilization* — `compile_impl` validates the
+recorded constraint against `document.introspector()`, which lacks the
+synthetic elements, so it never converges. Inject via the *style chain*
+(recomputed per iteration) instead, with twyla's own "keep going while
+harvested data changed" loop layered on typst's.
+
+*No fork.* Every dependency of the loop is public (`Output`, `Engine`,
+`Sink`, `Traced`, `Route`, `TargetElem`, `EmptyIntrospector`, `analyze`,
+`typst_eval::eval`; `Protected` via the `typst-utils` dep we already
+carry).
+
 = Builtins — the minimum for 0.1
 
 The aspirational doc implies a handful of builtins. Scoped to a *minimum
@@ -149,19 +190,23 @@ version of that vision* (Sam's call: typst-content-as-asset is later):
   columns: (auto, 1fr, 1fr),
   table.header[*Builtin*][*Minimum surface*][*Rust work / mechanism*],
 
-  [`document` \ (shadowed)],
-  [`#set document(.., draft: bool, extra: any)` atop native
-   title/date/description],
-  [Mechanism 1: a `#[func]` overwriting the global `document` binding,
-   capturing draft/extra/route, then constructing the native
-   `DocumentElem`. Shadow confirmed feasible (scope is a map).],
+  [`document` \ native + meta],
+  [native `#set document(title/date/description)` for standard fields; a
+   small *placed* twyla element for `draft`/`extra`],
+  [*Shadow-to-add-fields is dead.* `set document`'s apply-anywhere magic is
+   hardcoded to the native `DocumentElem` (typst-realize `lib.rs:609`;
+   forbidden inside containers), so a custom `document` element can't take
+   `#set document(draft:)`. Instead: native `set document` carries the
+   standard fields (flows to `<head>`, queryable, Rust-readable from
+   `DocumentInfo`); `draft`/`extra` ride a separate placed element.],
 
   [`pages` \ (+ `.current`)],
   [iterable of `{url,title,date,description,draft,extra}`; `.current` is
    this page],
-  [Aggregate per-page `document` metadata. *Contextual* (see Crux 1) —
-   `query`-backed, `#context` required. `.current` needs context
-   regardless (per-doc identity).],
+  [Harvested by twyla from the realized `Bundle` each loop iteration and
+   injected into the next via the style chain (§ Compile-loop ownership).
+   Read contextually (`#context for page in pages`) for now; the loop
+   *could* make it a bare binding (Crux 1).],
 
   [`asset(path, format:)`],
   [`.url`, `.data-url`, `.content`; file input only; `format` covers
@@ -199,23 +244,24 @@ asset(..).url)`); `resize`/srcset/`<picture>` raster optimization.
 
 == Crux 1 — `pages` and context
 
-Resolved. Top-level markup included into a document body is *not*
-implicitly contextual (`#include` doesn't change that; `query`/`here`
-need explicit `#context`). So whether `for page in pages` needs
-`#context` depends on what `pages` *is*:
+*Resolved via compile-loop ownership.* The earlier framing (contextual
+`query` vs a plain-data *pre-pass*) is superseded: twyla owns the loop, so
+it harvests each iteration's `DocumentInfo` Rust-side and injects the
+assembled page list into the next iteration's style chain. Two reasons
+this beats an in-compile `query(<twyla-post>)`:
 
-- *Contextual query* (today's `query(<twyla-post>)` shape) → needs
-  `#context`, single compile. *This is the 0.1 choice* — the
-  aspirational doc now writes `#context for page in pages [..]`, so it's
-  settled, not a reluctant compromise.
-- *Plain data* → no `#context`, but requires a metadata *pre-pass*
-  (compile once to harvest metadata, inject `pages` as data, compile for
-  real). A pure ergonomic upgrade, deferrable.
+- A single in-compile `query` of *document* elements can't read
+  title/date/description anyway — those live in each doc's `DocumentInfo`
+  (realization output, populated from the `set document` style chain), not
+  on the queryable element instance. (This is why the current site's
+  `mark-as-post` redundantly carries every field.)
+- Harvest-and-inject folds the "plain data" upgrade *into* the existing
+  relayout loop instead of a bolted-on second `eval` — one eval, full
+  metadata, and it can deliver the bare `for page in pages` (no `#context`)
+  + `.current` the aspirational doc wants.
 
-`pages.current` resists the plain-data trick regardless: a shared bundle
-compile has one global scope, so "which page am I" needs the
-introspector (context). Templates read it inside a show rule, which can
-be made contextual — fine in practice.
+`pages.current` is per-document identity; with loop ownership it's just the
+entry whose route matches the document being realized.
 
 == Asset model
 
@@ -270,53 +316,56 @@ second marker kind lands — which is exactly where `asset(..).url` /
 
 == Crux 2 — the asset side-channel (research)
 
-*This is the deep item.* The tension: `asset(..).url/.data-url/.content`
-are *strings*, which means asset processing either blocks typst rendering
-or must be deferred — unlike a traditional *queued* pipeline. Three
-candidate shapes, none free:
+*The deep item — now framed by the eval/realization split (§ Compile-loop
+ownership).* `asset(..).url` is a *string*; where it can be deferred
+depends on whether it's consumed at eval-time or realization-time. Three
+shapes, *not mutually exclusive*:
 
-+ *Opaque placeholder.* `asset(p).url` returns a marker string carrying
-  the spec; the resolution pass transforms + writes + rewrites after
-  compile. No side channel, nothing blocks, fields stay cheap strings,
-  and it reuses the raw-html machinery. *But* the URL is opaque until
-  resolved — a user doing `.replace(".png",".webp")` on it gets garbage.
-  Sam's objection: too surprising; would need API rethinking (e.g. make
-  the surprising values methods, or a distinct type) to be honest.
++ *Context-y asset.* `asset(..).url` resolves only inside `#context` (like
+  `pages`): runs at realization-time, reads twyla's injected resolved-URL
+  data, returns the real string. Zero extra eval. *Cost:* forces every
+  asset-URL *consumer* under `#context` — awkward for the doc's eager
+  head/markup uses (`html.link(href: asset(..).url)`).
 
-+ *Eager + side channel.* The func reads via the World, runs the
-  transform inline (grass, or even a subprocess — typst packages already
-  shell out to WASM), computes the real URL, and *registers the bytes*
-  for twyla to write. Clean UX (real URL immediately) but: (a) blocks
-  compile; (b) the side channel is the hard part — a thread-local is
-  fragile if typst parallelizes, and *comemo memoization means a cached
-  func won't re-fire its side effect*, so an incremental rebuild loses
-  the registration. `engine.sink` carries `values` out of a compile and
-  *may* survive memoization (it replays warnings) — the most promising
-  clean channel; needs verification.
++ *Eval fixed-point.* An *outer* loop over `eval`: eval + realize →
+  discover assets/pages (+ run grass/transcode Rust-side) → if the
+  discovered set changed, re-eval with resolved data injected, repeat.
+  Keeps `asset(..).url` an eager string usable *anywhere*, and *also* makes
+  `pages` plain data (bare `for page in pages`) — the unifier. *Cost:*
+  `eval` is memoized on the `Library` hash (per-file, propagating up the
+  import DAG), so injecting via `sys.inputs` busts *every* file's eval
+  cache → whole-site re-eval on the injecting pass, not incremental.
+  Mitigation is at the outer layer: cache the discovered asset/page *set*
+  across `serve` recompiles, run the inject-pass only when that set changes
+  — so the common prose edit stays at one eval. A *granular asset→file
+  dependency DAG* (re-eval only consumers of a changed asset) needs the
+  data on a tracked channel, which `eval`'s fixed signature blocks cleanly
+  — *distant-future, flagged not planned.*
 
-+ *Second compile pass.* typst exposes no public hook to inject
-  Rust-computed data into its introspection fixed-point mid-loop;
-  `typst::compile` is all-or-nothing. The equivalent is to compile
-  *twice*, feeding resolved assets in via `sys.inputs`/global on pass 2
-  — the same machinery `pages`-as-plain-data would use. Necessary only
-  if an asset result must feed back into typst *layout* (real pixel
-  dims, `measure()`); none of the doc's URL/data-url-in-attribute cases
-  do, so the minimum avoids it.
++ *Placeholder + post-export resolve.* `asset(..).url` returns an opaque
+  marker at eval-time; the resolution pass rewrites it in the serialized
+  bytes after compile (reuses the raw-html machinery). No extra eval, no
+  `#context`, usable anywhere — *but* the opaque string is surprising
+  (`.replace(".png",".webp")` → garbage), the objection that sank it as
+  *the* answer. Honest fixes: make the surprising values methods, or a
+  distinct `asset` type.
 
-*Sleeper problem (applies to placeholder & eager alike):* asset *source*
-files are read in twyla's Rust pass, not by typst, so they are invisible
-to `World::dependencies()`. `twyla serve`'s watcher won't know
-`main.sass` is a dep of a page. The resolution pass knows the source
-paths — feed them into the watcher's dep set explicitly.
+*Likely 0.1 split:* `pages` via harvest-and-inject in the relayout loop (no
+extra eval) + `asset` via the placeholder (already half-built); reserve the
+eval fixed-point for when an asset must feed back into *layout* (real pixel
+dims, `measure()`), which none of the doc's current cases need.
+
+*Sleeper problem (placeholder & context-y alike):* asset *source* files are
+read in twyla's Rust pass, not by typst, so they're invisible to
+`World::dependencies()`. `twyla serve`'s watcher won't know `main.sass` is
+a dep of a page. The resolution pass knows the source paths — feed them
+into the watcher's dep set explicitly.
 
 Open sub-problems to work through incrementally:
-+ Placeholder *format & forgery/collision safety* across attribute /
-  text / CSS contexts.
++ Placeholder *format & forgery/collision safety* across attribute, text,
+  and CSS contexts.
 + *Dependency tracking* of asset sources → watcher (the sleeper).
 + *Transform caching* keyed by (source-hash, params).
-+ The *fixed-point re-run* seam for layout-coupled / content-input
-  assets (deferred, but design the hook).
-+ `pages.current` per-document identity (shared with Crux 1).
 + Decide the *public API shape* that avoids the placeholder surprise:
   opaque-string vs methods vs a dedicated `asset` type.
 
@@ -375,21 +424,24 @@ pending tests that are the executable to-do list.
 Built so far (detail in git): HTML/bundle prototype, AST-diff harness,
 md→typ import, multi-document virtual-main routing, `serve` (shared
 World + watcher + SSE), `build`, the guis-{1,2,3} + home-page port,
-label-based internal links, the test-site fixtures, and a proven native
-prelude spike (mechanism 1).
+label-based internal links, the test-site fixtures, the native prelude
+(mechanism 1), *package imports* (typst-kit `SystemPackages` + downloader),
+*native HTML rules* (mechanism 2: `= → <h1>` + auto-slug ids +
+external-link `rel`, with the per-site `show heading`/`show link` hacks
+deleted), and the *vendored compile loop* (`src/compile.rs`, no-behavior
+refactor — the seam for harvest-and-inject).
 
 Planned order (each unblocks the next):
 
-+ *Package imports* — unblocks the dogfood doc (which imports
-  `@preview/*`). Loader serves `VirtualRoot::Package`; embedded `@twyla`
-  bytes first, typst-kit downloader for the rest.
-+ *`document` shadow + `pages`* (Crux 1: contextual). Replaces the
-  per-site `mark-as-post` / `post-list` with engine builtins.
-+ *Default template (mechanism 3) + native HTML rules (mechanism 2)* —
-  nicer-than-bare shell; fold the h1/h2 offset and external-link `rel`
-  into `rules.replace` instead of show-rule hacks.
-+ *`asset()` — sass first* (Crux 2). Resolves the side-channel decision;
-  grass integration *deletes the zola sass dependency* (0.1 blocker).
++ *`document` + `pages`* — harvest `DocumentInfo` from the realized bundle
+  each loop iteration, inject via the style chain (§ Compile-loop
+  ownership; Crux 1). Carry `draft`/`extra` on a placed twyla element.
+  Replaces the per-site `mark-as-post` / `post-list`.
++ *Default template* (mechanism 3) + `Twyla.toml` `theme`/`theme-show` —
+  nicer-than-bare shell, reading `pages.current` for `<head>`.
++ *`asset()` — sass first* (Crux 2: placeholder shape). Resolves the
+  side-channel decision; grass integration *deletes the zola sass
+  dependency* (0.1 blocker).
 + *Promote `raw-html`* to the resolution-pass registry (entry #1 of N).
 + *Feed generation* — query the `<twyla-post>`/`pages` metadata, emit
   `atom.xml`. Regression-not-to-have (zola had `generate_feeds`).
@@ -410,14 +462,17 @@ mechanism supersedes the workaround.
 - *Show rules fire in HTML mode* (content-transformation rules; verified
   de6f400). Layout-specific rules may not — untested.
 - *typst-html shifts `=` to `<h2>`* (reserves `<h1>` for the doc title).
-  *[obsolete workaround]* the per-site `show heading` fixup is replaced
-  by `rules.replace::<HeadingElem>(Html, ..)` (mechanism 2) if we want
-  `= → <h1>` globally. `set heading(offset: -1)` rejects negatives.
+  *Done:* `rules.replace::<HeadingElem>(Html, ..)` (mechanism 2,
+  `src/rules.rs`) makes `= → <h1>` globally and auto-slugs every heading's
+  `id` (explicit label wins, since `#link(<slug>)` must resolve to it).
+  `set heading(offset: -1)` rejects negatives. Heading text → slug uses the
+  `slug` crate (zola's own dep) for byte parity.
 - *External-link auto-attrs* (`rel="noopener external" target="_blank"`).
-  *[obsolete workaround]* was a `show link` rule checking `type(it.dest)
-  == str`; now a `rules.replace::<LinkElem>` candidate. Note `html.a(rel:
-  ..)` takes an array of tokens (`("noopener","external")`), not a
-  joined string.
+  *Done:* `rules.replace::<LinkElem>` (mechanism 2) adds them to external
+  http(s) links, leaving internal/relative links alone. Note `html.a(rel:
+  ..)` takes an array of tokens (`("noopener","external")`); at the
+  `HtmlElem`/attr level it's the joined string `"noopener external"`, which
+  is what zola emits.
 - *Native `#table`* works for HTML; only `align:` doesn't reflect into
   per-cell `style="text-align"` (relax `td/th:style`).
 - *Show rules can't replace typst's auto wrapper* (`show
@@ -469,8 +524,12 @@ change — demoted accordingly.
   `image()`-through-assets.
 + Suppress the `<span style="white-space:pre-wrap">` whitespace shim and
   the paragraph auto-wrap of bare inline elements in HTML output.
-+ A public seam to inject data into the introspection fixed-point (would
-  make Crux 2's "second compile pass" a single pass).
++ A public seam to inject data into the introspection fixed-point.
+  *Addressed in-library:* twyla vendors `compile_impl` (§ Compile-loop
+  ownership) to own the loop and inject via the style chain — no upstream
+  change needed. (`set document`'s global-apply being hardcoded to the
+  native element, typst-realize `lib.rs:609`, is the related upstream
+  wart — it blocks a custom `document` shadow.)
 
 = Fork vs library
 
