@@ -18,9 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use twyla::build::{Build, BuildSummary, run as build_run};
-use twyla::diff::{
-    Matcher, RelaxConfig, RelaxationRule, diff, parse_html,
-};
+use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff, parse_html};
 use twyla::project::TwylaContext;
 use twyla::render::{RoutedDoc, render_site};
 
@@ -54,7 +52,7 @@ fn page<'a>(docs: &'a [RoutedDoc], bundle_path: &str) -> &'a str {
 // --- routing -------------------------------------------------------------
 
 #[test]
-fn routes_every_content_page_and_skips_underscore_drafts() {
+fn routes_every_content_page_and_skips_underscores() {
     let docs = render();
     let paths: Vec<_> = docs.iter().map(|d| d.path.clone()).collect();
 
@@ -64,10 +62,10 @@ fn routes_every_content_page_and_skips_underscore_drafts() {
             "missing route {expected:?}; have {paths:?}",
         );
     }
-    // `_draft.typ` is underscore-prefixed → never scanned, never routed.
+    // `_picture.typ` is underscore-prefixed → never scanned, never routed.
     assert!(
-        !paths.iter().any(|p| p.starts_with("draft")),
-        "underscore-prefixed draft leaked into routes: {paths:?}",
+        !paths.iter().any(|p| p.starts_with("picture")),
+        "underscore-prefixed file leaked into routes: {paths:?}",
     );
 }
 
@@ -79,16 +77,24 @@ fn home_enumerates_posts_newest_first() {
     let home = page(&docs, "index.html");
 
     // Both posts appear as links to their permalinks.
-    assert!(home.contains(&format!("href=\"{BASE_URL}/hello/\"")), "home missing hello link");
+    assert!(
+        home.contains(&format!("href=\"{BASE_URL}/hello/\"")),
+        "home missing hello link"
+    );
     assert!(
         home.contains(&format!("href=\"{BASE_URL}/diagram-demo/\"")),
         "home missing diagram-demo link",
     );
 
     // Sorted by date descending: diagram-demo (05-24) before hello (05-20).
-    let diag = home.find("/diagram-demo/").expect("diagram-demo link present");
+    let diag = home
+        .find("/diagram-demo/")
+        .expect("diagram-demo link present");
     let hello = home.find("/hello/").expect("hello link present");
-    assert!(diag < hello, "posts not newest-first (diagram-demo should precede hello)");
+    assert!(
+        diag < hello,
+        "posts not newest-first (diagram-demo should precede hello)"
+    );
 }
 
 // --- headings, slugs, intra-doc anchors ----------------------------------
@@ -97,8 +103,14 @@ fn home_enumerates_posts_newest_first() {
 fn headings_get_slug_ids() {
     let docs = render();
     let hello = page(&docs, "hello/index.html");
-    assert!(hello.contains("<h2 id=\"prose-and-marks\">"), "missing slugified h2 id");
-    assert!(hello.contains("<h2 id=\"anchors\">"), "missing anchors h2 id");
+    assert!(
+        hello.contains("<h2 id=\"prose-and-marks\">"),
+        "missing slugified h2 id"
+    );
+    assert!(
+        hello.contains("<h2 id=\"anchors\">"),
+        "missing anchors h2 id"
+    );
 }
 
 #[test]
@@ -108,7 +120,10 @@ fn intra_doc_anchor_is_fragment_only() {
     // Label-based `#link(<anchors>)` resolves to a fragment, not an
     // absolutized URL — the cross-doc-leak regression guard from the
     // render smoke test, here on an independent site.
-    assert!(hello.contains("href=\"#anchors\""), "intra-doc link not fragment-only");
+    assert!(
+        hello.contains("href=\"#anchors\""),
+        "intra-doc link not fragment-only"
+    );
     assert!(
         !hello.contains(&format!("{BASE_URL}/hello/#")),
         "intra-doc anchor was absolutized against base URL",
@@ -124,7 +139,10 @@ fn raw_html_marker_is_resolved_to_inline_svg() {
 
     // The SVG body is spliced inline...
     assert!(diag.contains("<svg"), "inline svg missing");
-    assert!(diag.contains("viewBox=\"0 0 120 60\""), "svg attributes missing");
+    assert!(
+        diag.contains("viewBox=\"0 0 120 60\""),
+        "svg attributes missing"
+    );
     // ...and the real marker tag is gone. (The *escaped* mention of the
     // marker inside a <code> span — `&lt;script type="x-twyla-raw-html">`
     // — is left untouched, so match the unescaped tag specifically.)
@@ -159,8 +177,7 @@ fn hello_matches_golden() {
 
     // `<pre>` text-only: syntect highlight spans are cosmetic and churn
     // across typst bumps. Everything else compared structurally.
-    let cfg = RelaxConfig::new()
-        .relax(Matcher::Tag("pre".to_string()), RelaxationRule::TextOnly);
+    let cfg = RelaxConfig::new().relax(Matcher::Tag("pre".to_string()), RelaxationRule::TextOnly);
 
     let expected = parse_html(&golden_html);
     let actual = parse_html(actual_html);
@@ -190,7 +207,10 @@ fn build_emits_pages_static_and_colocated_assets() {
     let exists = |rel: &str| out.path().join(rel).is_file();
     assert!(exists("index.html"), "home not written");
     assert!(exists("hello/index.html"), "hello not written");
-    assert!(exists("diagram-demo/index.html"), "diagram-demo not written");
+    assert!(
+        exists("diagram-demo/index.html"),
+        "diagram-demo not written"
+    );
     // static/ copied verbatim.
     assert!(exists("style.css"), "static/style.css not copied");
     // colocated content asset (non-.typ under content/) emitted at root.
@@ -228,11 +248,17 @@ fn nested_section_routes_under_subdir() {
 #[ignore = "asset fingerprinting not implemented (no asset-url primitive yet)"]
 fn referenced_image_is_fingerprinted() {
     let out = tempfile::tempdir().expect("tempdir");
-    build_run(Build { ctx: ctx(), output_dir: out.path().to_path_buf() })
-        .expect("build");
+    build_run(Build {
+        ctx: ctx(),
+        output_dir: out.path().to_path_buf(),
+    })
+    .expect("build");
     // Expect e.g. assets/diagram-demo.<hash>.svg rather than a verbatim copy.
     let assets = out.path().join("assets");
-    assert!(assets.is_dir(), "no assets/ output dir — fingerprinting not wired");
+    assert!(
+        assets.is_dir(),
+        "no assets/ output dir — fingerprinting not wired"
+    );
 }
 
 /// Feed generation: `twyla build` should emit an Atom/RSS feed listing
@@ -242,8 +268,11 @@ fn referenced_image_is_fingerprinted() {
 #[ignore = "feed generation not implemented yet"]
 fn build_emits_feed_with_post_entries() {
     let out = tempfile::tempdir().expect("tempdir");
-    build_run(Build { ctx: ctx(), output_dir: out.path().to_path_buf() })
-        .expect("build");
+    build_run(Build {
+        ctx: ctx(),
+        output_dir: out.path().to_path_buf(),
+    })
+    .expect("build");
     let feed = out.path().join("atom.xml");
     assert!(feed.is_file(), "no atom.xml emitted");
     let body = std::fs::read_to_string(&feed).expect("read feed");
