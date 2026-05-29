@@ -62,12 +62,19 @@ fn fnv6(s: &str) -> String {
     format!("{:06x}", (h & 0xff_ffff))
 }
 
-/// Install twyla's native builtins into the library's global scope.
+/// Install twyla's native customizations into a freshly built library.
 /// Call after `Library::builder().build()`, before wrapping in
-/// `LazyHash`. Additive — does not remove or shadow stdlib bindings
-/// (yet; shadowing `document` to capture twyla metadata is the planned
-/// next step — see render.rs notes).
+/// `LazyHash`. Two seams:
+/// - global-scope builtins (mechanism 1) — new verbs callable with zero
+///   imports;
+/// - native HTML rules (mechanism 2, [`crate::rules`]) — engine-level
+///   element→HTML behavior that every site inherits.
+///
+/// Additive on the scope side — does not remove or shadow stdlib
+/// bindings (yet; shadowing `document` to capture twyla metadata is the
+/// planned next step — see render.rs notes).
 pub fn install(library: &mut Library) {
+    crate::rules::install(&mut library.rules);
     let global = library.global.scope_mut();
     global.define_func::<asset_url>();
 }

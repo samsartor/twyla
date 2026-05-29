@@ -16,4 +16,5 @@ pub mod import;
 pub mod prelude;
 pub mod project;
 pub mod render;
+pub mod rules;
 pub mod serve;

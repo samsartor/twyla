@@ -41,3 +41,39 @@ fn native_asset_url_builtin_resolves_with_zero_imports() {
     assert!(page.contains("<html"), "no document shell for bare content");
     assert!(page.contains("<body>"), "no body for bare content");
 }
+
+#[test]
+fn native_html_rules_apply_without_show_rules() {
+    let docs = render_plain();
+    let page = &docs
+        .iter()
+        .find(|d| d.path == PathBuf::from("index/index.html"))
+        .expect("index page rendered")
+        .html;
+
+    // Native heading rule (mechanism 2): a source-level `=` becomes `<h1>`
+    // (no +1 offset) and every heading gets an auto-slug `id` — here from
+    // the text "Plain page", with no label and no `show heading` rule.
+    assert!(
+        page.contains("<h1 id=\"plain-page\">"),
+        "native heading rule did not produce `= -> <h1 id=slug>`; got:\n{page}",
+    );
+
+    // Native link rule: external http(s) links get noopener/external/_blank.
+    assert!(
+        page.contains("rel=\"noopener external\"") && page.contains("target=\"_blank\""),
+        "external link missing native rel/target; got:\n{page}",
+    );
+
+    // ...but the internal asset-url link (a relative `/assets/..` href) is
+    // left alone — no rel/target leaks onto non-external links.
+    let asset_anchor = page
+        .split("<a ")
+        .find(|frag| frag.contains("/assets/logo."))
+        .expect("asset-url anchor present");
+    let asset_anchor = &asset_anchor[..asset_anchor.find('>').unwrap_or(asset_anchor.len())];
+    assert!(
+        !asset_anchor.contains("rel=") && !asset_anchor.contains("target="),
+        "internal asset link wrongly got rel/target: {asset_anchor}",
+    );
+}

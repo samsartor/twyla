@@ -10,3 +10,6 @@ A bare typst file. The link below resolves through twyla's native
 `asset-url` builtin (no import needed):
 
 #link(asset-url("logo.svg"))[the logo]
+
+An #link("https://typst.app")[external link] gets `rel`/`target` from
+twyla's native link rule, with no `#show` rule in sight.

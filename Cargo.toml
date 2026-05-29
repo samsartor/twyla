@@ -34,6 +34,11 @@ markup5ever_rcdom = "0.39"
 pulldown-cmark = { version = "0.13", default-features = false }
 toml = "0.9"
 
+# Heading-anchor slugs. Zola's own dependency, so `= My Heading` →
+# `id="my-heading"` matches zola's auto-anchors byte-for-byte (including
+# unicode transliteration). Used by the native heading HTML rule.
+slug = "0.1"
+
 [dev-dependencies]
 # Scratch output dir for the `twyla build` integration test (tests/site.rs).
 tempfile = "3"
