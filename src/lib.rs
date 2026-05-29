@@ -13,7 +13,6 @@
 pub mod build;
 pub mod compile;
 pub mod diff;
-pub mod harvest;
 pub mod import;
 pub mod prelude;
 pub mod project;

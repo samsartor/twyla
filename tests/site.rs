@@ -303,11 +303,11 @@ fn spike_overloaded_document_contextual_read() {
 /// without the redundant explicit-field metadata the old site needed.
 #[test]
 fn spike_harvest_reads_per_doc_extra() {
-    use twyla::harvest::harvest;
     use twyla::render::RenderWorld;
 
     let world = RenderWorld::new(&ctx()).expect("world");
-    let docs = harvest(&world).expect("harvest");
+    // Harvest shares the single eval/compile with the rendered HTML.
+    let (_rendered, docs) = world.compile_bundle_with_meta().expect("compile+harvest");
     let spike = docs
         .iter()
         .find(|d| d.path == "spike-doc/index.html")

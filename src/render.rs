@@ -35,13 +35,14 @@ use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
-use typst_bundle::{Bundle, BundleDocument, BundleFile};
+use typst_bundle::{BundleDocument, BundleFile};
 use typst_kit::downloader::SystemDownloader;
 use typst_kit::files::{FileLoader, FileStore};
 use typst_kit::fonts::FontStore;
 use typst_kit::packages::SystemPackages;
 use typst_library::Feature;
 
+use crate::compile::HarvestedDoc;
 use crate::project::TwylaContext;
 
 /// Twyla's emit-raw-HTML placeholder. Matches the helper in user typst
@@ -314,13 +315,24 @@ impl RenderWorld {
     /// `comemo::evict(..)` to invalidate; for content/ shape changes,
     /// also call [`refresh_main`](Self::refresh_main).
     pub fn compile_bundle(&self) -> Result<Vec<RoutedDoc>, RenderError> {
-        let Warned { output, warnings } = crate::compile::compile::<Bundle>(self);
+        Ok(self.compile_bundle_with_meta()?.0)
+    }
+
+    /// Like [`compile_bundle`](Self::compile_bundle) but also returns the
+    /// per-page twyla `document` metadata harvested from the *same*
+    /// compile (one eval). Both come out of [`crate::compile::compile_bundle`].
+    /// The harvested metadata is what `documents`/feeds will be built from;
+    /// `compile_bundle` just drops it for callers that only want HTML.
+    pub fn compile_bundle_with_meta(
+        &self,
+    ) -> Result<(Vec<RoutedDoc>, Vec<HarvestedDoc>), RenderError> {
+        let Warned { output, warnings } = crate::compile::compile_bundle(self);
 
         for w in &warnings {
             eprintln!("warning: {}", w.message);
         }
 
-        let bundle = output.map_err(|errors| RenderError {
+        let (bundle, harvested) = output.map_err(|errors| RenderError {
             messages: errors
                 .iter()
                 .map(|e| format_diagnostic(self, e))
@@ -355,7 +367,7 @@ impl RenderWorld {
         }
 
         docs.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(docs)
+        Ok((docs, harvested))
     }
 }
 
