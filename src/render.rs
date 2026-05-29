@@ -36,8 +36,10 @@ use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
 use typst_bundle::{Bundle, BundleDocument, BundleFile};
+use typst_kit::downloader::SystemDownloader;
 use typst_kit::files::{FileLoader, FileStore};
 use typst_kit::fonts::FontStore;
+use typst_kit::packages::SystemPackages;
 use typst_library::Feature;
 
 use crate::project::TwylaContext;
@@ -228,6 +230,10 @@ impl RenderWorld {
             root: ctx.root.clone(),
             main_id,
             main_bytes: Mutex::new(main_bytes),
+            packages: SystemPackages::new(SystemDownloader::new(concat!(
+                "twyla/",
+                env!("CARGO_PKG_VERSION"),
+            ))),
         };
 
         // Expose project config to typst via `sys.inputs`. Today: just
@@ -361,14 +367,19 @@ struct TwylaLoader {
     root: PathBuf,
     main_id: FileId,
     main_bytes: Mutex<Bytes>,
+    /// Serves `@preview/*` (and any other namespaced) packages from the
+    /// standard data/cache dirs, downloading from Typst Universe on a
+    /// cache miss. The dogfood doc imports `@preview/frame-it` and
+    /// `@preview/dtree`, so this is a hard prerequisite, not a nicety.
+    packages: SystemPackages,
 }
 
 impl TwylaLoader {
     /// Resolve a file id to its on-disk path. Returns
     /// [`FileError::NotFound`] for the virtual main (no real path) so
     /// callers iterating dependencies can `filter_map` it away.
-    /// Package ids (typst-universe etc.) are also rejected — twyla
-    /// doesn't depend on any packages yet.
+    /// Package ids resolve through [`SystemPackages`] (data/cache dirs,
+    /// then download from Universe), mirroring the typst CLI.
     fn resolve(&self, id: FileId) -> FileResult<PathBuf> {
         if id == self.main_id {
             return Err(FileError::NotFound(PathBuf::from(VIRTUAL_MAIN_VPATH)));
@@ -376,9 +387,7 @@ impl TwylaLoader {
         let vpath = id.vpath();
         match id.root() {
             VirtualRoot::Project => Ok(self.root.join(vpath.get_without_slash())),
-            VirtualRoot::Package(_) => {
-                Err(FileError::NotFound(PathBuf::from(vpath.get_without_slash())))
-            }
+            VirtualRoot::Package(spec) => Ok(self.packages.obtain(spec)?.resolve(vpath)),
         }
     }
 }
@@ -387,6 +396,12 @@ impl FileLoader for TwylaLoader {
     fn load(&self, id: FileId) -> FileResult<Bytes> {
         if id == self.main_id {
             return Ok(self.main_bytes.lock().unwrap().clone());
+        }
+        // Packages resolve to a (possibly just-downloaded) cache dir and
+        // load through `FsRoot` so the path-escape guard applies; project
+        // files read directly from the resolved on-disk path.
+        if let VirtualRoot::Package(spec) = id.root() {
+            return self.packages.obtain(spec)?.load(id.vpath());
         }
         let path = self.resolve(id)?;
         std::fs::read(&path).map(Bytes::new).map_err(|e| match e.kind() {

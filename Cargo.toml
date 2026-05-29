@@ -12,7 +12,7 @@ clap = { version = "4", features = ["derive", "env"] }
 typst = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
 typst-bundle = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
 typst-html = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
-typst-kit = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070", default-features = false, features = ["scan-fonts", "embedded-fonts", "watcher"] }
+typst-kit = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070", default-features = false, features = ["scan-fonts", "embedded-fonts", "watcher", "system-packages", "system-downloader"] }
 typst-library = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
 # Referenced by the `#[func]` macro expansion (`typst_utils::Static`); a
 # direct dep so twyla can define native typst builtins. Same pinned rev.
