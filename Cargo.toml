@@ -11,6 +11,10 @@ clap = { version = "4", features = ["derive", "env"] }
 # Bump deliberately; do not let `cargo update -p typst` move us.
 typst = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
 typst-bundle = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
+# We vendor typst's `compile_impl` fixed-point loop (see src/compile.rs) so
+# twyla can sit inside the relayout loop; that loop calls `typst_eval::eval`
+# directly, hence a direct dep at the same pinned rev.
+typst-eval = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
 typst-html = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
 typst-kit = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070", default-features = false, features = ["scan-fonts", "embedded-fonts", "watcher", "system-packages", "system-downloader"] }
 typst-library = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }

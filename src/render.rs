@@ -314,7 +314,7 @@ impl RenderWorld {
     /// `comemo::evict(..)` to invalidate; for content/ shape changes,
     /// also call [`refresh_main`](Self::refresh_main).
     pub fn compile_bundle(&self) -> Result<Vec<RoutedDoc>, RenderError> {
-        let Warned { output, warnings } = typst::compile::<Bundle>(self);
+        let Warned { output, warnings } = crate::compile::compile::<Bundle>(self);
 
         for w in &warnings {
             eprintln!("warning: {}", w.message);

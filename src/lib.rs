@@ -11,6 +11,7 @@
 //! - [`serve`] — zero-flag dev server.
 
 pub mod build;
+pub mod compile;
 pub mod diff;
 pub mod import;
 pub mod prelude;
