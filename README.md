@@ -42,17 +42,17 @@ content/
 └ how-to-bake-bread.typ
 ```
 
-For a blog you will probably want to list your other pages on your home page. To do that, use the [pages](/reference/pages) iterator:
+For a blog you will probably want to list your other pages on your home page. To do that, use the [documents()](/reference/document#documents) iterator:
 
 ```typst
 = My Blog
 
-#context for page in pages {
-  if !page.draft [
-    == #link(page.url, page.title)
-    #page.date.display()
+#context for doc in documents() {
+  if !doc.draft and doc.kind == "post" [
+    == #link(doc.url, doc.title)
+    #doc.date.display()
     
-    #page.description    
+    #doc.description    
   ]
 }
 
@@ -61,13 +61,12 @@ For a blog you will probably want to list your other pages on your home page. To
 I make bread!
 ```
 
-Your other pages should include basic information like `title`, `data`, `kind`, and a `description` as so:
+Your other pages should include basic information like `title`, `date`, `kind`, and a `description` as so:
 
 ```typst
 #set document(
   title: "Rewriting My Blog",
   date: datetime(year: 2026, month: 4, day: 12),
-  kind: "post",
   description: [
     My blog was written in normal everyday Markdown, but as a
     tech hipster I found that unacceptable...
@@ -107,22 +106,22 @@ sass/
 ---
 
 ```typst
-#context for page in pages {
-  if page.kind != "draft" [
+#context for doc in documents() {
+  if !doc.draft and doc.kind == "post" [
     html.div(
       html.div(
-        [#page.title],
+        [#doc.title],
         class: "post-title",
-        style: "color: " + page.extra.color,
+        style: "color: " + doc.extra.color,
       ),
       html.div(    
-        [#page.date.display()],
+        [#doc.date.display()],
         class: "post-date",
       ),
       class: "post-header",
     )
     
-    #page.description
+    #doc.description
   ]
 }
 ```
@@ -132,7 +131,7 @@ If you would like to include an image, you can use either the built-in image fun
 ```typst
 #image("./pretty.png")
 
-#html.img(src: asset("./pretty.png", format: "webp", resize: 1024).url)
+#context html.img(src: asset("./pretty.png", format: "webp", resize: 1024).url)
 ```
 
 Assets are pretty powerful, you can use them to do all kinds of stuff!
@@ -141,18 +140,17 @@ Assets are pretty powerful, you can use them to do all kinds of stuff!
 Check out this pretty #html.img(src: asset("icon.svg").data-url) icon.
 
 #figure(
-  raw-html(asset("./_diagram.typ", format: "svg").content),
+  context raw-html(asset("./_diagram.typ", format: "svg").content),
   caption: [A diagram of some sort],
 )
 
 #figure(
-  html.img(src: asset(circle(), format: "svg").url, style: "width: 100%"),
+  context html.img(src: asset(circle(), format: "svg").url, style: "width: 100%"),
   caption: [A big cirle],
 )
 ```
 
-If you would like to port your existing website over to Twyla, you can follow the guide provided by `typst init`, or download the [`TWYLA_SKILL.md`](https://raw.githubusercontent.com/samsartor/twyla/refs/heads/main/TWYLA_S
-KILL.md) and throw your agent of choice at the problem.
+If you would like to port your existing website over to Twyla, you can follow the guide provided by `typst init`, or download the [`TWYLA_SKILL.md`](https://raw.githubusercontent.com/samsartor/twyla/refs/heads/main/TWYLA_SKILL.md) and throw your agent of choice at the problem.
 
 ## Customization
 
@@ -176,10 +174,10 @@ Twyla customization and theming is mainly accomplished using Typt’s usual [sho
       ))
       html.elem("meta", attrs: (
         name: "description",
-        content: if pages.current.description == none { "" }
-          else { pages.current.description },
+        content: if document.description == none { "" }
+          else { document.description },
       ))
-      html.elem("title", pages.current.title)
+      html.elem("title", document.title)
       html.script(src: asset("/scripts/main.ts").url, "")
       html.link(rel: "stylesheet", href: asset("/sass/main.sass").url)
       html.link(rel: "icon", href: asset(circle(fill: blue), format: "png").url)
