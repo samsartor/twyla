@@ -29,10 +29,6 @@
   out.trim("-")
 }
 
-// Emit a queryable post record. The home page enumerates these via
-// `query(<twyla-post>)` — twyla itself knows nothing about it.
-#let mark-as-post(fields) = [#metadata(fields) <twyla-post>]
-
 // Splice raw HTML through twyla's resolution pass: typst has no
 // `html.raw`, so the render binary rewrites `<script
 // type="x-twyla-raw-html">BODY</script>` back to inline BODY.

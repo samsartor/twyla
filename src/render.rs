@@ -171,7 +171,7 @@ fn routed_sources(ctx: &TwylaContext) -> Result<Vec<RoutedSource>, RenderError> 
                 .map_err(|e| setup_err(format!("invalid bundle path for {slug}: {e:?}")))?;
             let path = BundlePath::new(bundle_vpath)
                 .map_err(|e| setup_err(format!("invalid bundle path for {slug}: {e}")))?;
-            Ok(RoutedSource { id, path })
+            Ok(RoutedSource { id, path, url: route.url_path })
         })
         .collect()
 }

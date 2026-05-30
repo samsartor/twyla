@@ -1,10 +1,11 @@
 #import "/templates/page.typ": *
-#show: page-template.with(
-  path: "hello",
+#set document(
   title: "Hello, twyla",
   description: "The baseline post: headings, slugs, anchors, lists, code.",
   date: datetime(year: 2026, month: 5, day: 20),
+  kind: "post",
 )
+#show: page-template
 
 A baseline post. Jump straight to #link(<anchors>)[the anchors section]
 to see an intra-document link resolve to a fragment.

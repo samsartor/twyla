@@ -94,4 +94,8 @@ pub fn install(library: &mut Library) {
         "document".into(),
         Binding::detached(crate::twyla_doc::TwylaDocument::ELEM),
     );
+
+    // The cross-page list builtin. Reads twyla's injected page metadata off
+    // the style chain (see `crate::compile`).
+    global.define_func::<crate::twyla_doc::documents>();
 }

@@ -10,31 +10,27 @@
 #import "/templates/lib.typ": (
   base-url,
   format-date,
+  text-of,
   apply-base-rules,
 )
 
-// Cross-document enumeration of every `mark-as-post`-emitting page,
-// newest first, drafts filtered out. Pure author-side typst over the
-// `<twyla-post>` introspector — the engine isn't involved.
+// Cross-document enumeration via the engine's `documents()` builtin: every
+// page that set `kind: "post"`, newest first, drafts filtered out. No
+// author-side metadata duplication — the data is harvested from each page's
+// `#set document(..)`.
 #let post-list() = context {
-  let posts = query(<twyla-post>).map(m => m.value)
-  let live = posts.filter(p => not p.at("draft", default: false))
-  let sorted = live.sorted(key: p => p.at(
-    "date",
-    default: datetime(year: 1970, month: 1, day: 1),
-  ))
-  let sorted = sorted.rev()
+  let posts = documents().filter(p => p.kind == "post" and not p.draft)
+  let epoch = datetime(year: 1970, month: 1, day: 1)
+  let sorted = posts.sorted(key: p => if p.date == none { epoch } else { p.date }).rev()
   if sorted.len() == 0 {
     html.p([No posts yet.])
   } else {
     html.elem("ul", attrs: (class: "post-list"), {
       for p in sorted {
         html.elem("li", {
-          let permalink = base-url + "/" + p.path + "/"
-          html.a(href: permalink, class: "post-link", p.title)
-          let desc = p.at("description", default: none)
-          if desc != none and desc != "" {
-            html.span(class: "post-desc", desc)
+          html.a(href: base-url + p.url, class: "post-link", p.title)
+          if p.description != none {
+            html.span(class: "post-desc", p.description)
           }
         })
       }
@@ -42,22 +38,21 @@
   }
 }
 
-#let home-template(
-  title: none,
-  description: none,
-  body,
-) = apply-base-rules({
+#let home-template(body) = apply-base-rules(context {
   html.elem("html", attrs: (lang: "en"), {
     html.elem("head", {
       html.elem("meta", attrs: (charset: "utf-8"))
-      html.elem("title", title)
-      if description != none {
-        html.elem("meta", attrs: (name: "description", content: description))
+      html.elem("title", document.title)
+      if document.description != none {
+        html.elem(
+          "meta",
+          attrs: (name: "description", content: text-of(document.description)),
+        )
       }
       html.elem("link", attrs: (rel: "stylesheet", href: base-url + "/style.css"))
     })
     html.elem("body", {
-      html.elem("header", html.h1(title))
+      html.elem("header", html.h1(document.title))
       html.elem("main", body)
     })
   })

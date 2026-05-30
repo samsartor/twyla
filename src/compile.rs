@@ -24,13 +24,15 @@
 use std::collections::HashSet;
 
 use comemo::{Track, Tracked};
-use ecow::{EcoVec, eco_vec};
+use ecow::{EcoString, EcoVec, eco_vec};
 use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult, Warned};
 use typst::foundations::{
-    BundlePath, Content, NativeElement, Output, StyleChain, Target, TargetElem, Value,
+    Array, BundlePath, Content, Datetime, Dict, IntoValue, NativeElement, Output, Style,
+    StyleChain, Target, TargetElem, Value,
 };
 use typst::syntax::{FileId, Span};
+use typst::utils::LazyHash;
 use typst_bundle::Bundle;
 use typst_library::engine::{Engine, Route, Sink, Traced};
 use typst_library::introspection::{
@@ -40,7 +42,7 @@ use typst_library::model::{DocumentElem, DocumentInfo};
 use typst_library::routines::{Arenas, RealizationKind};
 use typst_utils::Protected;
 
-use crate::twyla_doc::TwylaDocument;
+use crate::twyla_doc::{TwylaDocument, TwylaDocumentList};
 
 /// A page to route: its source file and the bundle path it emits at.
 ///
@@ -56,18 +58,52 @@ pub struct RoutedSource {
     /// Where the resulting document lands in the bundle (e.g.
     /// `hello/index.html`).
     pub path: BundlePath,
+    /// User-facing URL of the page (e.g. `/hello/`), surfaced as
+    /// `documents().*.url`.
+    pub url: String,
 }
 
-/// One page's harvested twyla metadata.
+/// A content file after evaluation: its route plus its body content.
+struct EvaledPage {
+    path: BundlePath,
+    url: String,
+    body: Content,
+}
+
+/// One page's harvested twyla metadata — the row that becomes one
+/// `documents()` entry and feeds feeds/listings.
 #[derive(Debug, Clone)]
 pub struct HarvestedDoc {
-    /// Bundle path, e.g. `spike-doc/index.html` — the route, read from the
-    /// native `DocumentElem` we collected.
-    pub path: String,
-    /// The page's `document.extra` (`Value::None` if unset).
-    pub extra: Value,
-    /// The page's `document.draft`.
+    /// User-facing URL (e.g. `/hello/`).
+    pub url: String,
+    /// `document.title` (`None` if unset).
+    pub title: Option<Content>,
+    /// `document.date`.
+    pub date: Option<Datetime>,
+    /// `document.description`.
+    pub description: Option<Content>,
+    /// `document.draft`.
     pub draft: bool,
+    /// Resolved page kind: the explicit `document.kind` if set, else derived
+    /// from the route (`/` → `"root"`, else `"page"`).
+    pub kind: EcoString,
+    /// `document.extra` (`Value::None` if unset).
+    pub extra: Value,
+}
+
+impl HarvestedDoc {
+    /// The `documents()` dictionary form of this row.
+    fn to_dict(&self) -> Dict {
+        let mut d = Dict::new();
+        d.insert("url".into(), self.url.clone().into_value());
+        d.insert("title".into(), self.title.clone().into_value());
+        d.insert("date".into(), self.date.into_value());
+        d.insert("description".into(), self.description.clone().into_value());
+        d.insert("draft".into(), self.draft.into_value());
+        d.insert("kind".into(), self.kind.clone().into_value());
+        d.insert("extra".into(), self.extra.clone());
+        d
+    }
 }
 
 /// Compile `pages` into a [`Bundle`] *and* harvest each page's twyla
@@ -94,22 +130,35 @@ fn compile_bundle_impl(
     pages: &[RoutedSource],
 ) -> SourceResult<(Bundle, Vec<HarvestedDoc>)> {
     // Evaluate each content file once into its body content.
-    let bodies: Vec<(BundlePath, Content)> = pages
+    let evaled: Vec<EvaledPage> = pages
         .iter()
-        .map(|page| Ok((page.path.clone(), eval_file(world, traced, sink, page.id)?)))
+        .map(|page| {
+            Ok(EvaledPage {
+                path: page.path.clone(),
+                url: page.url.clone(),
+                body: eval_file(world, traced, sink, page.id)?,
+            })
+        })
         .collect::<SourceResult<_>>()?;
+
+    // Harvest each page's metadata *before* assembling, so the `documents()`
+    // array is available to inject into the render pass below.
+    let harvested = harvest_bodies(world, traced, sink, &evaled)?;
+    let docs_array: Array = harvested.iter().map(|h| h.to_dict().into_value()).collect();
 
     // Assemble the combined bundle content: wrap each body in a native
     // `DocumentElem` at its route, sequence the lot. This is what the
     // generated `main.typ` used to express as `#document(path)[#include]`.
     let content = Content::sequence(
-        bodies
+        evaled
             .iter()
-            .map(|(path, body)| DocumentElem::new(path.clone(), body.clone()).pack()),
+            .map(|p| DocumentElem::new(p.path.clone(), p.body.clone()).pack()),
     );
 
-    let bundle = relayout::<Bundle>(world, traced, sink, &content)?;
-    let harvested = harvest_bodies(world, traced, sink, &bodies)?;
+    // Inject the page list onto the style chain so `documents()` resolves it
+    // during the render pass.
+    let docs_style = TwylaDocumentList::all.set(docs_array).wrap();
+    let bundle = relayout::<Bundle>(world, traced, sink, &content, Some(&docs_style))?;
     Ok((bundle, harvested))
 }
 
@@ -140,17 +189,24 @@ fn eval_file(
 }
 
 /// The fixed-point relayout loop, operating on already-evaluated `content`.
-/// Mirrors the loop in `typst::compile_impl`.
+/// Mirrors the loop in `typst::compile_impl`. `injected` is an optional extra
+/// style chained on top of the base (twyla uses it to inject the `documents()`
+/// page list).
 fn relayout<T: Output>(
     world: Tracked<dyn World + '_>,
     traced: Tracked<Traced>,
     sink: &mut Sink,
     content: &Content,
+    injected: Option<&LazyHash<Style>>,
 ) -> SourceResult<T> {
     let library = world.library();
     let base = StyleChain::new(&library.styles);
     let target = TargetElem::target.set(T::target()).wrap();
     let styles = base.chain(&target);
+    let styles = match injected {
+        Some(s) => styles.chain(s),
+        None => styles,
+    };
     let empty_introspector = EmptyIntrospector;
 
     let mut history: Vec<T> = Vec::new();
@@ -230,7 +286,7 @@ fn harvest_bodies(
     world: Tracked<dyn World + '_>,
     traced: Tracked<Traced>,
     sink: &mut Sink,
-    bodies: &[(BundlePath, Content)],
+    pages: &[EvaledPage],
 ) -> SourceResult<Vec<HarvestedDoc>> {
     let library = world.library();
     let base = StyleChain::new(&library.styles);
@@ -254,7 +310,7 @@ fn harvest_bodies(
     let styles = StyleChain::new(&style_map);
 
     let mut out = Vec::new();
-    for (path, body) in bodies {
+    for page in pages {
         let arenas = Arenas::default();
         let mut info = DocumentInfo::default();
         let children = (engine.library.routines.realize)(
@@ -262,22 +318,55 @@ fn harvest_bodies(
             &mut engine,
             &mut locator,
             &arenas,
-            body,
+            &page.body,
             styles,
         )?;
 
+        // Read twyla's `document` fields off the folded child style chains.
+        // Each top-of-file `#set document(..)` applies to subsequent siblings,
+        // so any realized child carries the page-level values.
+        let mut title = None;
+        let mut date = None;
+        let mut description = None;
+        let mut kind: Option<EcoString> = None;
         let mut extra = Value::None;
         let mut draft = false;
-        for (_, child_styles) in &children {
-            if child_styles.has(TwylaDocument::extra) {
-                extra = child_styles.get_cloned(TwylaDocument::extra);
+        for (_, cs) in &children {
+            if cs.has(TwylaDocument::title) {
+                title = cs.get_cloned(TwylaDocument::title);
             }
-            draft = child_styles.get(TwylaDocument::draft);
+            if cs.has(TwylaDocument::date) {
+                date = cs.get_cloned(TwylaDocument::date);
+            }
+            if cs.has(TwylaDocument::description) {
+                description = cs.get_cloned(TwylaDocument::description);
+            }
+            if cs.has(TwylaDocument::kind) {
+                kind = cs.get_cloned(TwylaDocument::kind);
+            }
+            if cs.has(TwylaDocument::extra) {
+                extra = cs.get_cloned(TwylaDocument::extra);
+            }
+            draft = cs.get(TwylaDocument::draft);
         }
+
+        // Resolve `kind`: explicit wins, else derive from the route.
+        let kind = kind.unwrap_or_else(|| {
+            if page.url == "/" {
+                EcoString::inline("root")
+            } else {
+                EcoString::inline("page")
+            }
+        });
+
         out.push(HarvestedDoc {
-            path: path.as_ref().get_without_slash().to_string(),
-            extra,
+            url: page.url.clone(),
+            title,
+            date,
+            description,
             draft,
+            kind,
+            extra,
         });
     }
 

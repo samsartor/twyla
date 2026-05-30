@@ -310,7 +310,7 @@ fn spike_harvest_reads_per_doc_extra() {
     let (_rendered, docs) = world.compile_bundle_with_meta().expect("compile+harvest");
     let spike = docs
         .iter()
-        .find(|d| d.path == "spike-doc/index.html")
+        .find(|d| d.url == "/spike-doc/")
         .unwrap_or_else(|| panic!("spike-doc not harvested; got {docs:#?}"));
     let extra = format!("{:?}", spike.extra);
     assert!(extra.contains("blue"), "extra.color not harvested: {spike:#?}");
@@ -320,17 +320,19 @@ fn spike_harvest_reads_per_doc_extra() {
     // Per-doc isolation: a second page sets a different extra + draft:true.
     let spike2 = docs
         .iter()
-        .find(|d| d.path == "spike-doc-2/index.html")
+        .find(|d| d.url == "/spike-doc-2/")
         .unwrap_or_else(|| panic!("spike-doc-2 not harvested; got {docs:#?}"));
     assert!(format!("{:?}", spike2.extra).contains("red"), "doc2 extra bled: {spike2:#?}");
     assert!(!format!("{:?}", spike2.extra).contains("blue"), "doc1 extra bled into doc2: {spike2:#?}");
     assert_eq!(spike2.draft, true, "doc2 draft not harvested: {spike2:#?}");
 
-    // A page that sets no twyla fields harvests the defaults (None/false).
+    // A post page harvests its standard fields + derived kind.
     let hello = docs
         .iter()
-        .find(|d| d.path == "hello/index.html")
+        .find(|d| d.url == "/hello/")
         .unwrap_or_else(|| panic!("hello not harvested; got {docs:#?}"));
+    assert_eq!(hello.kind, "post", "hello kind not harvested: {hello:#?}");
+    assert!(hello.date.is_some(), "hello date not harvested: {hello:#?}");
     assert_eq!(format!("{:?}", hello.extra), "None", "unset extra not default: {hello:#?}");
     assert_eq!(hello.draft, false, "unset draft not default: {hello:#?}");
 }

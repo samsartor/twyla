@@ -1,35 +1,105 @@
-//! SPIKE — overloading `document` with a twyla element.
+//! The `document` element and `documents()` builtin.
 //!
-//! Proves two things the `pages`/`documents` design hinges on:
-//! 1. A custom `#[elem]` can be defined *outside* the typst crates and
-//!    bound to the global identifier `document`, shadowing the native
-//!    element — while the native `DocumentElem` stays reachable (rebound
-//!    as `__std_document`) so `generate_main` can still emit it as the
-//!    routing primitive (bundle routing keys on the native type via
-//!    `to_packed::<DocumentElem>()`, not the binding name).
-//! 2. The custom element's fields are settable (`#set document(extra: …)`)
-//!    and so flow onto the style chain — making them both contextually
-//!    readable on the current page (`#context document.extra`, via the
-//!    `access_field` → `field_from_styles` fallback) and harvestable from
-//!    each document body's resolved style chain (see `crate::harvest`).
+//! Maintainer notes (the `///` docs below are the user-facing API docs;
+//! this module doc is the implementation story):
 //!
-//! For the spike the field surface is intentionally tiny: `extra` (the
-//! hard arbitrary-`Value` case) and `draft`. Standard fields (title/date/
-//! description) are left to the native element for now; the real design
-//! decides whether they migrate here too.
+//! `document` is bound — in [`crate::prelude`] — to [`TwylaDocument`], which
+//! shadows typst's native `document`. The native element stays reachable as
+//! `__std_document` so [`crate::compile`] can keep using it as the routing
+//! primitive (bundle routing keys on the native *type*, not the binding name).
+//! Because the fields are settable, `#set document(..)` puts them on the style
+//! chain, which is what makes them both readable on the current page
+//! (`#context document.title`, via typst's `field_from_styles` fallback for
+//! element field access) and harvestable per-document by `crate::compile`.
+//!
+//! `documents()` reads the whole-site list back off the style chain. Twyla
+//! harvests it Rust-side and injects it through [`TwylaDocumentList`]'s hidden
+//! style field (the same trick typst uses for `TargetElem`). A bare
+//! `documents` binding can't work — a bare identifier resolves at eval time,
+//! but the data only exists at realization time — and `for` only iterates
+//! Array/Dict/Str/Bytes, so it has to be a function returning an array.
 
-use typst::foundations::{Value, elem};
+use comemo::Tracked;
+use ecow::EcoString;
+use typst::diag::HintedStrResult;
+use typst::foundations::{Array, Content, Context, Datetime, Value, elem, func};
 
-/// Twyla's overload of the `document` identifier. Carries twyla-only page
-/// metadata on the style chain. Routing is unaffected — `generate_main`
-/// constructs the native element via the rebound `__std_document`.
+/// Metadata for the current page.
+///
+/// Set it once, near the top of a page, with a `set` rule. Every field is
+/// then available on this page via `#context document.<field>`, and the whole
+/// site's metadata is available through [`documents`].
+///
+/// ```typ
+/// #set document(
+///   title: "Rewriting My Blog",
+///   date: datetime(year: 2026, month: 4, day: 12),
+///   description: "Why I moved off Markdown.",
+///   kind: "post",
+/// )
+/// ```
 #[elem(name = "document")]
 pub struct TwylaDocument {
-    /// Arbitrary user data, surfaced per-page (`page.extra`).
+    /// The page's title.
+    pub title: Option<Content>,
+
+    /// The page's publication date.
+    pub date: Option<Datetime>,
+
+    /// A short description or summary of the page.
+    pub description: Option<Content>,
+
+    /// What kind of page this is, e.g. `"post"` or `"page"` — used to group
+    /// pages in listings and feeds. If unset, twyla derives it from the route
+    /// (`"root"` for the home page, otherwise `"page"`).
+    pub kind: Option<EcoString>,
+
+    /// Arbitrary extra data for your own use. Available as `document.extra`
+    /// and as the `extra` field of this page's [`documents`] entry.
     #[default(Value::None)]
     pub extra: Value,
 
-    /// Whether this page is a draft (built, excluded from listings/feed).
+    /// Whether this page is a draft. Drafts are still built, but are
+    /// conventionally excluded from listings and feeds.
     #[default(false)]
     pub draft: bool,
+}
+
+/// The list of every page in the site.
+///
+/// Returns an array with one dictionary per page, each carrying that page's
+/// `url` plus the metadata it set via `#set document(..)`:
+/// `url`, `title`, `date`, `description`, `kind`, `draft`, and `extra`.
+/// Access fields with ordinary dot syntax, e.g. `doc.title`.
+///
+/// This is contextual — call it inside a `#context` block:
+///
+/// ```typ
+/// #context for doc in documents() {
+///   if doc.kind == "post" and not doc.draft [
+///     == #link(doc.url, doc.title)
+///     #doc.date.display()
+///
+///     #doc.description
+///   ]
+/// }
+/// ```
+#[func(contextual)]
+pub fn documents(
+    /// The context to read the page list from.
+    context: Tracked<Context>,
+) -> HintedStrResult<Array> {
+    Ok(context.styles()?.get_cloned(TwylaDocumentList::all))
+}
+
+/// Internal host for the [`documents`] list.
+///
+/// Not constructed by users and not bound in the global scope — it exists only
+/// to carry the harvested page list on the style chain, where [`documents`]
+/// reads it back (mirrors how typst's `TargetElem` hosts the `target` field).
+#[elem]
+pub struct TwylaDocumentList {
+    /// Every page's metadata, injected by [`crate::compile`] each compile.
+    #[default(Array::new())]
+    pub all: Array,
 }

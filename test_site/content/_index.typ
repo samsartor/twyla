@@ -1,8 +1,9 @@
 #import "/templates/home.typ": *
-#show: home-template.with(
+#set document(
   title: "test_site",
   description: "twyla integration fixture — not a real site.",
 )
+#show: home-template
 
 This is twyla's integration fixture. It exercises engine primitives a
 real port might not: cross-document post enumeration, the raw-html
