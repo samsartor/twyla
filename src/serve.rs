@@ -194,7 +194,7 @@ fn run_watcher(
         let start = Instant::now();
         let (slugs_result, docs_result) = {
             let mut w = world.lock().unwrap();
-            let slugs = w.refresh_main();
+            let slugs = w.rescan();
             w.reset();
             comemo::evict(10);
             let docs = w.compile_bundle();
