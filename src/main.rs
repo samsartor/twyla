@@ -27,13 +27,9 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 
 use twyla::build::{Build, run as build_run};
-use twyla::diff::{
-    Matcher, RelaxConfig, RelaxationRule, diff, parse_html,
-    rewrite_own_page_anchor_hrefs,
-};
+use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff, parse_html};
 use twyla::import::import_md;
 use twyla::project::TwylaContext;
-use twyla::render::render_slug;
 use twyla::serve::{Serve, run as serve_run};
 
 #[derive(Parser)]
@@ -103,13 +99,6 @@ enum Cmd {
         #[arg(long, short = 'o')]
         output_dir: Option<PathBuf>,
     },
-    /// Compile a single page, run the resolution pass, print HTML.
-    Render {
-        #[command(flatten)]
-        ctx: ContextArgs,
-        /// Page slug — `guis-2` for `content/guis-2.typ`.
-        slug: String,
-    },
     /// Structurally diff two HTML files.
     Diff {
         /// Relax `<pre>` blocks to text-only equality.
@@ -147,10 +136,12 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::Serve { ctx } => cmd_serve(ctx),
         Cmd::Build { ctx, output_dir } => cmd_build(ctx, output_dir),
-        Cmd::Render { ctx, slug } => cmd_render(ctx, &slug),
-        Cmd::Diff { textonly_pre, ignore_attr, expected, actual } => {
-            cmd_diff(textonly_pre, &ignore_attr, &expected, &actual)
-        }
+        Cmd::Diff {
+            textonly_pre,
+            ignore_attr,
+            expected,
+            actual,
+        } => cmd_diff(textonly_pre, &ignore_attr, &expected, &actual),
         Cmd::Check { ctx, slug } => cmd_check(ctx, &slug),
         Cmd::Import { input } => cmd_import(&input),
     }
@@ -174,7 +165,10 @@ fn cmd_build(args: ContextArgs, output_dir: Option<PathBuf>) -> ExitCode {
     };
     let output_dir = output_dir.unwrap_or_else(|| ctx.default_output_dir());
     let start = std::time::Instant::now();
-    match build_run(Build { ctx, output_dir: output_dir.clone() }) {
+    match build_run(Build {
+        ctx,
+        output_dir: output_dir.clone(),
+    }) {
         Ok(summary) => {
             eprintln!(
                 "twyla build: {} pages, {} static, {} assets → {} ({:.1?})",
@@ -223,23 +217,6 @@ fn cmd_import(input: &Path) -> ExitCode {
         }
         Err(e) => {
             eprintln!("import error: {e}");
-            ExitCode::from(1)
-        }
-    }
-}
-
-fn cmd_render(args: ContextArgs, slug: &str) -> ExitCode {
-    let ctx = match resolve_ctx(args) {
-        Ok(c) => c,
-        Err(code) => return code,
-    };
-    match render_slug(&ctx, slug) {
-        Ok(doc) => {
-            print!("{}", doc.html);
-            ExitCode::from(0)
-        }
-        Err(e) => {
-            eprintln!("{e}");
             ExitCode::from(1)
         }
     }
@@ -307,7 +284,9 @@ fn cmd_diff(
 /// `rewrite_own_page_anchor_hrefs` — zola absolutizes anchor-only
 /// links against the base, typst emits fragment-only, so we rewrite
 /// zola's form back before comparison.
-fn cmd_check(args: ContextArgs, slug: &str) -> ExitCode {
+fn cmd_check(_args: ContextArgs, _slug: &str) -> ExitCode {
+    todo!("revive the check function")
+    /*
     let ctx = match resolve_ctx(args) {
         Ok(c) => c,
         Err(code) => return code,
@@ -324,7 +303,7 @@ fn cmd_check(args: ContextArgs, slug: &str) -> ExitCode {
     let zola_html_path = ctx.root.join(format!("public/{slug}/index.html"));
 
     eprintln!(">>> rendering {slug}");
-    let typst_html = match render_slug(&ctx, slug) {
+    let typst_html = match render_path(&ctx, slug) {
         Ok(doc) => doc.html,
         Err(e) => {
             eprintln!("{e}");
@@ -365,10 +344,7 @@ fn cmd_check(args: ContextArgs, slug: &str) -> ExitCode {
     // diff purposes rewrite the zola form back to the fragment-only
     // form before comparison.
     let route_url = ctx.default_route(slug).url_path;
-    rewrite_own_page_anchor_hrefs(
-        &mut expected,
-        &format!("{base_url}{route_url}#"),
-    );
+    rewrite_own_page_anchor_hrefs(&mut expected, &format!("{base_url}{route_url}#"));
     let actual = parse_html(&typst_html);
 
     eprintln!(">>> diff");
@@ -382,4 +358,5 @@ fn cmd_check(args: ContextArgs, slug: &str) -> ExitCode {
             ExitCode::from(1)
         }
     }
+    */
 }

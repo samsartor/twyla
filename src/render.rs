@@ -1,35 +1,17 @@
 //! Render typst content to HTML via the bundle export feature.
 //!
-//! Every compile goes through the same shape: twyla generates a virtual
-//! `main.typ` in memory containing one `#document(path, body)` call per
-//! routed page, then compiles that as a bundle and walks the HTML
-//! documents out.
-//!
 //! [`RenderWorld`] is the persistent compile state — typst-kit's
 //! [`FileStore`] backs the file/source caches, dependency tracking, and
 //! the stale-source-reuse optimization. Long-lived instances (used by
 //! `twyla serve`) keep their comemo cache across compiles; one-shot
 //! callers (`build`, `check`, `render`) just construct a fresh world,
 //! compile once, and drop it.
-//!
-//! Two public one-shot entry points:
-//!
-//! - [`render_site`] — scan `<root>/content/*.typ`, compile the
-//!   multi-document bundle, return every routed HTML.
-//! - [`render_slug`] — same compile, filter the bundle down to a
-//!   single doc. (`render_slug` runs the *full* bundle because
-//!   cross-doc labels, queries, and home-page enumeration only work
-//!   when every page is present.)
-//!
-//! After typst-html serializes, the resolution pass replaces every
-//! `<script type="x-twyla-raw-html">..</script>` with its inner body —
-//! the workaround for the missing `html.raw` primitive.
 
 use std::fmt;
 use std::path::PathBuf;
 
 use typst::diag::{FileError, FileResult, SourceDiagnostic, Warned};
-use typst::foundations::{BundlePath, Bytes, Datetime, Dict, Duration, IntoValue};
+use typst::foundations::{Bytes, Datetime, Dict, Duration, IntoValue};
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
@@ -41,7 +23,7 @@ use typst_kit::fonts::FontStore;
 use typst_kit::packages::SystemPackages;
 use typst_library::Feature;
 
-use crate::compile::{HarvestedDoc, RoutedSource};
+use crate::compile::HarvestedDoc;
 use crate::project::TwylaContext;
 
 /// Twyla's emit-raw-HTML placeholder. Matches the helper in user typst
@@ -49,10 +31,6 @@ use crate::project::TwylaContext;
 /// resolution pass below replaces each instance with the script body
 /// inlined.
 const RAW_HTML_MARKER: &str = r#"<script type="x-twyla-raw-html">"#;
-
-/// Virtual path for the generated main. Lives only in the in-memory
-/// source map — never read from disk.
-const VIRTUAL_MAIN_VPATH: &str = "/__twyla_main.typ";
 
 /// Pre-formatted errors. Caller prints these on stderr and exits.
 #[derive(Debug)]
@@ -87,7 +65,7 @@ impl std::error::Error for RenderError {}
 
 /// One routed page emerging from the bundle compile.
 #[derive(Debug, Clone)]
-pub struct RoutedDoc {
+pub struct OutputDoc {
     /// The bundle-relative output path, e.g., `guis-2/index.html`.
     pub path: PathBuf,
     /// Fully resolved HTML (placeholders already substituted).
@@ -99,35 +77,9 @@ pub struct RoutedDoc {
 /// One-shot wrapper: builds a fresh [`RenderWorld`], compiles, drops.
 /// `twyla serve` skips this and reuses a long-lived world directly so
 /// the comemo cache survives between requests.
-pub fn render_site(ctx: &TwylaContext) -> Result<Vec<RoutedDoc>, RenderError> {
+pub fn render_site(ctx: &TwylaContext) -> Result<Vec<OutputDoc>, RenderError> {
     let world = RenderWorld::new(ctx)?;
     world.compile_bundle()
-}
-
-/// Compile the full bundle and return the doc routed at `<slug>`.
-///
-/// The compile is multi-document even when the caller wants one slug,
-/// because typst-html resolves cross-doc `link(<label>)`, `query(..)`
-/// across the bundle, and the home page's `query(<twyla-post>)`
-/// enumeration only sees siblings if they're present. Filtering to one
-/// doc happens after compile, not before.
-pub fn render_slug(
-    ctx: &TwylaContext,
-    slug: &str,
-) -> Result<RoutedDoc, RenderError> {
-    let world = RenderWorld::new(ctx)?;
-    let mut docs = world.compile_bundle()?;
-    let target = ctx.default_route(slug).bundle_path;
-    let idx = docs.iter().position(|d| d.path == target).ok_or_else(|| {
-        RenderError {
-            messages: vec![format!(
-                "bundle did not contain a document for slug {slug:?} \
-                 (expected path {target:?})"
-            )],
-            kind: RenderErrorKind::Bundle,
-        }
-    })?;
-    Ok(docs.swap_remove(idx))
 }
 
 /// Replace every `<script type="x-twyla-raw-html">..</script>` with its
@@ -153,29 +105,6 @@ pub fn resolve_raw_html_placeholders(input: &str) -> String {
     out
 }
 
-/// Build the routed-source list for the current `content/` layout: one
-/// [`RoutedSource`] per scanned slug, pairing the content file's [`FileId`]
-/// with the bundle path it emits at. `compile_bundle` evaluates each and
-/// wraps it in a native document — twyla owns routing in Rust, so there's
-/// no generated `main.typ` to `#include` pages anymore.
-fn routed_sources(ctx: &TwylaContext) -> Result<Vec<RoutedSource>, RenderError> {
-    let slugs = ctx.scan_pages().map_err(setup_err)?;
-    slugs
-        .iter()
-        .map(|slug| {
-            let route = ctx.default_route(slug);
-            let src_vpath = VirtualPath::new(format!("/content/{slug}.typ"))
-                .map_err(|e| setup_err(format!("invalid content path for {slug}: {e:?}")))?;
-            let id = FileId::new(RootedPath::new(VirtualRoot::Project, src_vpath));
-            let bundle_vpath = VirtualPath::new(route.bundle_path.to_string_lossy().as_ref())
-                .map_err(|e| setup_err(format!("invalid bundle path for {slug}: {e:?}")))?;
-            let path = BundlePath::new(bundle_vpath)
-                .map_err(|e| setup_err(format!("invalid bundle path for {slug}: {e}")))?;
-            Ok(RoutedSource { id, path, url: route.url_path })
-        })
-        .collect()
-}
-
 fn setup_err(msg: impl Into<String>) -> RenderError {
     RenderError {
         messages: vec![msg.into()],
@@ -191,11 +120,11 @@ fn setup_err(msg: impl Into<String>) -> RenderError {
 /// requests so the comemo cache survives between compiles. For one-shot
 /// CLI commands, we just build one, compile, drop.
 pub struct RenderWorld {
-    ctx: TwylaContext,
-    main_id: FileId,
-    library: LazyHash<Library>,
-    fonts: FontStore,
-    files: FileStore<TwylaLoader>,
+    pub ctx: TwylaContext,
+    pub main_id: FileId,
+    pub library: LazyHash<Library>,
+    pub fonts: FontStore,
+    pub files: FileStore<TwylaLoader>,
 }
 
 impl RenderWorld {
@@ -213,19 +142,14 @@ impl RenderWorld {
         fonts.extend(typst_kit::fonts::embedded());
         fonts.extend(typst_kit::fonts::system());
 
-        // World::main() must return a valid file id, but twyla no longer
-        // routes through a generated main — it assembles the bundle from
-        // per-page sources in Rust (see `routed_sources` / `compile_bundle`).
-        // So the virtual main is now an empty placeholder that only satisfies
-        // the trait; it's never evaluated.
-        let vpath = VirtualPath::new(VIRTUAL_MAIN_VPATH)
-            .map_err(|e| setup_err(format!("invalid virtual main path: {e:?}")))?;
-        let main_id =
-            FileId::new(RootedPath::new(VirtualRoot::Project, vpath));
+        // Static `FileId` allocated to act as the site "main".
+        let main_id = FileId::unique(RootedPath::new(
+            VirtualRoot::Project,
+            VirtualPath::new("<website>").unwrap(),
+        ));
 
         let loader = TwylaLoader {
             root: ctx.root.clone(),
-            main_id,
             packages: SystemPackages::new(SystemDownloader::new(concat!(
                 "twyla/",
                 env!("CARGO_PKG_VERSION"),
@@ -262,33 +186,6 @@ impl RenderWorld {
         })
     }
 
-    /// The context this world was built from. Useful for callers that
-    /// need to reach project-layout state (paths, base_url) without
-    /// threading the context separately.
-    pub fn ctx(&self) -> &TwylaContext {
-        &self.ctx
-    }
-
-    /// Re-scan `<root>/content/` and return the current slug set (for the
-    /// dev server's log + watcher). The page set is no longer cached on the
-    /// world — every [`compile_bundle`](Self::compile_bundle) rebuilds it
-    /// fresh via `routed_sources`, so this is purely informational now.
-    /// Errors from `read_dir` (e.g., content/ vanished mid-session) propagate.
-    pub fn rescan(&self) -> Result<Vec<String>, String> {
-        self.ctx.scan_pages()
-    }
-
-    /// Mark every cached file slot stale. The next [`compile_bundle`]
-    /// call will reload affected files from disk; FileStore reuses the
-    /// existing Source object for in-place reparse where bytes match.
-    ///
-    /// Pair with `comemo::evict(N)` to also age out memoized compile
-    /// results — see `typst-cli/src/watch.rs` for the canonical
-    /// invocation.
-    pub fn reset(&mut self) {
-        self.files.reset();
-    }
-
     /// Paths that the last compile read from disk. Suitable for
     /// `typst_kit::watcher::Watcher::update`. Drops the virtual main
     /// (not a real path).
@@ -303,7 +200,7 @@ impl RenderWorld {
     /// cache. Between compiles, call [`reset`](Self::reset) and
     /// `comemo::evict(..)` to invalidate; for content/ shape changes,
     /// also call [`refresh_main`](Self::refresh_main).
-    pub fn compile_bundle(&self) -> Result<Vec<RoutedDoc>, RenderError> {
+    pub fn compile_bundle(&self) -> Result<Vec<OutputDoc>, RenderError> {
         Ok(self.compile_bundle_with_meta()?.0)
     }
 
@@ -314,19 +211,25 @@ impl RenderWorld {
     /// `compile_bundle` just drops it for callers that only want HTML.
     pub fn compile_bundle_with_meta(
         &self,
-    ) -> Result<(Vec<RoutedDoc>, Vec<HarvestedDoc>), RenderError> {
-        let sources = routed_sources(&self.ctx)?;
-        let Warned { output, warnings } = crate::compile::compile_bundle(self, &sources);
-
+    ) -> Result<(Vec<OutputDoc>, Vec<HarvestedDoc>), RenderError> {
+        let sources = self.ctx.scan_pages().map_err(|e| setup_err(e))?;
+        let fileids: Vec<_> = sources
+            .into_iter()
+            .map(|path| {
+                FileId::new(RootedPath::new(
+                    VirtualRoot::Project,
+                    VirtualPath::virtualize(&self.ctx.root, &path)
+                        .expect("all paths should be within the root"),
+                ))
+            })
+            .collect();
+        let Warned { output, warnings } = crate::compile::compile_bundle(&self.ctx, self, &fileids);
         for w in &warnings {
             eprintln!("warning: {}", w.message);
         }
 
         let (bundle, harvested) = output.map_err(|errors| RenderError {
-            messages: errors
-                .iter()
-                .map(|e| format_diagnostic(self, e))
-                .collect(),
+            messages: errors.iter().map(|e| format_diagnostic(self, e)).collect(),
             kind: RenderErrorKind::Compile,
         })?;
 
@@ -337,13 +240,10 @@ impl RenderWorld {
                 _ => continue,
             };
             let raw = typst_html::html(doc).map_err(|errors| RenderError {
-                messages: errors
-                    .iter()
-                    .map(|e| format_diagnostic(self, e))
-                    .collect(),
+                messages: errors.iter().map(|e| format_diagnostic(self, e)).collect(),
                 kind: RenderErrorKind::Compile,
             })?;
-            docs.push(RoutedDoc {
+            docs.push(OutputDoc {
                 path: PathBuf::from(path.get_without_slash()),
                 html: resolve_raw_html_placeholders(&raw),
             });
@@ -363,13 +263,10 @@ impl RenderWorld {
 
 /// FileLoader for [`FileStore`]. Serves the (empty) virtual main from
 /// memory and every other id from the on-disk project root.
-struct TwylaLoader {
+pub struct TwylaLoader {
     root: PathBuf,
-    main_id: FileId,
-    /// Serves `@preview/*` (and any other namespaced) packages from the
-    /// standard data/cache dirs, downloading from Typst Universe on a
-    /// cache miss. The dogfood doc imports `@preview/frame-it` and
-    /// `@preview/dtree`, so this is a hard prerequisite, not a nicety.
+    /// Serves packages from the  standard data/cache dirs, downloading from
+    /// Typst Universe on a cache miss.
     packages: SystemPackages,
 }
 
@@ -380,9 +277,6 @@ impl TwylaLoader {
     /// Package ids resolve through [`SystemPackages`] (data/cache dirs,
     /// then download from Universe), mirroring the typst CLI.
     fn resolve(&self, id: FileId) -> FileResult<PathBuf> {
-        if id == self.main_id {
-            return Err(FileError::NotFound(PathBuf::from(VIRTUAL_MAIN_VPATH)));
-        }
         let vpath = id.vpath();
         match id.root() {
             VirtualRoot::Project => Ok(self.root.join(vpath.get_without_slash())),
@@ -393,10 +287,6 @@ impl TwylaLoader {
 
 impl FileLoader for TwylaLoader {
     fn load(&self, id: FileId) -> FileResult<Bytes> {
-        if id == self.main_id {
-            // Empty placeholder — the virtual main is never evaluated.
-            return Ok(Bytes::new(Vec::new()));
-        }
         // Packages resolve to a (possibly just-downloaded) cache dir and
         // load through `FsRoot` so the path-escape guard applies; project
         // files read directly from the resolved on-disk path.
@@ -404,10 +294,12 @@ impl FileLoader for TwylaLoader {
             return self.packages.obtain(spec)?.load(id.vpath());
         }
         let path = self.resolve(id)?;
-        std::fs::read(&path).map(Bytes::new).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => FileError::NotFound(path),
-            _ => FileError::Other(Some(e.to_string().into())),
-        })
+        std::fs::read(&path)
+            .map(Bytes::new)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => FileError::NotFound(path),
+                _ => FileError::Other(Some(e.to_string().into())),
+            })
     }
 }
 
@@ -431,13 +323,7 @@ fn format_diagnostic(world: &dyn World, e: &SourceDiagnostic) -> String {
         .byte_to_line_column(range.start)
         .unwrap_or((0, 0));
     let path = id.vpath().get_without_slash();
-    format!(
-        "error: {} ({}:{}:{})",
-        e.message,
-        path,
-        line + 1,
-        col + 1
-    )
+    format!("error: {} ({}:{}:{})", e.message, path, line + 1, col + 1)
 }
 
 impl World for RenderWorld {
@@ -546,10 +432,7 @@ mod tests {
             ("guis-1/index.html", &["href=\"#hybrid-mode\""]),
             (
                 "guis-3/index.html",
-                &[
-                    "href=\"#streams\"",
-                    "href=\"#stream-based-reactivity\"",
-                ],
+                &["href=\"#streams\"", "href=\"#stream-based-reactivity\""],
             ),
         ];
         for (path, expected_anchors) in intra_doc_expectations {

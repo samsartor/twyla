@@ -32,7 +32,7 @@ use notify::{EventKind, RecursiveMode, Watcher as _};
 use typst_kit::watcher::Watcher;
 
 use crate::project::TwylaContext;
-use crate::render::{RenderError, RenderWorld, RoutedDoc};
+use crate::render::{OutputDoc, RenderError, RenderWorld};
 
 pub struct Serve {
     pub ctx: TwylaContext,
@@ -41,7 +41,7 @@ pub struct Serve {
 
 /// Result of the most recent bundle compile. Published by the watcher
 /// thread, read by request handlers.
-type LastOutput = Mutex<Result<Vec<RoutedDoc>, RenderError>>;
+type LastOutput = Mutex<Result<Vec<OutputDoc>, RenderError>>;
 
 /// Live Server-Sent-Events connections subscribed to `/__twyla/reload`.
 /// Request handlers push new ones; the watcher threads write reload
@@ -182,29 +182,25 @@ fn run_watcher(
         // content/ shape changed), reset FileStore, age comemo, and
         // recompile. Publish the result.
         let start = Instant::now();
-        let (slugs_result, docs_result) = {
-            let mut w = world.lock().unwrap();
-            let slugs = w.rescan();
-            w.reset();
+        let result = {
             comemo::evict(10);
-            let docs = w.compile_bundle();
-            (slugs, docs)
+            let mut w = world.lock().unwrap();
+            w.files.reset();
+            w.compile_bundle()
         };
         let elapsed = start.elapsed();
-        match (&slugs_result, &docs_result) {
-            (Ok(slugs), Ok(docs)) => eprintln!(
-                "twyla serve: recompiled {} doc(s) from {} slug(s) in {:.1?}",
+        match &result {
+            Ok(docs) => eprintln!(
+                "twyla serve: recompiled {} doc(s) in {:.1?}",
                 docs.len(),
-                slugs.len(),
                 elapsed,
             ),
-            (Err(e), _) => eprintln!("twyla serve: content/ rescan failed: {e}"),
-            (Ok(_), Err(e)) => eprintln!(
+            Err(e) => eprintln!(
                 "twyla serve: recompile errored (after {:.1?}):\n{e}",
                 elapsed,
             ),
         }
-        *last_output.lock().unwrap() = docs_result;
+        *last_output.lock().unwrap() = result;
 
         // Tell every connected browser to reload. We signal on *every*
         // publish, including compile errors, so that fixing broken typst
@@ -455,21 +451,26 @@ fn status_phrase(status: u16) -> &'static str {
 }
 
 fn dispatch(state: &ServeState, path: &str) -> Response {
-    let path = path.split('?').next().unwrap_or(path);
-
-    if path == "/" {
-        return serve_doc(state, &PathBuf::from("index.html"));
+    let path = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .trim_start_matches('/');
+    if path.is_empty() {
+        serve_doc(state, Path::new("index.html"))
+    } else if path.ends_with('/') {
+        serve_doc(state, &Path::new(path).join("index.html"))
+    } else {
+        let res = serve_doc(state, Path::new(path));
+        if res.status == 200 {
+            return res;
+        }
+        let res = serve_doc(state, &Path::new(path).join("index.html"));
+        if res.status == 200 {
+            return res;
+        }
+        serve_static(&state.ctx, path)
     }
-
-    // Page route: single path component, no extension, matching
-    // `content/<slug>.typ`. Anything else falls through to static.
-    let trimmed = path.trim_start_matches('/').trim_end_matches('/');
-    if !trimmed.is_empty() && !trimmed.contains('/') && state.ctx.page_exists(trimmed) {
-        let route = state.ctx.default_route(trimmed);
-        return serve_doc(state, &route.bundle_path);
-    }
-
-    serve_static(&state.ctx, path)
 }
 
 /// Serve a compiled doc from the cached `last_output`.
@@ -480,7 +481,7 @@ fn serve_doc(state: &ServeState, bundle_path: &Path) -> Response {
             Some(d) => Response::html(200, d.html.clone()),
             None => {
                 if bundle_path == Path::new("index.html") {
-                    placeholder_main(&state.ctx)
+                    placeholder_main(docs, &state.ctx)
                 } else {
                     Response::text(404, "page not found in bundle")
                 }
@@ -500,13 +501,7 @@ fn serve_doc(state: &ServeState, bundle_path: &Path) -> Response {
 /// Plain-list index of available slugs, served at `/` when no
 /// `content/main.typ` exists. Stand-in for a real home page during
 /// the early stages of a site.
-fn placeholder_main(ctx: &TwylaContext) -> Response {
-    let slugs = match ctx.scan_pages() {
-        Ok(s) => s,
-        Err(e) => {
-            return Response::html(500, format!("<pre>{}</pre>", html_escape(&e)));
-        }
-    };
+fn placeholder_main(docs: &[OutputDoc], _ctx: &TwylaContext) -> Response {
     let mut out = String::new();
     out.push_str(
         "<!doctype html>\n\
@@ -518,10 +513,10 @@ fn placeholder_main(ctx: &TwylaContext) -> Response {
     out.push_str("<h1>twyla dev</h1>\n");
     out.push_str("<p>placeholder index — content/main.typ not present.</p>\n");
     out.push_str("<ul>\n");
-    for s in &slugs {
+    for d in docs {
         out.push_str(&format!(
-            "<li><a href=\"/{slug}/\">/{slug}/</a></li>\n",
-            slug = html_escape(s),
+            "<li><a href=\"/{slug}\">/{slug}</a></li>\n",
+            slug = html_escape(d.path.to_str().unwrap()),
         ));
     }
     out.push_str("</ul>\n</body></html>\n");

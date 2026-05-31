@@ -22,7 +22,7 @@
 use comemo::Tracked;
 use ecow::EcoString;
 use typst::diag::HintedStrResult;
-use typst::foundations::{Array, Content, Context, Datetime, Value, elem, func};
+use typst::foundations::{Array, Content, Context, Datetime, Smart, Value, elem, func};
 
 /// Metadata for the current page.
 ///
@@ -40,6 +40,11 @@ use typst::foundations::{Array, Content, Context, Datetime, Value, elem, func};
 /// ```
 #[elem(name = "document")]
 pub struct TwylaDocument {
+    /// The output location of the document. For example, `"foo/index.html"` or
+    /// `"foo.html"` to create a page called "foo". Can be used to create a page
+    /// literally called "main".
+    pub output: Smart<EcoString>,
+
     /// The page's title.
     pub title: Option<Content>,
 
@@ -50,9 +55,11 @@ pub struct TwylaDocument {
     pub description: Option<Content>,
 
     /// What kind of page this is, e.g. `"post"` or `"page"` — used to group
-    /// pages in listings and feeds. If unset, twyla derives it from the route
-    /// (`"root"` for the home page, otherwise `"page"`).
-    pub kind: Option<EcoString>,
+    /// pages in listings and feeds. If `auto`, will be set to:
+    /// - "home" for `main.typ`
+    /// - "dir" for `*/main.typ`
+    /// - "page" for for all others
+    pub kind: Smart<EcoString>,
 
     /// Arbitrary extra data for your own use. Available as `document.extra`
     /// and as the `extra` field of this page's [`documents`] entry.

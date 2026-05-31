@@ -13,10 +13,9 @@ use std::path::{Path, PathBuf};
 use twyla::project::TwylaContext;
 use twyla::render::render_site;
 
-fn render_plain() -> Vec<twyla::render::RoutedDoc> {
+fn render_plain() -> Vec<twyla::render::OutputDoc> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_site_plain");
-    let ctx = TwylaContext::new(root, Some("https://example.com".to_string()))
-        .expect("ctx");
+    let ctx = TwylaContext::new(root, Some("https://example.com".to_string())).expect("ctx");
     render_site(&ctx).expect("render test_site_plain")
 }
 

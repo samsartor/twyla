@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use twyla::build::{Build, BuildSummary, run as build_run};
 use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff, parse_html};
 use twyla::project::TwylaContext;
-use twyla::render::{RoutedDoc, render_site};
+use twyla::render::{OutputDoc, render_site};
 
 const BASE_URL: &str = "https://example.com";
 
@@ -33,14 +33,14 @@ fn ctx() -> TwylaContext {
         .expect("construct TwylaContext for test_site")
 }
 
-fn render() -> Vec<RoutedDoc> {
+fn render() -> Vec<OutputDoc> {
     render_site(&ctx()).expect("render test_site")
 }
 
 /// HTML of the doc routed to `bundle_path` (e.g. `hello/index.html`).
-fn page<'a>(docs: &'a [RoutedDoc], bundle_path: &str) -> &'a str {
+fn page<'a>(docs: &'a [OutputDoc], bundle_path: &str) -> &'a str {
     docs.iter()
-        .find(|d| d.path == PathBuf::from(bundle_path))
+        .find(|d| d.path == Path::new(bundle_path))
         .unwrap_or_else(|| {
             let have: Vec<_> = docs.iter().map(|d| d.path.display().to_string()).collect();
             panic!("no doc at {bundle_path:?}; have {have:?}")
@@ -75,6 +75,7 @@ fn routes_every_content_page_and_skips_underscores() {
 fn home_enumerates_posts_newest_first() {
     let docs = render();
     let home = page(&docs, "index.html");
+    println!("{}", home);
 
     // Both posts appear as links to their permalinks.
     assert!(
@@ -319,7 +320,7 @@ fn spike_harvest_reads_per_doc_extra() {
     let (_rendered, docs) = world.compile_bundle_with_meta().expect("compile+harvest");
     let spike = docs
         .iter()
-        .find(|d| d.url == "/spike-doc/")
+        .find(|d| d.url == "https://example.com/spike-doc/")
         .unwrap_or_else(|| panic!("spike-doc not harvested; got {docs:#?}"));
     let extra = format!("{:?}", spike.extra);
     assert!(
@@ -335,7 +336,7 @@ fn spike_harvest_reads_per_doc_extra() {
     // Per-doc isolation: a second page sets a different extra + draft:true.
     let spike2 = docs
         .iter()
-        .find(|d| d.url == "/spike-doc-2/")
+        .find(|d| d.url == "https://example.com/spike-doc-2/")
         .unwrap_or_else(|| panic!("spike-doc-2 not harvested; got {docs:#?}"));
     assert!(
         format!("{:?}", spike2.extra).contains("red"),
@@ -350,7 +351,7 @@ fn spike_harvest_reads_per_doc_extra() {
     // A post page harvests its standard fields + derived kind.
     let hello = docs
         .iter()
-        .find(|d| d.url == "/hello/")
+        .find(|d| d.url == "https://example.com/hello/")
         .unwrap_or_else(|| panic!("hello not harvested; got {docs:#?}"));
     assert_eq!(hello.kind, "post", "hello kind not harvested: {hello:#?}");
     assert!(hello.date.is_some(), "hello date not harvested: {hello:#?}");

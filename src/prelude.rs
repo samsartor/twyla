@@ -92,10 +92,10 @@ pub fn install(library: &mut Library) {
     global.define("__std_document", native_document);
     global.bind(
         "document".into(),
-        Binding::detached(crate::twyla_doc::TwylaDocument::ELEM),
+        Binding::detached(crate::document::TwylaDocument::ELEM),
     );
 
     // The cross-page list builtin. Reads twyla's injected page metadata off
     // the style chain (see `crate::compile`).
-    global.define_func::<crate::twyla_doc::documents>();
+    global.define_func::<crate::document::documents>();
 }

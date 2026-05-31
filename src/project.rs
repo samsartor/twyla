@@ -12,15 +12,6 @@
 
 use std::path::{Path, PathBuf};
 
-/// Where a routed page emits in the bundle and what URL serves it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageRoute {
-    /// User-facing URL, leading slash, trailing slash. `/foo/` or `/`.
-    pub url_path: String,
-    /// Bundle-relative output path. `foo/index.html` or `index.html`.
-    pub bundle_path: PathBuf,
-}
-
 /// Everything a twyla command needs to operate on a project. Cheap to
 /// clone — paths are owned `PathBuf`s, no heavy state.
 #[derive(Debug, Clone)]
@@ -60,13 +51,6 @@ impl TwylaContext {
         self.root.join("static")
     }
 
-    /// `<root>/templates/` — typst modules importable from content.
-    /// Not directly emitted; here for completeness so call sites stop
-    /// hardcoding the directory name.
-    pub fn templates_dir(&self) -> PathBuf {
-        self.root.join("templates")
-    }
-
     /// Default output directory for `twyla build`. `<root>/public/`,
     /// matching zola so a coexisting workflow doesn't surprise anyone.
     /// `twyla build -o <dir>` overrides at the CLI layer; this is just
@@ -90,11 +74,11 @@ impl TwylaContext {
     /// Discover routed pages from the filesystem layout. Top-level
     /// `content/*.typ` only — no subdirectory recursion yet (the
     /// corpus doesn't need it).
-    pub fn scan_pages(&self) -> Result<Vec<String>, String> {
+    pub fn scan_pages(&self) -> Result<Vec<PathBuf>, String> {
         let content_dir = self.content_dir();
         let entries = std::fs::read_dir(&content_dir)
             .map_err(|e| format!("cannot read {}: {e}", content_dir.display()))?;
-        let mut slugs = Vec::new();
+        let mut paths = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| format!("scan error: {e}"))?;
             let path = entry.path();
@@ -107,32 +91,48 @@ impl TwylaContext {
             if stem.starts_with('_') {
                 continue;
             }
-            slugs.push(stem.to_string());
+            paths.push(path);
         }
-        slugs.sort();
-        Ok(slugs)
+        paths.sort();
+        Ok(paths)
     }
 
-    /// Default twyla-inferred route for a page identified by its file
-    /// stem. Today this is the *only* route source; when pages can
-    /// declare their own URL via typst metadata, this becomes the
-    /// fallback for the un-overridden case (signature stays the same,
-    /// callers swap to a `route_for(stem, declared)` helper that calls
-    /// this when `declared` is `None`).
-    ///
-    /// `main` → `("/", "index.html")`; everything else →
-    /// `("/<stem>/", "<stem>/index.html")`.
-    pub fn default_route(&self, stem: &str) -> PageRoute {
-        if stem == "main" {
-            PageRoute {
-                url_path: "/".to_string(),
-                bundle_path: PathBuf::from("index.html"),
+    pub fn default_output(&self, source: &str) -> String {
+        let source = self.root.join(source);
+        let content_dir = self.content_dir();
+        let Ok(path) = source.strip_prefix(&content_dir) else {
+            panic!(
+                "source {:?} is not within the content dir {:?}",
+                source.display(),
+                content_dir.display()
+            );
+        };
+        if path.file_stem().is_some_and(|s| s == "main") {
+            match path.parent() {
+                Some(parent) => parent.join("index.html").to_str().unwrap().to_owned(),
+                None => "index.html".to_owned(),
             }
         } else {
-            PageRoute {
-                url_path: format!("/{stem}/"),
-                bundle_path: PathBuf::from(format!("{stem}/index.html")),
-            }
+            path.with_extension("")
+                .join("index.html")
+                .to_str()
+                .unwrap()
+                .to_owned()
+        }
+    }
+
+    pub fn url_for(&self, output: &str) -> String {
+        let path = match output.strip_suffix("index.html") {
+            Some(rest) => rest,
+            None => output,
+        };
+        match &self.base_url {
+            Some(base) => format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                path.trim_start_matches('/')
+            ),
+            None => format!("/{}", path.trim_start_matches('/')),
         }
     }
 
@@ -149,25 +149,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_route_for_index_routes_to_bundle_root() {
+    fn default_output_for_main() {
         let ctx = TwylaContext {
             root: PathBuf::from("/tmp"),
             base_url: None,
         };
-        let r = ctx.default_route("main");
-        assert_eq!(r.url_path, "/");
-        assert_eq!(r.bundle_path, PathBuf::from("index.html"));
+        let r = ctx.default_output("content/main.typ");
+        assert_eq!(r, PathBuf::from("index.html"));
     }
 
     #[test]
-    fn default_route_for_slug_nests_under_slug_dir() {
+    fn default_output_for_nested_main() {
         let ctx = TwylaContext {
             root: PathBuf::from("/tmp"),
             base_url: None,
         };
-        let r = ctx.default_route("guis-2");
-        assert_eq!(r.url_path, "/guis-2/");
-        assert_eq!(r.bundle_path, PathBuf::from("guis-2/index.html"));
+        let r = ctx.default_output("content/foobar/main.typ");
+        assert_eq!(r, PathBuf::from("foobar/index.html"));
+    }
+
+    #[test]
+    fn default_output_for_other() {
+        let ctx = TwylaContext {
+            root: PathBuf::from("/tmp"),
+            base_url: None,
+        };
+        let r = ctx.default_output("content/guis-2.typ");
+        assert_eq!(r, PathBuf::from("guis-2/index.html"));
     }
 
     #[test]

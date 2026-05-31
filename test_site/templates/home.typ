@@ -21,7 +21,7 @@
     html.elem("ul", attrs: (class: "post-list"), {
       for p in sorted {
         html.elem("li", {
-          html.a(href: base-url + p.url, class: "post-link", p.title)
+          html.a(href: p.url, class: "post-link", p.title)
           if p.description != none {
             html.span(class: "post-desc", p.description)
           }

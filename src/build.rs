@@ -136,10 +136,7 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<usize, BuildError> {
 /// Like [`copy_dir_contents`] but skips source-format files — `.typ`
 /// (twyla pages) and `.md` (zola legacy still on disk during porting).
 /// Used for the colocated-asset bridge.
-fn copy_non_typ_contents(
-    src: &Path,
-    dst: &Path,
-) -> Result<usize, BuildError> {
+fn copy_non_typ_contents(src: &Path, dst: &Path) -> Result<usize, BuildError> {
     let entries = fs::read_dir(src).map_err(|e| BuildError::Io {
         context: format!("reading {}", src.display()),
         source: e,
