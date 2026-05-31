@@ -1,7 +1,6 @@
-> This README is aspirational, and not all features here are currently implemented. See doc/planning.typ for the
-current state of the project.
+> This README is aspirational, and not all features here are currently implemented. See doc/planning.typ for the current state of the project.
 
-# Twyla
+<h1>Twyla</h1>
 
 Twyla is a static site generator (SSG) similar to [Zola](https://www.getzola.org) but built entirely around the [Typst](https://typst.app) typesetting and scripting language.
 
@@ -88,7 +87,7 @@ sass/
 └ main.sass
 ```
 
----
+<hr />
 
 ```sass
 .post-header
@@ -103,7 +102,7 @@ sass/
   color: grey  
 ```
 
----
+<hr />
 
 ```typst
 #context for doc in documents() {
@@ -224,7 +223,7 @@ templates/
 As a shorthand, you can also add the theme to your `Twyla.toml`:
 
 ```toml
-theme: "/templates/theme.typ"
+theme = "/templates/theme.typ"
 ```
 
 Twyla themes can also be arbitrary typst packages such as `@samsartor/twyla-pickles` or `@samsartor/twyla-book`. A theme need only expose `KIND-template` functions and/or `KIND-default` constants for each supported page `KIND` (eg `"page"`, `"root"`, `"dir"`, `"draft"`).

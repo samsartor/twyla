@@ -1,12 +1,5 @@
-// test_site home template. Apply at the top of `content/_index.typ`:
-//
-//   #import "/templates/home.typ": *
-//   #show: home-template.with(title: "test_site", description: "...")
-//
-//   Intro prose here.
-//
-//   #post-list()
-
+// test_site home template.
+// 
 #import "/templates/lib.typ": (
   base-url,
   format-date,

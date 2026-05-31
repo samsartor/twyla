@@ -1,19 +1,5 @@
-#import "@preview/frame-it:2.0.0": *
-#import "@preview/dtree:0.1.1": dtree
+#import "../templates/lib.typ": horizontalrule
 
-#let note = frame("Note", blue)
-#let horizontalrule = context { if target() == "html" { html.hr() } else { line(length: 100%) } }
-
-#show quote.where(block: true): it => note(it.body)
-#show: frame-style(styles.hint)
-#show raw.where(lang: "tree"): it => if target() == "html" { it } else { dtree(raw(it.text.replace("├", " ").replace("└", " "))) }
-
-#quote(block: true)[
-This README is aspirational, and not all features here are currently
-implemented. See doc/planning.typ for the current state of the project.
-]
-
-= Twyla
 <twyla>
 Twyla is a static site generator (SSG) similar to
 #link("https://www.getzola.org")[Zola] but built entirely around the
@@ -33,7 +19,7 @@ Twyla is still in early development, and mostly vibe-coded. Use for your
 personal blog, not your company homepage.
 ]
 
-== Installing
+= Installing
 <installing>
 Your best option (for now) is to compile Twyla from source:
 
@@ -41,7 +27,7 @@ Your best option (for now) is to compile Twyla from source:
 cargo install https://github.com/samsartor/twyla
 ```
 
-== Getting Started
+= Getting Started
 <getting-started>
 All you need to start using twyla is a single file!
 
@@ -190,7 +176,7 @@ follow the guide provided by `typst init`, or download the
 #link("https://raw.githubusercontent.com/samsartor/twyla/refs/heads/main/TWYLA_SKILL.md")[`TWYLA_SKILL.md`]
 and throw your agent of choice at the problem.
 
-== Customization
+= Customization
 <customization>
 Twyla customization and theming is mainly accomplished using Typt's
 usual
@@ -274,7 +260,7 @@ templates/
 As a shorthand, you can also add the theme to your `Twyla.toml`:
 
 ```toml
-theme: "/templates/theme.typ"
+theme = "/templates/theme.typ"
 ```
 
 Twyla themes can also be arbitrary typst packages such as

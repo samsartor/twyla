@@ -8,7 +8,7 @@ engine primitives (bundle routing, `sys.inputs.base_url`, the
 
 What each page exercises:
 
-- `content/_index.typ` — home page; cross-document post enumeration via
+- `content/main.typ` — home page; cross-document post enumeration via
   `query(<twyla-post>)`.
 - `content/hello.typ` — headings + auto-slug ids, an intra-document
   anchor link (label → fragment-only href), lists, fenced code.

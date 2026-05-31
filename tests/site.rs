@@ -230,7 +230,7 @@ fn build_emits_pages_static_and_colocated_assets() {
 /// Nested sections: `content/<section>/<page>.typ` should route to
 /// `<section>/<page>/index.html`. Blocked on `scan_pages` recursion
 /// (`project.rs` — "no subdirectory recursion yet"). To enable: add
-/// `test_site/content/notes/_index.typ` + `notes/first.typ`, then
+/// `test_site/content/notes/main.typ` + `notes/first.typ`, then
 /// un-ignore.
 #[test]
 #[ignore = "nested-section routing not implemented (scan_pages is top-level only)"]
@@ -291,9 +291,18 @@ fn build_emits_feed_with_post_entries() {
 fn spike_overloaded_document_contextual_read() {
     let docs = render();
     let html = page(&docs, "spike-doc/index.html");
-    assert!(html.contains("extra-color=blue"), "contextual extra.color not read: {html}");
-    assert!(html.contains("extra-tag=spike"), "contextual extra.tag not read: {html}");
-    assert!(html.contains("draft=false"), "contextual draft default not read: {html}");
+    assert!(
+        html.contains("extra-color=blue"),
+        "contextual extra.color not read: {html}"
+    );
+    assert!(
+        html.contains("extra-tag=spike"),
+        "contextual extra.tag not read: {html}"
+    );
+    assert!(
+        html.contains("draft=false"),
+        "contextual draft default not read: {html}"
+    );
 }
 
 /// The decisive harvest test: read each page's `document.extra`/`draft`
@@ -313,8 +322,14 @@ fn spike_harvest_reads_per_doc_extra() {
         .find(|d| d.url == "/spike-doc/")
         .unwrap_or_else(|| panic!("spike-doc not harvested; got {docs:#?}"));
     let extra = format!("{:?}", spike.extra);
-    assert!(extra.contains("blue"), "extra.color not harvested: {spike:#?}");
-    assert!(extra.contains("spike"), "extra.tag not harvested: {spike:#?}");
+    assert!(
+        extra.contains("blue"),
+        "extra.color not harvested: {spike:#?}"
+    );
+    assert!(
+        extra.contains("spike"),
+        "extra.tag not harvested: {spike:#?}"
+    );
     assert_eq!(spike.draft, false, "draft default wrong: {spike:#?}");
 
     // Per-doc isolation: a second page sets a different extra + draft:true.
@@ -322,8 +337,14 @@ fn spike_harvest_reads_per_doc_extra() {
         .iter()
         .find(|d| d.url == "/spike-doc-2/")
         .unwrap_or_else(|| panic!("spike-doc-2 not harvested; got {docs:#?}"));
-    assert!(format!("{:?}", spike2.extra).contains("red"), "doc2 extra bled: {spike2:#?}");
-    assert!(!format!("{:?}", spike2.extra).contains("blue"), "doc1 extra bled into doc2: {spike2:#?}");
+    assert!(
+        format!("{:?}", spike2.extra).contains("red"),
+        "doc2 extra bled: {spike2:#?}"
+    );
+    assert!(
+        !format!("{:?}", spike2.extra).contains("blue"),
+        "doc1 extra bled into doc2: {spike2:#?}"
+    );
     assert_eq!(spike2.draft, true, "doc2 draft not harvested: {spike2:#?}");
 
     // A post page harvests its standard fields + derived kind.
@@ -333,6 +354,10 @@ fn spike_harvest_reads_per_doc_extra() {
         .unwrap_or_else(|| panic!("hello not harvested; got {docs:#?}"));
     assert_eq!(hello.kind, "post", "hello kind not harvested: {hello:#?}");
     assert!(hello.date.is_some(), "hello date not harvested: {hello:#?}");
-    assert_eq!(format!("{:?}", hello.extra), "None", "unset extra not default: {hello:#?}");
+    assert_eq!(
+        format!("{:?}", hello.extra),
+        "None",
+        "unset extra not default: {hello:#?}"
+    );
     assert_eq!(hello.draft, false, "unset draft not default: {hello:#?}");
 }

@@ -19,16 +19,6 @@
 //!   `reset()` (mark FileStore slots stale), `comemo::evict(10)` (age
 //!   memoized entries), `compile_bundle()` (incremental on warm cache),
 //!   publish result. Mirrors typst's own `typst watch` loop.
-//!
-//! Routing:
-//!
-//! - `GET /` — the bundle's `index.html` (compiled from
-//!   `content/_index.typ`), or a placeholder slug index if `_index.typ`
-//!   is absent.
-//! - `GET /<slug>/` (or `/<slug>`) — bundle's `<slug>/index.html`, if
-//!   `content/<slug>.typ` exists.
-//! - Everything else — served from `static/` first, then `content/` as
-//!   a zola-style colocated-asset fallback.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -208,9 +198,7 @@ fn run_watcher(
                 slugs.len(),
                 elapsed,
             ),
-            (Err(e), _) => eprintln!(
-                "twyla serve: content/ rescan failed: {e}"
-            ),
+            (Err(e), _) => eprintln!("twyla serve: content/ rescan failed: {e}"),
             (Ok(_), Err(e)) => eprintln!(
                 "twyla serve: recompile errored (after {:.1?}):\n{e}",
                 elapsed,
@@ -440,7 +428,11 @@ impl Response {
         }
     }
     fn bytes(status: u16, content_type: &'static str, body: Vec<u8>) -> Self {
-        Self { status, content_type, body }
+        Self {
+            status,
+            content_type,
+            body,
+        }
     }
 }
 
@@ -480,14 +472,7 @@ fn dispatch(state: &ServeState, path: &str) -> Response {
     serve_static(&state.ctx, path)
 }
 
-/// Serve a compiled doc from the cached `last_output`. For `/`,
-/// `bundle_path` is `index.html`; for `/<slug>/` it's
-/// `<slug>/index.html`. If the bundle doesn't contain the requested
-/// path: for `/` we fall back to the placeholder slug index (early
-/// project state — no `_index.typ` yet); for slug routes we return 404
-/// even though the `.typ` exists (probably the compile errored on that
-/// doc — the error path below handles the compile-error case before
-/// this).
+/// Serve a compiled doc from the cached `last_output`.
 fn serve_doc(state: &ServeState, bundle_path: &Path) -> Response {
     let guard = state.last_output.lock().unwrap();
     match &*guard {
@@ -495,7 +480,7 @@ fn serve_doc(state: &ServeState, bundle_path: &Path) -> Response {
             Some(d) => Response::html(200, d.html.clone()),
             None => {
                 if bundle_path == Path::new("index.html") {
-                    placeholder_index(&state.ctx)
+                    placeholder_main(&state.ctx)
                 } else {
                     Response::text(404, "page not found in bundle")
                 }
@@ -513,9 +498,9 @@ fn serve_doc(state: &ServeState, bundle_path: &Path) -> Response {
 }
 
 /// Plain-list index of available slugs, served at `/` when no
-/// `content/_index.typ` exists. Stand-in for a real home page during
+/// `content/main.typ` exists. Stand-in for a real home page during
 /// the early stages of a site.
-fn placeholder_index(ctx: &TwylaContext) -> Response {
+fn placeholder_main(ctx: &TwylaContext) -> Response {
     let slugs = match ctx.scan_pages() {
         Ok(s) => s,
         Err(e) => {
@@ -531,7 +516,7 @@ fn placeholder_index(ctx: &TwylaContext) -> Response {
          </head><body>\n",
     );
     out.push_str("<h1>twyla dev</h1>\n");
-    out.push_str("<p>placeholder index — content/_index.typ not present.</p>\n");
+    out.push_str("<p>placeholder index — content/main.typ not present.</p>\n");
     out.push_str("<ul>\n");
     for s in &slugs {
         out.push_str(&format!(
@@ -560,8 +545,7 @@ fn serve_static(ctx: &TwylaContext, request_path: &str) -> Response {
     // `/foo.svg`). Mirror that for porting; revisit once twyla has a
     // real asset model.
     let content_path = ctx.content_dir().join(rel);
-    let is_typ =
-        content_path.extension().and_then(|e| e.to_str()) == Some("typ");
+    let is_typ = content_path.extension().and_then(|e| e.to_str()) == Some("typ");
     if !is_typ {
         if let Ok(body) = std::fs::read(&content_path) {
             return Response::bytes(200, mime_for(&content_path), body);

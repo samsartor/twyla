@@ -13,13 +13,6 @@
 use std::path::{Path, PathBuf};
 
 /// Where a routed page emits in the bundle and what URL serves it.
-///
-/// Carried as a pair because every caller needs both — `generate_main`
-/// uses `bundle_path` for the `#document(..)` arg, the dev server's
-/// dispatcher matches against `url_path`, and `cmd_check` derives the
-/// zola-side absolute URL from `url_path`. Keeping them together
-/// means the `_index` ↔ `/` / `index.html` special-case lives in one
-/// place ([`TwylaContext::default_route`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRoute {
     /// User-facing URL, leading slash, trailing slash. `/foo/` or `/`.
@@ -47,16 +40,12 @@ impl TwylaContext {
     /// downstream comparisons are against the resolved path. Trims
     /// trailing slashes from `base_url` so concatenation
     /// (`base_url + "/" + path`) never produces `//`.
-    pub fn new(
-        root: impl AsRef<Path>,
-        base_url: Option<String>,
-    ) -> Result<Self, String> {
+    pub fn new(root: impl AsRef<Path>, base_url: Option<String>) -> Result<Self, String> {
         let root = root.as_ref();
-        let root = root.canonicalize().map_err(|e| {
-            format!("cannot canonicalize root {}: {e}", root.display())
-        })?;
-        let base_url =
-            base_url.map(|s| s.trim_end_matches('/').to_string());
+        let root = root
+            .canonicalize()
+            .map_err(|e| format!("cannot canonicalize root {}: {e}", root.display()))?;
+        let base_url = base_url.map(|s| s.trim_end_matches('/').to_string());
         Ok(Self { root, base_url })
     }
 
@@ -101,10 +90,6 @@ impl TwylaContext {
     /// Discover routed pages from the filesystem layout. Top-level
     /// `content/*.typ` only — no subdirectory recursion yet (the
     /// corpus doesn't need it).
-    ///
-    /// Returns slugs (filename without extension). `_index.typ` is the
-    /// home page (special-cased in [`default_route`](Self::default_route));
-    /// other underscore-prefixed files (drafts, partials) are skipped.
     pub fn scan_pages(&self) -> Result<Vec<String>, String> {
         let content_dir = self.content_dir();
         let entries = std::fs::read_dir(&content_dir)
@@ -119,7 +104,7 @@ impl TwylaContext {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if stem.starts_with('_') && stem != "_index" {
+            if stem.starts_with('_') {
                 continue;
             }
             slugs.push(stem.to_string());
@@ -135,10 +120,10 @@ impl TwylaContext {
     /// callers swap to a `route_for(stem, declared)` helper that calls
     /// this when `declared` is `None`).
     ///
-    /// `_index` → `("/", "index.html")`; everything else →
+    /// `main` → `("/", "index.html")`; everything else →
     /// `("/<stem>/", "<stem>/index.html")`.
     pub fn default_route(&self, stem: &str) -> PageRoute {
-        if stem == "_index" {
+        if stem == "main" {
             PageRoute {
                 url_path: "/".to_string(),
                 bundle_path: PathBuf::from("index.html"),
@@ -169,7 +154,7 @@ mod tests {
             root: PathBuf::from("/tmp"),
             base_url: None,
         };
-        let r = ctx.default_route("_index");
+        let r = ctx.default_route("main");
         assert_eq!(r.url_path, "/");
         assert_eq!(r.bundle_path, PathBuf::from("index.html"));
     }
