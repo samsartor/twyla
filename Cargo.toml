@@ -22,6 +22,13 @@ typst-library = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6
 # direct dep so twyla can define native typst builtins. Same pinned rev.
 typst-utils = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
 comemo = "0.5"
+
+# Asset-discovery side-channel (spike): the contextual `asset.*` builtins
+# `send` discovered asset specs out of the (comemo-memoized, otherwise pure)
+# realization pass; twyla drains the receiver between relayout iterations and
+# processes off to the side. Write-only + hash-excluded, so comemo never sees
+# it. Already in the tree transitively via typst-kit.
+crossbeam-channel = "0.5"
 ecow = "0.2"
 
 # Path-aware file watcher for `static/` (serve hot-reload). The typst

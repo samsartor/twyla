@@ -98,4 +98,9 @@ pub fn install(library: &mut Library) {
     // The cross-page list builtin. Reads twyla's injected page metadata off
     // the style chain (see `crate::compile`).
     global.define_func::<crate::document::documents>();
+
+    // SPIKE — the `asset` module (`asset.file`, …). Contextual builtins that
+    // resolve asset URLs off the injected resolved-map and report misses on a
+    // discovery channel (see `crate::asset`).
+    crate::asset::install(global);
 }

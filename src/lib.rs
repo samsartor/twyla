@@ -10,6 +10,7 @@
 //!   Output is scaffolding, not a maintained md↔typ sync.
 //! - [`serve`] — zero-flag dev server.
 
+pub mod asset;
 pub mod build;
 pub mod compile;
 pub mod diff;
