@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use comemo::Tracked;
 use ecow::{EcoString, eco_format, eco_vec};
@@ -19,7 +19,7 @@ use typst::foundations::{Bytes, PathOrStr, func};
 use typst::syntax::{FileId, Span, Spanned};
 use typst_utils::hash128;
 
-use super::{Asset, AssetSpec, Built, Emit, resolve_path};
+use super::{Asset, AssetSpec, Built, Emit, Upstream, resolve_path};
 use crate::project::TwylaContext;
 
 /// Compile a Sass/SCSS file to a fingerprinted CSS asset.
@@ -36,35 +36,40 @@ pub fn sass(
 /// Read the entry, compile it (recording every imported file), fingerprint the
 /// CSS output, and emit it as bytes.
 pub(crate) fn build(
-    world: Tracked<dyn World + '_>,
+    _world: Tracked<dyn World + '_>,
     file: FileId,
     ctx: &TwylaContext,
 ) -> SourceResult<Built> {
-    let bytes = world.file(file).map_err(|err| {
-        eco_vec![SourceDiagnostic::error(Span::detached(), EcoString::from(err))]
-    })?;
-    let src = std::str::from_utf8(&bytes).map_err(|e| {
+    let on_disk = ctx.root.join(file.vpath().get_without_slash());
+    let (on_disk, src) = Upstream::new_read_string(on_disk).map_err(|err| {
         eco_vec![SourceDiagnostic::error(
             Span::detached(),
-            eco_format!("sass source is not valid UTF-8: {e}"),
+            EcoString::from(err.to_string())
         )]
     })?;
-    let on_disk = ctx.root.join(file.vpath().get_without_slash());
+    let stem = on_disk
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned);
 
     // `.sass` is the indented syntax; everything else (`.scss`) is SCSS —
     // grass's `from_string` would otherwise assume SCSS for both.
-    let syntax = match on_disk.extension().and_then(|e| e.to_str()) {
+    let syntax = match on_disk.path.extension().and_then(|e| e.to_str()) {
         Some("sass") => grass::InputSyntax::Sass,
         _ => grass::InputSyntax::Scss,
     };
 
     let fs = RecordingFs::default();
     let mut options = grass::Options::default().input_syntax(syntax).fs(&fs);
-    if let Some(parent) = on_disk.parent() {
+    if let Some(parent) = on_disk.path.parent() {
         options = options.load_path(parent);
     }
     let css = grass::from_string(src.to_string(), &options).map_err(|e| {
-        eco_vec![SourceDiagnostic::error(Span::detached(), eco_format!("sass: {e}"))]
+        eco_vec![SourceDiagnostic::error(
+            Span::detached(),
+            eco_format!("sass: {e}")
+        )]
     })?;
 
     // Upstream = the imports grass read + the entry (read via the World, so not
@@ -77,7 +82,8 @@ pub(crate) fn build(
         content_hash: hash128(&css),
         emit: Emit::Bytes(css),
         upstream,
-        out_ext: "css".to_string(),
+        ext: Some("css".to_string()),
+        stem,
     })
 }
 
@@ -87,12 +93,12 @@ pub(crate) fn build(
 /// `RefCell` is fine.
 #[derive(Debug, Default)]
 struct RecordingFs {
-    reads: RefCell<BTreeSet<PathBuf>>,
+    reads: RefCell<BTreeSet<Upstream>>,
 }
 
 impl RecordingFs {
     /// The files read so far, as a fresh `Vec`.
-    fn reads(&self) -> Vec<PathBuf> {
+    fn reads(&self) -> Vec<Upstream> {
         self.reads.borrow().iter().cloned().collect()
     }
 }
@@ -107,8 +113,8 @@ impl grass::Fs for RecordingFs {
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        let data = std::fs::read(path)?;
-        self.reads.borrow_mut().insert(path.to_path_buf());
+        let (upstream, data) = Upstream::new_read_bytes(path.to_path_buf())?;
+        self.reads.borrow_mut().insert(upstream);
         Ok(data)
     }
 }

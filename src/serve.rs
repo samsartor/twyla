@@ -500,17 +500,18 @@ fn dispatch(state: &ServeState, path: &str) -> Response {
 fn serve_asset(state: &ServeState, path: &str) -> Option<Response> {
     let guard = state.last_output.lock().unwrap();
     let site = guard.as_ref().ok()?;
-    let asset = site
-        .assets
-        .iter()
-        .find(|a| a.output_path.to_string_lossy().replace('\\', "/") == path)?;
+    let asset = site.assets.iter().find(|a| a.output_path == path)?;
     let dest = Path::new(path);
-    match &asset.emit {
+    match &asset.built.emit {
         Emit::Copy(src) => match std::fs::read(src) {
             Ok(body) => Some(Response::bytes(200, mime_for(dest), body)),
             Err(_) => Some(Response::text(404, "asset source unreadable")),
         },
-        Emit::Bytes(bytes) => Some(Response::bytes(200, mime_for(dest), bytes.as_slice().to_vec())),
+        Emit::Bytes(bytes) => Some(Response::bytes(
+            200,
+            mime_for(dest),
+            bytes.as_slice().to_vec(),
+        )),
     }
 }
 

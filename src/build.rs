@@ -76,7 +76,7 @@ pub fn run(build: Build) -> Result<BuildSummary, BuildError> {
                 source: e,
             })?;
         }
-        match &asset.emit {
+        match &asset.built.emit {
             Emit::Copy(src) => {
                 fs::copy(src, &dest).map_err(|e| BuildError::Io {
                     context: format!("copying {} → {}", src.display(), dest.display()),

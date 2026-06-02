@@ -16,7 +16,6 @@ pub mod compile;
 pub mod diff;
 pub mod document;
 pub mod import;
-pub mod prelude;
 pub mod project;
 pub mod render;
 pub mod rules;

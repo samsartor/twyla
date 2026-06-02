@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crossbeam_channel::unbounded;
-use ecow::EcoString;
 use typst::foundations::{Style, Value};
 use typst::syntax::{FileId, RootedPath, VirtualPath, VirtualRoot};
 use typst::utils::LazyHash;
@@ -42,18 +41,28 @@ fn fid(path: &str) -> FileId {
 #[test]
 fn cold_build_resolves_asset_url_through_the_loop() {
     let (ctx, _dir) = site(&[
-        ("content/main.typ", "#context asset.file(\"logo.svg\").url()"),
+        (
+            "content/main.typ",
+            "#context asset.file(\"logo.svg\").url()",
+        ),
         ("content/logo.svg", "<svg/>"),
     ]);
     let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
 
-    assert_eq!(assets.len(), 1, "expected one resolved asset, got {assets:?}");
-    let url = assets[0].url.as_str();
+    assert_eq!(
+        assets.len(),
+        1,
+        "expected one resolved asset, got {assets:?}"
+    );
+    let url = assets[0].output_path.as_str();
     assert!(
-        url.contains("/assets/logo-") && url.ends_with(".svg"),
+        url.starts_with("assets/logo-") && url.ends_with(".svg"),
         "unexpected auto-named url: {url}",
     );
-    assert!(html.contains(url), "page missing resolved url {url}:\n{html}");
+    assert!(
+        html.contains(url),
+        "page missing resolved url {url}:\n{html}"
+    );
     assert!(
         !html.contains("__twyla-asset-pending__"),
         "placeholder leaked into output:\n{html}",
@@ -75,14 +84,21 @@ fn multiple_assets_resolve_and_sass_renames_to_css() {
 
     assert_eq!(assets.len(), 2, "got {assets:?}");
     assert!(
-        assets.iter().any(|a| a.url.contains("/assets/a-") && a.url.ends_with(".txt")),
+        assets
+            .iter()
+            .any(|a| a.output_path.starts_with("assets/a-") && a.output_path.ends_with(".txt")),
         "missing a.txt asset: {assets:?}",
     );
     assert!(
-        assets.iter().any(|a| a.url.contains("/assets/b-") && a.url.ends_with(".css")),
+        assets
+            .iter()
+            .any(|a| a.output_path.starts_with("assets/b-") && a.output_path.ends_with(".css")),
         "sass asset not renamed to .css: {assets:?}",
     );
-    assert!(!html.contains("__twyla-asset-pending__"), "placeholder leaked:\n{html}");
+    assert!(
+        !html.contains("__twyla-asset-pending__"),
+        "placeholder leaked:\n{html}"
+    );
 }
 
 /// Two *separate* resolvers in one process (sharing comemo's global cache) must
@@ -91,16 +107,25 @@ fn multiple_assets_resolve_and_sass_renames_to_css() {
 #[test]
 fn separate_compiles_each_resolve() {
     let files: &[(&str, &str)] = &[
-        ("content/index.typ", "#context link(asset.file(\"logo.svg\").url())[logo]"),
+        (
+            "content/index.typ",
+            "#context link(asset.file(\"logo.svg\").url())[logo]",
+        ),
         ("content/logo.svg", "<svg/>"),
     ];
     let (ctx_a, _a) = site(files);
     let (html_a, _) = compile(&RenderWorld::new(&ctx_a).unwrap());
-    assert!(!html_a.contains("__twyla-asset-pending__"), "compile A leaked:\n{html_a}");
+    assert!(
+        !html_a.contains("__twyla-asset-pending__"),
+        "compile A leaked:\n{html_a}"
+    );
 
     let (ctx_b, _b) = site(files);
     let (html_b, _) = compile(&RenderWorld::new(&ctx_b).unwrap());
-    assert!(!html_b.contains("__twyla-asset-pending__"), "compile B leaked:\n{html_b}");
+    assert!(
+        !html_b.contains("__twyla-asset-pending__"),
+        "compile B leaked:\n{html_b}"
+    );
 }
 
 /// Editing a sass source and recompiling the *same* (persistent) world must
@@ -110,7 +135,10 @@ fn separate_compiles_each_resolve() {
 #[test]
 fn editing_source_revalidates_to_new_fingerprint() {
     let (ctx, dir) = site(&[
-        ("content/main.typ", "#context asset.sass(\"main.scss\").url()"),
+        (
+            "content/main.typ",
+            "#context asset.sass(\"main.scss\").url()",
+        ),
         ("content/main.scss", ".a { color: red; }"),
     ]);
     let mut world = RenderWorld::new(&ctx).unwrap();
@@ -118,7 +146,7 @@ fn editing_source_revalidates_to_new_fingerprint() {
     let mut resolver = AssetResolver::new(&ctx);
 
     let (_docs1, _h1, assets1) = world.compile_bundle_with_meta(&mut resolver).unwrap();
-    let url1 = assets1[0].url.clone();
+    let url1 = assets1[0].output_path.clone();
 
     // Edit the source (distinct mtime), then recompile the same world the way
     // `serve` does: reset the FileStore + age comemo.
@@ -129,10 +157,16 @@ fn editing_source_revalidates_to_new_fingerprint() {
 
     let (docs2, _h2, assets2) = world.compile_bundle_with_meta(&mut resolver).unwrap();
     let html2 = docs2[0].html.clone();
-    let url2 = assets2[0].url.clone();
+    let url2 = assets2[0].output_path.clone();
 
-    assert_ne!(url1, url2, "fingerprint did not change after editing the source");
-    assert!(!html2.contains("__twyla-asset-pending__"), "placeholder leaked after edit:\n{html2}");
+    assert_ne!(
+        url1, url2,
+        "fingerprint did not change after editing the source"
+    );
+    assert!(
+        !html2.contains("__twyla-asset-pending__"),
+        "placeholder leaked after edit:\n{html2}"
+    );
 }
 
 /// Hash discipline (the comemo split): the resolved-map hashes by *content* and
@@ -140,31 +174,51 @@ fn editing_source_revalidates_to_new_fingerprint() {
 /// generation, distinct across them).
 #[test]
 fn map_hashes_by_content_sink_keys_on_epoch() {
-    let a = AssetSpec::File { file: fid("content/a.css") };
-    let b = AssetSpec::Sass { file: fid("content/b.scss") };
+    let a = AssetSpec::File {
+        file: fid("content/a.css"),
+    };
+    let b = AssetSpec::Sass {
+        file: fid("content/b.scss"),
+    };
 
     let make = |pairs: &[(&AssetSpec, &str)]| {
         let mut m = HashMap::new();
         for (k, v) in pairs {
-            m.insert((*k).clone(), EcoString::from(*v));
+            m.insert((*k).clone(), String::from(*v));
         }
         ResolvedAssets(m)
     };
 
     let m1 = make(&[(&a, "ua"), (&b, "ub")]);
     let m2 = make(&[(&b, "ub"), (&a, "ua")]);
-    assert_eq!(hash128(&m1), hash128(&m2), "resolved-map hash must be order-independent");
+    assert_eq!(
+        hash128(&m1),
+        hash128(&m2),
+        "resolved-map hash must be order-independent"
+    );
 
     let m3 = make(&[(&a, "CHANGED"), (&b, "ub")]);
     assert_ne!(hash128(&m1), hash128(&m3), "map must track its contents");
 
-    let sink = |epoch, tx| TwylaAssetSink::sink.set(Value::dynamic(AssetSink { epoch, tx })).wrap();
+    let sink = |epoch, tx| {
+        TwylaAssetSink::sink
+            .set(Value::dynamic(AssetSink { epoch, tx }))
+            .wrap()
+    };
     let (tx1, _r1) = unbounded::<AssetRequest>();
     let (tx2, _r2) = unbounded::<AssetRequest>();
     let (tx3, _r3) = unbounded::<AssetRequest>();
     let same_a: LazyHash<Style> = sink(7, tx1);
     let same_b: LazyHash<Style> = sink(7, tx2);
     let other: LazyHash<Style> = sink(8, tx3);
-    assert_eq!(hash128(&same_a), hash128(&same_b), "same epoch must hash equal regardless of channel");
-    assert_ne!(hash128(&same_a), hash128(&other), "distinct epochs must hash differently");
+    assert_eq!(
+        hash128(&same_a),
+        hash128(&same_b),
+        "same epoch must hash equal regardless of channel"
+    );
+    assert_ne!(
+        hash128(&same_a),
+        hash128(&other),
+        "distinct epochs must hash differently"
+    );
 }

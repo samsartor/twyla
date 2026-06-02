@@ -12,6 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::asset;
+
 /// Everything a twyla command needs to operate on a project. Cheap to
 /// clone — paths are owned `PathBuf`s, no heavy state.
 #[derive(Debug, Clone)]
@@ -97,7 +99,10 @@ impl TwylaContext {
         Ok(paths)
     }
 
-    pub fn default_output(&self, source: &str) -> String {
+    /// Bundle-relative directory compiled HTML files are emitted into, e.g.
+    /// `somepost/index.html`. Joined under the build output dir on disk and
+    /// exposed at the matching root-relative URL ([`document_url`](Self::document_url)).
+    pub fn default_document_output(&self, source: &str) -> String {
         let source = self.root.join(source);
         let content_dir = self.content_dir();
         let Ok(path) = source.strip_prefix(&content_dir) else {
@@ -121,7 +126,7 @@ impl TwylaContext {
         }
     }
 
-    pub fn url_for(&self, output: &str) -> String {
+    pub fn document_url(&self, output: &str) -> String {
         let path = match output.strip_suffix("index.html") {
             Some(rest) => rest,
             None => output,
@@ -139,19 +144,30 @@ impl TwylaContext {
     /// Bundle-relative directory processed assets are emitted into, e.g.
     /// `assets/main-<hash>.css`. Joined under the build output dir on disk and
     /// exposed at the matching root-relative URL ([`asset_url`](Self::asset_url)).
-    pub fn default_asset_dir(&self) -> PathBuf {
-        PathBuf::from("assets")
+    pub fn default_asset_output(&self, built: &asset::Built) -> String {
+        match &built.stem {
+            Some(stem) => format!(
+                "assets/{}-{:032x}.{}",
+                stem,
+                built.content_hash,
+                built.ext.as_deref().unwrap_or("bin")
+            ),
+            None => format!(
+                "assets/{:032x}.{}",
+                built.content_hash,
+                built.ext.as_deref().unwrap_or("bin")
+            ),
+        }
     }
 
-    /// Root-relative (or base-url-prefixed) URL for a bundle-relative asset
-    /// path like `assets/main-<hash>.css`. Unlike [`url_for`](Self::url_for) it
-    /// does not strip `index.html` — asset paths are used verbatim.
-    pub fn asset_url(&self, rel: &Path) -> String {
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        let rel = rel.trim_start_matches('/');
+    pub fn asset_url(&self, output: &str) -> String {
         match &self.base_url {
-            Some(base) => format!("{}/{}", base.trim_end_matches('/'), rel),
-            None => format!("/{rel}"),
+            Some(base) => format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                output.trim_start_matches('/')
+            ),
+            None => format!("/{}", output.trim_start_matches('/')),
         }
     }
 
@@ -173,7 +189,7 @@ mod tests {
             root: PathBuf::from("/tmp"),
             base_url: None,
         };
-        let r = ctx.default_output("content/main.typ");
+        let r = ctx.default_document_output("content/main.typ");
         assert_eq!(r, PathBuf::from("index.html"));
     }
 
@@ -183,7 +199,7 @@ mod tests {
             root: PathBuf::from("/tmp"),
             base_url: None,
         };
-        let r = ctx.default_output("content/foobar/main.typ");
+        let r = ctx.default_document_output("content/foobar/main.typ");
         assert_eq!(r, PathBuf::from("foobar/index.html"));
     }
 
@@ -193,7 +209,7 @@ mod tests {
             root: PathBuf::from("/tmp"),
             base_url: None,
         };
-        let r = ctx.default_output("content/guis-2.typ");
+        let r = ctx.default_document_output("content/guis-2.typ");
         assert_eq!(r, PathBuf::from("guis-2/index.html"));
     }
 

@@ -71,9 +71,15 @@ pub fn compile_bundle(
 ) -> Warned<SourceResult<CompiledBundle>> {
     let mut sink = Sink::new();
     let traced = Traced::default();
-    let output =
-        compile_bundle_impl(ctx, world.track(), traced.track(), &mut sink, sources, resolver)
-            .map_err(deduplicate);
+    let output = compile_bundle_impl(
+        ctx,
+        world.track(),
+        traced.track(),
+        &mut sink,
+        sources,
+        resolver,
+    )
+    .map_err(deduplicate);
     Warned {
         output,
         warnings: sink.warnings(),
@@ -311,13 +317,14 @@ fn harvest_metadata(
         }
         draft = cs.get(TwylaDocument::draft);
     }
-    let output = output.unwrap_or_else(|| ctx.default_output(id.vpath().get_without_slash()));
+    let output =
+        output.unwrap_or_else(|| ctx.default_document_output(id.vpath().get_without_slash()));
     let kind = kind.unwrap_or_else(|| match output.as_str() {
         "index.html" => EcoString::inline("root"),
         _ if output.ends_with("/index.html") => EcoString::inline("dir"),
         _ => EcoString::inline("page"),
     });
-    let url = ctx.url_for(&output);
+    let url = ctx.document_url(&output);
 
     Ok(HarvestedDoc {
         output,

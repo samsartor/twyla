@@ -176,10 +176,6 @@ impl RenderWorld {
             ))),
         };
 
-        // Expose project config to typst via `sys.inputs`. Today: just
-        // `base_url` (empty string when unset — site templates read it
-        // with a fallback so relative URLs work out of the box on
-        // localhost). Add more keys here as the config layer grows.
         let mut inputs = Dict::new();
         inputs.insert(
             "base_url".into(),
@@ -195,7 +191,7 @@ impl RenderWorld {
             .with_features([Feature::Html, Feature::Bundle].into_iter().collect())
             .with_inputs(inputs)
             .build();
-        crate::prelude::install(&mut library);
+        install_stdlib(&mut library);
 
         Ok(Self {
             ctx,
@@ -220,7 +216,10 @@ impl RenderWorld {
     /// cache. Between compiles, call [`reset`](Self::reset) and
     /// `comemo::evict(..)` to invalidate; for content/ shape changes,
     /// also call [`refresh_main`](Self::refresh_main).
-    pub fn compile_bundle(&self, resolver: &mut AssetResolver) -> Result<Vec<OutputDoc>, RenderError> {
+    pub fn compile_bundle(
+        &self,
+        resolver: &mut AssetResolver,
+    ) -> Result<Vec<OutputDoc>, RenderError> {
         Ok(self.compile_bundle_with_meta(resolver)?.0)
     }
 
@@ -293,6 +292,14 @@ impl RenderWorld {
         docs.sort_by(|a, b| a.path.cmp(&b.path));
         Ok((docs, harvested, assets))
     }
+}
+
+/// Install twyla's native customizations into a freshly built library.
+pub fn install_stdlib(library: &mut Library) {
+    crate::rules::install(&mut library.rules);
+    let global = library.global.scope_mut();
+    crate::document::install(global);
+    crate::asset::install(global);
 }
 
 /// FileLoader for [`FileStore`]. Serves the (empty) virtual main from

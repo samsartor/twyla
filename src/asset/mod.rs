@@ -35,9 +35,11 @@ mod sass;
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+use std::{fs, io};
 
 use comemo::Tracked;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -72,15 +74,6 @@ pub enum AssetSpec {
     File { file: FileId },
     /// Compile a Sass/SCSS file to CSS. See [`sass`].
     Sass { file: FileId },
-}
-
-impl AssetSpec {
-    /// The source file this spec reads from.
-    pub(crate) fn file(&self) -> FileId {
-        match self {
-            AssetSpec::File { file } | AssetSpec::Sass { file } => *file,
-        }
-    }
 }
 
 /// A spec plus its (future) output policy. The `output: auto | str | info => str`
@@ -163,7 +156,11 @@ const ASSET_PENDING: &str = "/__twyla-asset-pending__";
 /// file (mirrors how `read`/`image` resolve their paths). Shared by the
 /// per-type constructors.
 pub(crate) fn resolve_path(path: Spanned<PathOrStr>) -> SourceResult<FileId> {
-    Ok(path.v.resolve_if_some(path.span.id()).at(path.span)?.intern())
+    Ok(path
+        .v
+        .resolve_if_some(path.span.id())
+        .at(path.span)?
+        .intern())
 }
 
 /// Build the `asset` module (`asset.file`, `asset.sass`) for the global scope.
@@ -206,10 +203,10 @@ pub struct TwylaAssetSink {
 /// the same set of entries hashes identically regardless of discovery order.
 #[ty(name = "twyla-resolved-assets")]
 #[derive(Clone, PartialEq, Debug)]
-pub struct ResolvedAssets(HashMap<AssetSpec, EcoString>);
+pub struct ResolvedAssets(HashMap<AssetSpec, String>);
 
 impl ResolvedAssets {
-    fn get(&self, spec: &AssetSpec) -> Option<&EcoString> {
+    fn get(&self, spec: &AssetSpec) -> Option<&String> {
         self.0.get(spec)
     }
 }
@@ -270,17 +267,19 @@ impl Hash for AssetSink {
 /// What a per-type `build` ([`file::build`], [`sass::build`]) produces. The
 /// resolver turns it into a [`ResolvedAsset`] by adding the fingerprinted name,
 /// output path, and URL (all shared logic).
-pub(crate) struct Built {
+#[derive(Clone, Debug)]
+pub struct Built {
     /// How the bytes reach the output.
     pub emit: Emit,
     /// Every on-disk file the build read (entry + transitive imports). Drives
     /// invalidation and the watcher's dependency set.
-    pub upstream: Vec<PathBuf>,
+    pub upstream: Vec<Upstream>,
     /// Content hash of the *output* bytes (the fingerprint).
     pub content_hash: u128,
-    /// Output extension (`css` for sass, the source ext for a copy); empty if
-    /// the source has none.
-    pub out_ext: String,
+    /// Output extension (`css` for sass, the source ext for a copy)
+    pub ext: Option<String>,
+    /// The name of the original asset file, if any.
+    pub stem: Option<String>,
 }
 
 /// How a resolved asset's bytes reach the output. `Copy` keeps only the source
@@ -296,10 +295,35 @@ pub enum Emit {
 
 /// One on-disk file an asset depends on, with its mtime at resolve time (for
 /// [`AssetResolver::revalidate`]).
-#[derive(Clone, Debug)]
-struct Upstream {
-    path: PathBuf,
-    mtime: Option<SystemTime>,
+#[derive(Clone, Debug, PartialEq, PartialOrd, Ord, Eq)]
+pub struct Upstream {
+    pub path: PathBuf,
+    pub mtime: Option<SystemTime>,
+}
+
+impl Upstream {
+    pub fn new_lazy(path: PathBuf) -> Self {
+        Upstream {
+            mtime: mtime(&path).ok(),
+            path,
+        }
+    }
+
+    pub fn new_read_string(path: PathBuf) -> io::Result<(Self, String)> {
+        let mut f = fs::File::open(&path)?;
+        let mtime = f.metadata()?.modified().ok();
+        let mut text = String::new();
+        f.read_to_string(&mut text)?;
+        Ok((Upstream { path, mtime }, text))
+    }
+
+    pub fn new_read_bytes(path: PathBuf) -> io::Result<(Self, Vec<u8>)> {
+        let mut f = fs::File::open(&path)?;
+        let mtime = f.metadata()?.modified().ok();
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes)?;
+        Ok((Upstream { path, mtime }, bytes))
+    }
 }
 
 /// One processed asset: where it lives, how to emit it, and what it depends on.
@@ -307,20 +331,16 @@ struct Upstream {
 pub struct ResolvedAsset {
     /// The spec that produced it (its key).
     pub spec: AssetSpec,
-    /// Root-relative (or base-url-prefixed) URL.
-    pub url: EcoString,
+    /// The built asset
+    pub built: Built,
     /// Bundle-relative output path, e.g. `assets/main-<hash>.css`.
-    pub output_path: PathBuf,
-    /// How to emit the bytes.
-    pub emit: Emit,
-    /// On-disk files this asset was built from (entry + transitive imports).
-    upstream: Vec<Upstream>,
+    pub output_path: String,
 }
 
 impl ResolvedAsset {
     /// The on-disk source files this asset depends on — for the serve watcher.
     pub fn upstream_paths(&self) -> impl Iterator<Item = &Path> {
-        self.upstream.iter().map(|u| u.path.as_path())
+        self.built.upstream.iter().map(|u| u.path.as_path())
     }
 }
 
@@ -371,12 +391,14 @@ impl AssetResolver {
 
     /// The resolved-map style for the current store — rebuilt each iteration.
     pub fn map_style(&self) -> LazyHash<Style> {
-        let map: HashMap<AssetSpec, EcoString> = self
+        let map: HashMap<AssetSpec, String> = self
             .resolved
             .iter()
-            .map(|(spec, asset)| (spec.clone(), asset.url.clone()))
+            .map(|(spec, asset)| (spec.clone(), self.ctx.asset_url(&asset.output_path)))
             .collect();
-        TwylaAssetMap::map.set(Value::dynamic(ResolvedAssets(map))).wrap()
+        TwylaAssetMap::map
+            .set(Value::dynamic(ResolvedAssets(map)))
+            .wrap()
     }
 
     /// Drain the discovery channel and process each newly-seen request.
@@ -407,24 +429,12 @@ impl AssetResolver {
             AssetSpec::Sass { file } => sass::build(world, *file, &self.ctx)?,
         };
 
-        let name = fingerprinted_name(spec.file(), built.content_hash, &built.out_ext);
-        let output_path = self.ctx.default_asset_dir().join(&name);
-        let url = EcoString::from(self.ctx.asset_url(&output_path));
-        let upstream = built
-            .upstream
-            .into_iter()
-            .map(|path| Upstream {
-                mtime: mtime(&path),
-                path,
-            })
-            .collect();
+        let output_path = self.ctx.default_asset_output(&built);
 
         Ok(ResolvedAsset {
             spec: spec.clone(),
-            url,
+            built,
             output_path,
-            emit: built.emit,
-            upstream,
         })
     }
 
@@ -450,7 +460,13 @@ impl AssetResolver {
     /// `invalidate(&changed_paths)` that calls [`evict_where`](Self::evict_where)
     /// with an intersection predicate instead of stat'ing every upstream.
     pub fn revalidate(&mut self) -> bool {
-        self.evict_where(|asset| asset.upstream.iter().any(|u| mtime(&u.path) != u.mtime))
+        self.evict_where(|asset| {
+            asset
+                .built
+                .upstream
+                .iter()
+                .any(|u| mtime(&u.path).ok() != u.mtime)
+        })
     }
 
     /// A snapshot of every currently-resolved asset (for emission).
@@ -459,26 +475,9 @@ impl AssetResolver {
     }
 }
 
-/// `stem-<hash>.ext`, or `stem-<hash>` when the source has no extension.
-fn fingerprinted_name(file: FileId, content_hash: u128, out_ext: &str) -> String {
-    let stem = source_stem(file).unwrap_or_else(|| EcoString::inline("asset"));
-    if out_ext.is_empty() {
-        format!("{stem}-{content_hash:032x}")
-    } else {
-        format!("{stem}-{content_hash:032x}.{out_ext}")
-    }
-}
-
-/// File stem of a project file id, for naming (`main.scss` -> `main`).
-fn source_stem(file: FileId) -> Option<EcoString> {
-    Path::new(file.vpath().get_without_slash())
-        .file_stem()
-        .map(|s| EcoString::from(s.to_string_lossy().as_ref()))
-}
-
-/// Last-modified time of an on-disk path, or `None` if it can't be stat'd.
-fn mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+/// Last-modified time of an on-disk path
+fn mtime(path: &Path) -> io::Result<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified())
 }
 
 #[cfg(test)]

@@ -4,9 +4,7 @@
 //! this module doc is the implementation story):
 //!
 //! `document` is bound — in [`crate::prelude`] — to [`TwylaDocument`], which
-//! shadows typst's native `document`. The native element stays reachable as
-//! `__std_document` so [`crate::compile`] can keep using it as the routing
-//! primitive (bundle routing keys on the native *type*, not the binding name).
+//! shadows typst's native `document`
 //! Because the fields are settable, `#set document(..)` puts them on the style
 //! chain, which is what makes them both readable on the current page
 //! (`#context document.title`, via typst's `field_from_styles` fallback for
@@ -22,7 +20,9 @@
 use comemo::Tracked;
 use ecow::EcoString;
 use typst::diag::HintedStrResult;
-use typst::foundations::{Array, Content, Context, Datetime, Smart, Value, elem, func};
+use typst::foundations::{
+    Array, Binding, Content, Context, Datetime, NativeElement as _, Scope, Smart, Value, elem, func,
+};
 
 /// Metadata for the current page.
 ///
@@ -109,4 +109,12 @@ pub struct TwylaDocumentList {
     /// Every page's metadata, injected by [`crate::compile`] each compile.
     #[default(Array::new())]
     pub all: Array,
+}
+
+pub fn install(global: &mut Scope) {
+    global.bind(
+        "document".into(),
+        Binding::detached(crate::document::TwylaDocument::ELEM),
+    );
+    global.define_func::<crate::document::documents>();
 }
