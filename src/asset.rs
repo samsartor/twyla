@@ -1,151 +1,200 @@
-//! SPIKE — the asset side-channel, proven in isolation.
+//! The asset system: typed constructors, the discovery side-channel, and the
+//! resolver that drives asset URLs to convergence inside the compile loop.
 //!
-//! Validates the mechanism for `asset.*` builtins before wiring up real
-//! transforms (grass, image resize) or folding it into [`crate::compile`].
-//! The three claims under test (see `#[cfg(test)]` below):
+//! Mechanism (proven in the spike, jj `rtnknlwo`): an asset's URL is resolved
+//! through the *realization* fixed-point loop, split into two halves with
+//! opposite comemo requirements.
 //!
-//! 1. **Converges in one cold round.** A page that calls `asset.file("x")`
-//!    when the URL is unknown gets a placeholder on the first realization,
-//!    twyla processes the discovered spec, injects the resolved URL, and the
-//!    *next* realization returns the real URL.
-//! 2. **No-op when seeded.** If twyla seeds the resolved-URL map from its
-//!    persistent store before compiling, the very first realization returns
-//!    the real URL, the discovery channel stays empty, and the loop converges
-//!    in typst's normal iteration count — zero extra asset rounds.
-//! 3. **The sink doesn't perturb the comemo hash.** Discovery rides a
-//!    write-only [`crossbeam_channel::Sender`]; the value carrying it onto the
-//!    style chain hashes to a constant and compares equal regardless of which
-//!    channel it holds, so injecting it never busts the realization cache.
-//!    Only the resolved-map (the *tracked* driver) moves the hash.
+//! - **Resolved-map — tracked/hashed (data IN, drives convergence).**
+//!   [`ResolvedAssets`] (`AssetSpec -> url`) rides the relayout style chain via
+//!   [`TwylaAssetMap`]. The `StyleChain` is hashed *by value* into typst's
+//!   `realize` memo key, so injecting a more-complete map is a comemo miss for
+//!   every `asset.*` consumer — which is what re-resolves them. (It must be
+//!   `Hash`; `#[track]` can't help — the map crosses typst's by-value realize
+//!   boundary, which we don't own.) The `Hash` is *order-independent* so the
+//!   same set of entries hashes identically regardless of discovery order,
+//!   which is what lets a warm rebuild reuse the previous compile's cache.
+//! - **Discovery sink — hash-excluded (specs OUT, drives discovery).**
+//!   [`AssetSink`] wraps a write-only [`crossbeam_channel::Sender`]; its `Hash`
+//!   is constant and `PartialEq` always-true, so it rides the chain via
+//!   [`TwylaAssetSink`] without ever moving the comemo key. The contextual
+//!   `.url` method `send`s its [`AssetRequest`] on a miss and never reads back.
 //!
-//! The split is the whole point: **map = tracked/hashed (drives convergence),
-//! sink = hash-excluded (drives discovery).** Get it backwards and you either
-//! never converge or re-realize the whole site every compile.
+//! Why the side-channel is sound: the set of asset *inputs* is immutable going
+//! into a compile; the sink only reports *which* fixed inputs were referenced,
+//! and processing `(source, transform) -> bytes` is a pure function computed
+//! off to the side by [`AssetResolver`]. comemo's at-least-once-per-unique-input
+//! is all discovery needs (dup call sites collapse; we dedup by [`AssetSpec`]).
 
-use comemo::{Track, Tracked, TrackedMut};
-use crossbeam_channel::{Sender, unbounded};
-use ecow::{EcoString, eco_vec};
+use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+
+use comemo::Tracked;
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use ecow::{EcoString, eco_vec};
 use typst::World;
-use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
+use typst::diag::{At, HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{
-    Binding, Context, Dict, IntoValue, Module, NativeElement, Output, Repr, Scope, Str, Style,
-    StyleChain, TargetElem, Value, elem, func, ty,
+    Binding, Bytes, Context, Module, PathOrStr, Repr, Scope, Str, Style, Value, elem, func, scope,
+    ty,
 };
-use typst::syntax::{FileId, Span, VirtualPath};
+use typst::syntax::{FileId, Span, Spanned};
 use typst::utils::LazyHash;
-use typst_bundle::{Bundle, BundleDocument, BundleFile};
-use typst_library::engine::{Engine, Route, Sink, Traced};
-use typst_library::introspection::{EmptyIntrospector, MAX_ITERS};
-use typst_library::model::DocumentElem;
-use typst_utils::Protected;
+use typst_utils::hash128;
+
+use crate::project::TwylaContext;
 
 // ---------------------------------------------------------------------------
-// Carriers on the style chain
+// Keys: AssetSpec -> AssetRequest -> Asset
 // ---------------------------------------------------------------------------
 
-/// Host element carrying the **resolved-URL map** — the *tracked* half.
+/// What produces an asset's bytes — the cache/store key. An asset's output is
+/// a pure function of its spec, so this is what every map keys on.
 ///
-/// Maps an asset spec key (here just the path string) to its final URL. Twyla
-/// injects it onto the relayout style chain each iteration; because it's
-/// content-hashed, replacing it with a more-complete map is a comemo *miss*
-/// for every `asset.*` consumer, which is exactly what re-resolves them. This
-/// is the same trick `documents()` uses (see [`crate::document`]).
-#[elem]
-pub struct TwylaAssetMap {
-    /// `spec-key -> url` for every asset twyla has resolved so far.
-    #[default(Dict::new())]
-    pub map: Dict,
+/// FileId-based on purpose: `FileId` is `Eq + Hash` (usable as a `HashMap`
+/// key), whereas typst's `Bytes`/`DataSource` are neither `Eq` nor `Ord`. When
+/// `asset.raw` lands we'll unify the source behind `loading::DataSource` and
+/// hand-impl `Eq` (it's a reflexive marker) to keep this keyable.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum AssetSpec {
+    /// Copy a project file verbatim (fingerprinted).
+    File { file: FileId },
+    /// Compile a Sass/SCSS file to CSS.
+    Sass { file: FileId },
 }
 
-/// Host element carrying the **discovery sink** — the *hash-excluded* half.
-#[elem]
-pub struct TwylaAssetSink {
-    /// A [`Value::Dyn`] wrapping an [`AssetSink`]. Hashes constant (see
-    /// [`AssetSink`]), so injecting it never moves the realization cache key.
-    #[default(Value::None)]
-    pub sink: Value,
-}
+impl AssetSpec {
+    /// The source file this spec reads from.
+    fn file(&self) -> FileId {
+        match self {
+            AssetSpec::File { file } | AssetSpec::Sass { file } => *file,
+        }
+    }
 
-/// Write-only channel for reporting discovered asset specs out of the
-/// otherwise-pure realization pass.
-///
-/// The `Hash`/`PartialEq` impls are deliberately **constant**: any two
-/// `AssetSink`s hash equal and compare equal regardless of the channel they
-/// hold. That is what keeps the sink out of comemo's view — it can ride the
-/// style chain alongside the resolved-map without ever perturbing the hash
-/// comemo keys realization on. (`dyn_hash` also folds in the `TypeId`, so the
-/// constant is per-type, not globally zero — irrelevant here, just noted.)
-#[ty]
-#[derive(Clone)]
-pub struct AssetSink(pub Sender<EcoString>);
-
-impl Debug for AssetSink {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        f.write_str("AssetSink(..)")
+    /// The output extension after transforming (empty if the source has none).
+    fn out_ext(&self) -> String {
+        match self {
+            AssetSpec::Sass { .. } => "css".to_string(),
+            AssetSpec::File { file } => Path::new(file.vpath().get_without_slash())
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default(),
+        }
     }
 }
 
-impl Repr for AssetSink {
+/// A spec plus its (future) output policy. The `output: auto | str | info => str`
+/// argument will live here; keeping the wrapper now makes adding it
+/// non-breaking. For today it carries nothing beyond the spec.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct AssetRequest {
+    pub spec: AssetSpec,
+}
+
+/// A handle to an asset, returned by `asset.file(..)` / `asset.sass(..)`.
+///
+/// Pure and eval-time: it just captures the [`AssetRequest`]. Resolve its URL
+/// with `.url` **inside a `#context` block** — that's where the injected
+/// resolved-map is readable.
+#[ty(scope)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Asset {
+    request: AssetRequest,
+}
+
+#[scope]
+impl Asset {
+    /// The resolved, fingerprinted URL of this asset (e.g.
+    /// `/assets/main-<hash>.css`).
+    ///
+    /// Contextual — call it inside `#context`:
+    ///
+    /// ```typ
+    /// #context html.elem("link", attrs: (
+    ///   rel: "stylesheet",
+    ///   href: asset.sass("main.scss").url,
+    /// ))
+    /// ```
+    #[func(contextual)]
+    fn url(&self, context: Tracked<Context>) -> HintedStrResult<Str> {
+        let styles = context.styles()?;
+
+        // Tracked read: a hit here is what makes the page converge.
+        if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetMap::map)
+            && let Some(map) = dynamic.downcast::<ResolvedAssets>()
+            && let Some(url) = map.get(&self.request.spec)
+        {
+            return Ok(Str::from(url.as_str()));
+        }
+
+        // Miss: report the request on the write-only sink (invisible to comemo)
+        // and return a placeholder. A later relayout iteration — once the
+        // resolver has processed it and injected the URL — re-runs this (comemo
+        // miss on the changed map) and returns the real URL.
+        if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetSink::sink)
+            && let Some(sink) = dynamic.downcast::<AssetSink>()
+        {
+            let _ = sink.0.send(self.request.clone());
+        }
+        Ok(Str::from(ASSET_PENDING))
+    }
+}
+
+impl Repr for Asset {
     fn repr(&self) -> EcoString {
-        EcoString::inline("asset-sink")
+        EcoString::inline("asset(..)")
     }
 }
 
-impl PartialEq for AssetSink {
-    /// All sinks are equal — the channel identity is invisible to comemo.
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-
-impl Hash for AssetSink {
-    /// Hash nothing — the channel identity is invisible to comemo.
-    fn hash<H: Hasher>(&self, _: &mut H) {}
-}
+/// Placeholder URL returned for an as-yet-unresolved asset. By the time the
+/// loop converges every consumer has re-run against a populated map, so this
+/// never survives into output (a leak means non-convergence — a bug).
+const ASSET_PENDING: &str = "/__twyla-asset-pending__";
 
 // ---------------------------------------------------------------------------
-// The contextual builtin: `asset.file(path)`
+// Constructors: the `asset` module
 // ---------------------------------------------------------------------------
 
-/// Resolve an asset path to its final URL (spike: path input only).
-///
-/// Contextual: it reads the injected resolved-map off the style chain. On a
-/// hit it returns the real URL. On a miss it reports the spec on the discovery
-/// sink and returns a placeholder; a later relayout iteration — once twyla has
-/// processed the spec and injected its URL — re-runs this (comemo miss on the
-/// changed map) and returns the resolved URL.
-#[func(contextual)]
-pub fn file(
-    /// The context to read the resolved-asset map from.
-    context: Tracked<Context>,
-    /// Project-relative path of the asset.
-    path: Str,
-) -> HintedStrResult<Str> {
-    let styles = context.styles()?;
-    let key = path.as_str();
-
-    // Tracked read: a hit here is what makes the page converge.
-    let map = styles.get_cloned(TwylaAssetMap::map);
-    if let Ok(Value::Str(url)) = map.get(key) {
-        return Ok(url.clone());
-    }
-
-    // Miss: report on the write-only sink (invisible to comemo) and return a
-    // placeholder for this round.
-    if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetSink::sink)
-        && let Some(sink) = dynamic.downcast::<AssetSink>()
-    {
-        let _ = sink.0.send(EcoString::from(key));
-    }
-    Ok(Str::from(format!("/__twyla-pending__/{key}")))
+/// Reference a project file as an asset, copied verbatim and fingerprinted.
+#[func]
+fn file(
+    /// Path to the file, relative to the calling file.
+    path: Spanned<PathOrStr>,
+) -> SourceResult<Asset> {
+    Ok(Asset {
+        request: AssetRequest {
+            spec: AssetSpec::File { file: resolve(path)? },
+        },
+    })
 }
 
-/// Build the `asset` module (`asset.file`, …) for the global scope.
+/// Compile a Sass/SCSS file to a fingerprinted CSS asset.
+#[func]
+fn sass(
+    /// Path to the `.sass`/`.scss` file, relative to the calling file.
+    path: Spanned<PathOrStr>,
+) -> SourceResult<Asset> {
+    Ok(Asset {
+        request: AssetRequest {
+            spec: AssetSpec::Sass { file: resolve(path)? },
+        },
+    })
+}
+
+/// Resolve a path argument to the `FileId` it names, relative to the calling
+/// file (mirrors how `read`/`image` resolve their paths).
+fn resolve(path: Spanned<PathOrStr>) -> SourceResult<FileId> {
+    Ok(path.v.resolve_if_some(path.span.id()).at(path.span)?.intern())
+}
+
+/// Build the `asset` module (`asset.file`, `asset.sass`) for the global scope.
 pub fn module() -> Module {
     let mut scope = Scope::new();
     scope.define_func::<file>();
+    scope.define_func::<sass>();
     Module::new("asset", scope)
 }
 
@@ -155,174 +204,224 @@ pub fn install(global: &mut Scope) {
 }
 
 // ---------------------------------------------------------------------------
-// Spike driver: a relayout loop that drains the sink and re-injects
+// Style-chain carriers
 // ---------------------------------------------------------------------------
 
-/// What the spike compile observed — enough to assert all three claims.
-#[derive(Debug)]
-pub struct SpikeOutcome {
-    /// Final serialized HTML (placeholders should be gone on success).
-    pub html: String,
-    /// Specs the sink received across the whole compile, in order.
-    pub discovered: Vec<EcoString>,
-    /// How many realization iterations the loop ran (1 ⇒ converged cold).
-    pub iterations: usize,
+/// Host element carrying the resolved-URL map (the tracked half).
+#[elem]
+pub struct TwylaAssetMap {
+    /// A [`Value::Dyn`] wrapping [`ResolvedAssets`]. Content-hashed, so it
+    /// drives re-realization as assets resolve.
+    #[default(Value::None)]
+    pub map: Value,
 }
 
-/// Evaluate `source` once, then run the relayout fixed-point with asset
-/// discovery folded into the *same* loop (no nesting). `seed` pre-populates
-/// the resolved-URL map — pass an empty dict for a cold build, or a warm map
-/// to exercise the seeded no-op path.
-///
-/// This deliberately mirrors [`crate::compile`]'s `relayout`, with two added
-/// lines of behavior: (1) the resolved-map is recomputed every iteration as
-/// the sink drains, and (2) the break is gated on assets being *settled* as
-/// well as typst's own introspection constraint — otherwise typst could
-/// declare convergence on a round where a freshly-discovered asset is still
-/// showing its placeholder.
-pub fn spike_resolve(
-    world: &dyn World,
-    source: FileId,
-    seed: Dict,
-) -> SourceResult<SpikeOutcome> {
-    let mut sink = Sink::new();
-    let traced = Traced::default();
-    let world = world.track();
+/// Host element carrying the discovery sink (the hash-excluded half).
+#[elem]
+pub struct TwylaAssetSink {
+    /// A [`Value::Dyn`] wrapping [`AssetSink`]. Hashes constant, so injecting
+    /// it never moves the realization cache key.
+    #[default(Value::None)]
+    pub sink: Value,
+}
 
-    // Evaluate the source into a body and wrap it as a routed document.
-    let body = {
-        let src = world.source(source).map_err(|err| {
+/// The resolved-URL map carried on the style chain: `AssetSpec -> url`.
+///
+/// `Hash` is **order-independent** (the per-entry hashes are sorted before
+/// hashing) so the same set of entries hashes identically regardless of the
+/// order rayon discovered them in — which is what lets a warm rebuild hit the
+/// previous compile's realization cache. `BTreeMap` would give this for free,
+/// but no component of `AssetSpec` is `Ord`, so we do it by hand over a
+/// `HashMap`.
+#[ty(name = "twyla-resolved-assets")]
+#[derive(Clone, PartialEq, Debug)]
+pub struct ResolvedAssets(HashMap<AssetSpec, EcoString>);
+
+impl ResolvedAssets {
+    fn get(&self, spec: &AssetSpec) -> Option<&EcoString> {
+        self.0.get(spec)
+    }
+}
+
+impl Hash for ResolvedAssets {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let mut entries: Vec<u128> = self.0.iter().map(|kv| hash128(&kv)).collect();
+        entries.sort_unstable();
+        entries.hash(state);
+    }
+}
+
+impl Repr for ResolvedAssets {
+    fn repr(&self) -> EcoString {
+        EcoString::inline("twyla-resolved-assets(..)")
+    }
+}
+
+/// Write-only channel for reporting discovered asset requests out of the
+/// otherwise-pure realization pass. Hash/Eq are deliberately **constant** —
+/// the channel identity is invisible to comemo (see module docs).
+#[ty(name = "twyla-asset-sink")]
+#[derive(Clone)]
+pub struct AssetSink(Sender<AssetRequest>);
+
+impl Debug for AssetSink {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.write_str("AssetSink(..)")
+    }
+}
+
+impl Repr for AssetSink {
+    fn repr(&self) -> EcoString {
+        EcoString::inline("twyla-asset-sink")
+    }
+}
+
+impl PartialEq for AssetSink {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Hash for AssetSink {
+    fn hash<H: Hasher>(&self, _: &mut H) {}
+}
+
+// ---------------------------------------------------------------------------
+// The resolver
+// ---------------------------------------------------------------------------
+
+/// How a resolved asset's bytes reach the output. `Copy` keeps only the source
+/// path (stream-copied at emit time — never the whole file in memory);
+/// `Bytes` holds small transformed output (e.g. compiled CSS).
+#[derive(Clone, Debug)]
+pub enum Emit {
+    /// Stream-copy from this on-disk source path.
+    Copy(PathBuf),
+    /// Write these transformed bytes.
+    Bytes(Bytes),
+}
+
+/// One processed asset: where it lives and how to emit it.
+#[derive(Clone, Debug)]
+pub struct ResolvedAsset {
+    /// The spec that produced it (its key).
+    pub spec: AssetSpec,
+    /// Root-relative (or base-url-prefixed) URL.
+    pub url: EcoString,
+    /// Bundle-relative output path, e.g. `assets/main-<hash>.css`.
+    pub output_path: PathBuf,
+    /// How to emit the bytes.
+    pub emit: Emit,
+}
+
+/// Owns the discovery channel and the accumulated resolved-asset store, and
+/// processes discovered requests between relayout iterations.
+pub struct AssetResolver {
+    ctx: TwylaContext,
+    tx: Sender<AssetRequest>,
+    rx: Receiver<AssetRequest>,
+    resolved: HashMap<AssetSpec, ResolvedAsset>,
+}
+
+impl AssetResolver {
+    /// Create a resolver, seeded with already-known assets (e.g. from a warm
+    /// `serve` session). An empty seed is a cold build.
+    pub fn new(ctx: &TwylaContext, seed: HashMap<AssetSpec, ResolvedAsset>) -> Self {
+        let (tx, rx) = unbounded();
+        Self {
+            ctx: ctx.clone(),
+            tx,
+            rx,
+            resolved: seed,
+        }
+    }
+
+    /// The (constant-hashing) sink style — build once and chain every iteration.
+    pub fn sink_style(&self) -> LazyHash<Style> {
+        TwylaAssetSink::sink
+            .set(Value::dynamic(AssetSink(self.tx.clone())))
+            .wrap()
+    }
+
+    /// The resolved-map style for the current state — rebuilt each iteration as
+    /// the store grows.
+    pub fn map_style(&self) -> LazyHash<Style> {
+        let map: HashMap<AssetSpec, EcoString> = self
+            .resolved
+            .iter()
+            .map(|(spec, asset)| (spec.clone(), asset.url.clone()))
+            .collect();
+        TwylaAssetMap::map
+            .set(Value::dynamic(ResolvedAssets(map)))
+            .wrap()
+    }
+
+    /// Drain the discovery channel and process each newly-seen request.
+    /// Returns `true` if nothing new was resolved (assets are *settled*).
+    pub fn drain_and_process(&mut self, world: Tracked<dyn World + '_>) -> SourceResult<bool> {
+        let mut settled = true;
+        // Collect first so we don't hold the receiver across processing.
+        let requests: Vec<AssetRequest> = self.rx.try_iter().collect();
+        for request in requests {
+            if self.resolved.contains_key(&request.spec) {
+                continue;
+            }
+            let asset = self.process(world, &request.spec)?;
+            self.resolved.insert(request.spec, asset);
+            settled = false;
+        }
+        Ok(settled)
+    }
+
+    /// Process one spec into a [`ResolvedAsset`]: read the source bytes
+    /// (tracked, so the watcher sees them), transform, fingerprint, name.
+    fn process(
+        &self,
+        world: Tracked<dyn World + '_>,
+        spec: &AssetSpec,
+    ) -> SourceResult<ResolvedAsset> {
+        let file = spec.file();
+        let bytes = world.file(file).map_err(|err| {
             eco_vec![SourceDiagnostic::error(Span::detached(), EcoString::from(err))]
         })?;
-        let mut tracked_sink = sink.track_mut();
-        let module = typst_eval::eval(
-            world,
-            world.library(),
-            traced.track(),
-            TrackedMut::reborrow_mut(&mut tracked_sink),
-            Route::default().track(),
-            &src,
-        )?;
-        module.content()
-    };
-    let path = typst::foundations::BundlePath::new(VirtualPath::new("index.html").unwrap()).unwrap();
-    let content = DocumentElem::new(path, body).pack();
 
-    let library = world.library();
-    let base = StyleChain::new(&library.styles);
-    let target = TargetElem::target.set(Bundle::target()).wrap();
-    let base_target = base.chain(&target);
-
-    let (tx, rx) = unbounded::<EcoString>();
-    let sink_style: LazyHash<Style> =
-        TwylaAssetSink::sink.set(Value::dynamic(AssetSink(tx))).wrap();
-
-    let mut resolved = seed;
-    let mut discovered = Vec::new();
-    let empty_introspector = EmptyIntrospector;
-    let mut history: Vec<Bundle> = Vec::new();
-    let mut iterations = 0usize;
-    let bundle: Bundle;
-
-    loop {
-        iterations += 1;
-
-        // Recompute the injected styles every iteration — the resolved-map
-        // grows as the sink drains. The sink style is constant (and hashes
-        // constant), so only the map ever moves the comemo key.
-        let map_style: LazyHash<Style> = TwylaAssetMap::map.set(resolved.clone()).wrap();
-        let styles = base_target.chain(&map_style);
-        let styles = styles.chain(&sink_style);
-
-        let introspector = history
-            .last()
-            .map(|doc| doc.introspector())
-            .unwrap_or(&empty_introspector);
-        let constraint = comemo::Constraint::new();
-
-        let mut subsink = Sink::new();
-        let mut engine = Engine {
-            library,
-            world,
-            introspector: Protected::new(introspector.track_with(&constraint)),
-            traced: traced.track(),
-            sink: subsink.track_mut(),
-            route: Route::default(),
+        // Transform. Phase 0: identity for both (grass for Sass lands in
+        // Phase 1). The fingerprint is of the *output* bytes, like zola/hugo.
+        let output: Emit = match spec {
+            AssetSpec::File { .. } => Emit::Copy(self.ctx.root.join(file.vpath().get_without_slash())),
+            AssetSpec::Sass { .. } => Emit::Bytes(bytes.clone()),
+        };
+        let hash = match &output {
+            Emit::Copy(_) => hash128(&bytes),
+            Emit::Bytes(b) => hash128(b),
         };
 
-        let document = Bundle::create(&mut engine, &content, styles)?;
+        let name = match source_stem(file) {
+            Some(stem) => format!("{stem}-{hash:032x}.{}", spec.out_ext()),
+            None => format!("{hash:032x}.{}", spec.out_ext()),
+        };
+        let output_path = self.ctx.default_asset_dir().join(&name);
+        let url = EcoString::from(self.ctx.asset_url(&output_path));
 
-        // Drain the discovery sink and "process" each new spec. Real twyla
-        // hashes bytes / runs grass / encodes here, on rayon, off to the side;
-        // the spike just synthesizes a deterministic URL.
-        let mut newly_resolved = 0;
-        for spec in rx.try_iter() {
-            discovered.push(spec.clone());
-            if !resolved.contains(spec.as_str()) {
-                resolved.insert(spec.as_str().into(), process(&spec).into_value());
-                newly_resolved += 1;
-            }
-        }
-        let assets_settled = newly_resolved == 0;
-
-        // Break only when typst's introspection AND twyla's assets agree.
-        if constraint.validate(document.introspector()) && assets_settled {
-            sink.extend_from_sink(subsink);
-            bundle = document;
-            break;
-        }
-
-        if history.len() >= MAX_ITERS - 1 {
-            sink.extend_from_sink(subsink);
-            bundle = document;
-            break;
-        }
-
-        // If only assets moved (typst was otherwise stable), still re-run with
-        // the enriched map; push history so the introspector carries forward.
-        history.push(document);
+        Ok(ResolvedAsset {
+            spec: spec.clone(),
+            url,
+            output_path,
+            emit: output,
+        })
     }
 
-    let delayed = sink.delayed();
-    if !delayed.is_empty() {
-        return Err(delayed);
-    }
-
-    let html = render_bundle(&bundle)?;
-    Ok(SpikeOutcome {
-        html,
-        discovered,
-        iterations,
-    })
-}
-
-/// Stand-in for the real transform pipeline: deterministic content-addressed
-/// URL from the spec. Real impl resizes/transcodes/hashes bytes on rayon.
-fn process(spec: &str) -> String {
-    let digest = {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in spec.bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        format!("{:08x}", h & 0xffff_ffff)
-    };
-    let (stem, ext) = spec.rsplit_once('.').unwrap_or((spec, ""));
-    if ext.is_empty() {
-        format!("/assets/{stem}.{digest}")
-    } else {
-        format!("/assets/{stem}.{digest}.{ext}")
+    /// Consume the resolver, yielding every resolved asset (for emission).
+    pub fn into_resolved(self) -> Vec<ResolvedAsset> {
+        self.resolved.into_values().collect()
     }
 }
 
-/// Serialize the first HTML document in the bundle.
-fn render_bundle(bundle: &Bundle) -> SourceResult<String> {
-    for (_, file) in bundle.files.iter() {
-        if let BundleFile::Document(BundleDocument::Html(doc)) = file {
-            return typst_html::html(doc);
-        }
-    }
-    Ok(String::new())
+/// File stem of a project file id, for naming (`main.scss` -> `main`).
+fn source_stem(file: FileId) -> Option<EcoString> {
+    Path::new(file.vpath().get_without_slash())
+        .file_stem()
+        .map(|s| EcoString::from(s.to_string_lossy().as_ref()))
 }
 
 #[cfg(test)]
@@ -330,114 +429,145 @@ mod tests {
     use super::*;
     use crate::project::TwylaContext;
     use crate::render::RenderWorld;
-    use typst::syntax::{RootedPath, VirtualRoot};
+    use crossbeam_channel::unbounded;
+    use typst::foundations::Value;
+    use typst::syntax::{RootedPath, VirtualPath, VirtualRoot};
+    use typst::utils::LazyHash;
+    use typst_bundle::{BundleDocument, BundleFile};
+    use typst_utils::hash128;
 
-    /// A page that reads one asset URL inside `#context` (the only place a
-    /// contextual builtin resolves) and shows it as text.
-    const PAGE: &str = "#context asset.file(\"style.css\")";
-
-    fn world_with(content: &str) -> (RenderWorld, FileId, tempfile::TempDir) {
+    fn site(files: &[(&str, &str)]) -> (TwylaContext, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir(root.join("content")).unwrap();
-        std::fs::write(root.join("content/main.typ"), content).unwrap();
-        let ctx = TwylaContext::new(root, Some("https://example.com".into())).unwrap();
-        let world = RenderWorld::new(&ctx).unwrap();
-        let id = FileId::new(RootedPath::new(
+        std::fs::create_dir(dir.path().join("content")).unwrap();
+        for (rel, contents) in files {
+            std::fs::write(dir.path().join(rel), contents).unwrap();
+        }
+        let ctx = TwylaContext::new(dir.path(), Some("https://example.com".into())).unwrap();
+        (ctx, dir)
+    }
+
+    /// Compile the whole site through the real loop; return (first-page HTML,
+    /// resolved assets).
+    fn compile(ctx: &TwylaContext) -> (String, Vec<ResolvedAsset>) {
+        let world = RenderWorld::new(ctx).unwrap();
+        let sources: Vec<FileId> = ctx
+            .scan_pages()
+            .unwrap()
+            .into_iter()
+            .map(|p| {
+                FileId::new(RootedPath::new(
+                    VirtualRoot::Project,
+                    VirtualPath::virtualize(&ctx.root, &p).unwrap(),
+                ))
+            })
+            .collect();
+        let warned = crate::compile::compile_bundle(ctx, &world, &sources);
+        let (bundle, _harvested, assets) = warned.output.unwrap();
+        let mut html = String::new();
+        for (_, file) in bundle.files.iter() {
+            if let BundleFile::Document(BundleDocument::Html(doc)) = file {
+                html = typst_html::html(doc).unwrap();
+                break;
+            }
+        }
+        (html, assets)
+    }
+
+    fn fid(path: &str) -> FileId {
+        FileId::new(RootedPath::new(
             VirtualRoot::Project,
-            VirtualPath::new("content/main.typ").unwrap(),
-        ));
-        (world, id, dir)
+            VirtualPath::new(path).unwrap(),
+        ))
     }
 
-    /// Iterations typst needs for an equivalent `#context` page that touches
-    /// no assets — the baseline the asset machinery must not exceed.
-    fn typst_baseline_iterations() -> usize {
-        let (world, id, _dir) = world_with("#context \"warm\"");
-        spike_resolve(&world, id, Dict::new()).unwrap().iterations
-    }
-
-    /// Claim 1 — a cold build (empty seed) discovers the asset and resolves it
-    /// without leaking a placeholder, costing at most one extra realization
-    /// over the typst baseline (the discovery round, which often piggybacks on
-    /// an iteration typst was doing anyway).
+    /// The whole point of Phase 0: an `asset.*().url()` call resolves to a
+    /// fingerprinted URL through the relayout loop, with no placeholder left
+    /// behind — proving discovery → process → re-inject → re-realize works in
+    /// the *real* compile path.
     #[test]
-    fn cold_build_discovers_and_resolves() {
-        let (world, id, _dir) = world_with(PAGE);
-        let out = spike_resolve(&world, id, Dict::new()).unwrap();
+    fn cold_build_resolves_asset_url_through_the_loop() {
+        let (ctx, _dir) = site(&[
+            ("content/main.typ", "#context asset.file(\"logo.svg\").url()"),
+            ("content/logo.svg", "<svg/>"),
+        ]);
+        let (html, assets) = compile(&ctx);
 
-        assert_eq!(out.discovered, vec![EcoString::from("style.css")]);
+        assert_eq!(assets.len(), 1, "expected one resolved asset, got {assets:?}");
+        let url = assets[0].url.as_str();
         assert!(
-            out.html.contains("/assets/style.") && out.html.contains(".css"),
-            "URL not resolved into the output:\n{}",
-            out.html,
+            url.contains("/assets/logo-") && url.ends_with(".svg"),
+            "unexpected auto-named url: {url}",
         );
+        assert!(html.contains(url), "page missing resolved url {url}:\n{html}");
         assert!(
-            !out.html.contains("__twyla-pending__"),
-            "placeholder leaked into the output:\n{}",
-            out.html,
-        );
-        assert!(
-            out.iterations <= typst_baseline_iterations() + 1,
-            "cold build added more than one asset round (got {})",
-            out.iterations,
+            !html.contains("__twyla-asset-pending__"),
+            "placeholder leaked into output:\n{html}",
         );
     }
 
-    /// Claim 2 — seeding the resolved-map (as twyla would from its persistent
-    /// store) makes the first realization return the real URL: discovery never
-    /// fires and the loop converges in exactly typst's baseline count — zero
-    /// extra asset rounds.
+    /// Two assets on one page both resolve (loop converges with several
+    /// outstanding placeholders), and `sass` fingerprints to a `.css` name.
     #[test]
-    fn seeded_build_is_a_noop() {
-        let (world, id, _dir) = world_with(PAGE);
-        let mut seed = Dict::new();
-        seed.insert("style.css".into(), "/assets/style.deadbeef.css".into_value());
+    fn multiple_assets_resolve_and_sass_renames_to_css() {
+        let (ctx, _dir) = site(&[
+            (
+                "content/main.typ",
+                "#context asset.file(\"a.txt\").url() #context asset.sass(\"b.scss\").url()",
+            ),
+            ("content/a.txt", "hello"),
+            ("content/b.scss", "a{b:c}"),
+        ]);
+        let (html, assets) = compile(&ctx);
 
-        let out = spike_resolve(&world, id, seed).unwrap();
-
+        assert_eq!(assets.len(), 2, "got {assets:?}");
         assert!(
-            out.discovered.is_empty(),
-            "discovery fired despite a warm seed: {:?}",
-            out.discovered,
+            assets.iter().any(|a| a.url.contains("/assets/a-") && a.url.ends_with(".txt")),
+            "missing a.txt asset: {assets:?}",
         );
         assert!(
-            out.html.contains("/assets/style.deadbeef.css"),
-            "seeded URL not used:\n{}",
-            out.html,
+            assets.iter().any(|a| a.url.contains("/assets/b-") && a.url.ends_with(".css")),
+            "sass asset not renamed to .css: {assets:?}",
         );
+        assert!(!html.contains("__twyla-asset-pending__"), "placeholder leaked:\n{html}");
+    }
+
+    /// Hash discipline (the comemo split): the resolved-map hashes by *content*
+    /// and is order-independent; the sink hashes *constant*.
+    #[test]
+    fn map_hashes_by_content_sink_is_excluded() {
+        let a = AssetSpec::File { file: fid("content/a.css") };
+        let b = AssetSpec::Sass { file: fid("content/b.scss") };
+
+        let make = |pairs: &[(&AssetSpec, &str)]| {
+            let mut m = HashMap::new();
+            for (k, v) in pairs {
+                m.insert((*k).clone(), EcoString::from(*v));
+            }
+            ResolvedAssets(m)
+        };
+
+        // Same entries, opposite insertion order → identical hash.
+        let m1 = make(&[(&a, "ua"), (&b, "ub")]);
+        let m2 = make(&[(&b, "ub"), (&a, "ua")]);
         assert_eq!(
-            out.iterations,
-            typst_baseline_iterations(),
-            "seeded build must add no realizations over the typst baseline",
+            hash128(&m1),
+            hash128(&m2),
+            "resolved-map hash must be order-independent (enables warm-cache hits)",
         );
-    }
 
-    /// Claim 3 — the sink is invisible to comemo. Two sinks holding different
-    /// channels produce an identical style-chain hash, while changing the
-    /// resolved-map (the tracked half) does move the hash.
-    #[test]
-    fn sink_does_not_perturb_the_comemo_hash() {
-        let (tx1, _r1) = unbounded::<EcoString>();
-        let (tx2, _r2) = unbounded::<EcoString>();
+        // Different URL → different hash (this is what drives re-realization).
+        let m3 = make(&[(&a, "CHANGED"), (&b, "ub")]);
+        assert_ne!(hash128(&m1), hash128(&m3), "map must track its contents");
+
+        // The sink: two distinct channels must hash identically as style fields.
+        let (tx1, _r1) = unbounded::<AssetRequest>();
+        let (tx2, _r2) = unbounded::<AssetRequest>();
         let s1: LazyHash<Style> = TwylaAssetSink::sink.set(Value::dynamic(AssetSink(tx1))).wrap();
         let s2: LazyHash<Style> = TwylaAssetSink::sink.set(Value::dynamic(AssetSink(tx2))).wrap();
         assert_eq!(
-            typst_utils::hash128(&s1),
-            typst_utils::hash128(&s2),
-            "different channels must hash identically (sink hash-excluded)",
-        );
-
-        let mut m1 = Dict::new();
-        m1.insert("a".into(), "x".into_value());
-        let mut m2 = Dict::new();
-        m2.insert("a".into(), "y".into_value());
-        let ms1: LazyHash<Style> = TwylaAssetMap::map.set(m1).wrap();
-        let ms2: LazyHash<Style> = TwylaAssetMap::map.set(m2).wrap();
-        assert_ne!(
-            typst_utils::hash128(&ms1),
-            typst_utils::hash128(&ms2),
-            "the resolved-map must move the hash (it drives convergence)",
+            hash128(&s1),
+            hash128(&s2),
+            "sink identity must be invisible to comemo",
         );
     }
 }

@@ -228,7 +228,10 @@ impl RenderWorld {
             eprintln!("warning: {}", w.message);
         }
 
-        let (bundle, harvested) = output.map_err(|errors| RenderError {
+        // Phase 0: asset resolution runs inside the compile loop, but emission
+        // into the output bundle / dev server (and watcher deps) lands in
+        // Phase 1 — drop the resolved assets here for now.
+        let (bundle, harvested, _assets) = output.map_err(|errors| RenderError {
             messages: errors.iter().map(|e| format_diagnostic(self, e)).collect(),
             kind: RenderErrorKind::Compile,
         })?;

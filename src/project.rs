@@ -136,6 +136,25 @@ impl TwylaContext {
         }
     }
 
+    /// Bundle-relative directory processed assets are emitted into, e.g.
+    /// `assets/main-<hash>.css`. Joined under the build output dir on disk and
+    /// exposed at the matching root-relative URL ([`asset_url`](Self::asset_url)).
+    pub fn default_asset_dir(&self) -> PathBuf {
+        PathBuf::from("assets")
+    }
+
+    /// Root-relative (or base-url-prefixed) URL for a bundle-relative asset
+    /// path like `assets/main-<hash>.css`. Unlike [`url_for`](Self::url_for) it
+    /// does not strip `index.html` — asset paths are used verbatim.
+    pub fn asset_url(&self, rel: &Path) -> String {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let rel = rel.trim_start_matches('/');
+        match &self.base_url {
+            Some(base) => format!("{}/{}", base.trim_end_matches('/'), rel),
+            None => format!("/{rel}"),
+        }
+    }
+
     /// Whether `content/<slug>.typ` exists on disk. Used by the dev
     /// server's dispatcher to decide page-route vs static-asset
     /// fallback for an incoming URL.
