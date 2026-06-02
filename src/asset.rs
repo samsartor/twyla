@@ -14,11 +14,16 @@
 //!   boundary, which we don't own.) The `Hash` is *order-independent* so the
 //!   same set of entries hashes identically regardless of discovery order,
 //!   which is what lets a warm rebuild reuse the previous compile's cache.
-//! - **Discovery sink — hash-excluded (specs OUT, drives discovery).**
-//!   [`AssetSink`] wraps a write-only [`crossbeam_channel::Sender`]; its `Hash`
-//!   is constant and `PartialEq` always-true, so it rides the chain via
-//!   [`TwylaAssetSink`] without ever moving the comemo key. The contextual
-//!   `.url` method `send`s its [`AssetRequest`] on a miss and never reads back.
+//! - **Discovery sink — per-resolver epoch (specs OUT, drives discovery).**
+//!   [`AssetSink`] wraps a write-only [`crossbeam_channel::Sender`] and rides
+//!   the chain via [`TwylaAssetSink`]. Its `Hash` keys on the resolver's
+//!   *epoch*: constant within one resolver's lifetime (so across iterations
+//!   only the map moves the comemo key), but distinct per resolver. A
+//!   *globally*-constant hash is unsound — comemo would reuse a previous
+//!   compile's cached `placeholder + send` for a fresh resolver, and the
+//!   discovery `send` (a side effect inside memoized code) would never re-fire,
+//!   starving it. The contextual `.url` method `send`s its [`AssetRequest`] on a
+//!   miss and never reads back.
 //!
 //! Why the side-channel is sound: the set of asset *inputs* is immutable going
 //! into a compile; the sink only reports *which* fixed inputs were referenced,
@@ -30,10 +35,11 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use comemo::Tracked;
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use ecow::{EcoString, eco_vec};
+use ecow::{EcoString, eco_format, eco_vec};
 use typst::World;
 use typst::diag::{At, HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{
@@ -137,7 +143,7 @@ impl Asset {
         if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetSink::sink)
             && let Some(sink) = dynamic.downcast::<AssetSink>()
         {
-            let _ = sink.0.send(self.request.clone());
+            let _ = sink.tx.send(self.request.clone());
         }
         Ok(Str::from(ASSET_PENDING))
     }
@@ -258,15 +264,27 @@ impl Repr for ResolvedAssets {
 }
 
 /// Write-only channel for reporting discovered asset requests out of the
-/// otherwise-pure realization pass. Hash/Eq are deliberately **constant** —
-/// the channel identity is invisible to comemo (see module docs).
+/// otherwise-pure realization pass.
+///
+/// Hash/Eq key on the resolver's `epoch`, **not** the channel: constant within
+/// one resolver's lifetime (so across relayout iterations only the resolved-map
+/// moves the comemo key — that's what drives convergence), but **distinct per
+/// resolver** (so a fresh resolver's empty-map realization is a comemo *miss*,
+/// not a hit on a previous compile's cached placeholder). A globally-constant
+/// hash here is unsound: comemo would reuse the cached `placeholder + send`
+/// across resolver instances, and the discovery `send` — a side effect inside
+/// memoized code — would never re-fire, starving the new resolver. The
+/// channel identity itself stays out of the hash (it's not observable output).
 #[ty(name = "twyla-asset-sink")]
 #[derive(Clone)]
-pub struct AssetSink(Sender<AssetRequest>);
+pub struct AssetSink {
+    epoch: u64,
+    tx: Sender<AssetRequest>,
+}
 
 impl Debug for AssetSink {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        f.write_str("AssetSink(..)")
+        write!(f, "AssetSink(epoch={})", self.epoch)
     }
 }
 
@@ -277,13 +295,15 @@ impl Repr for AssetSink {
 }
 
 impl PartialEq for AssetSink {
-    fn eq(&self, _: &Self) -> bool {
-        true
+    fn eq(&self, other: &Self) -> bool {
+        self.epoch == other.epoch
     }
 }
 
 impl Hash for AssetSink {
-    fn hash<H: Hasher>(&self, _: &mut H) {}
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.epoch.hash(state);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -314,9 +334,15 @@ pub struct ResolvedAsset {
     pub emit: Emit,
 }
 
+/// Hands out a distinct discovery epoch per [`AssetResolver`]. See
+/// [`AssetSink`] for why a fresh epoch (rather than a constant) is required for
+/// correctness across compiles that share comemo's process-global cache.
+static RESOLVER_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 /// Owns the discovery channel and the accumulated resolved-asset store, and
 /// processes discovered requests between relayout iterations.
 pub struct AssetResolver {
+    epoch: u64,
     ctx: TwylaContext,
     tx: Sender<AssetRequest>,
     rx: Receiver<AssetRequest>,
@@ -329,6 +355,7 @@ impl AssetResolver {
     pub fn new(ctx: &TwylaContext, seed: HashMap<AssetSpec, ResolvedAsset>) -> Self {
         let (tx, rx) = unbounded();
         Self {
+            epoch: RESOLVER_EPOCH.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),
             tx,
             rx,
@@ -336,11 +363,14 @@ impl AssetResolver {
         }
     }
 
-    /// The (constant-hashing) sink style — build once and chain every iteration.
+    /// The sink style — build once and chain every iteration. Hashes on this
+    /// resolver's `epoch` (constant for its lifetime, distinct per resolver).
     pub fn sink_style(&self) -> LazyHash<Style> {
-        TwylaAssetSink::sink
-            .set(Value::dynamic(AssetSink(self.tx.clone())))
-            .wrap()
+        let sink = AssetSink {
+            epoch: self.epoch,
+            tx: self.tx.clone(),
+        };
+        TwylaAssetSink::sink.set(Value::dynamic(sink)).wrap()
     }
 
     /// The resolved-map style for the current state — rebuilt each iteration as
@@ -384,16 +414,19 @@ impl AssetResolver {
         let bytes = world.file(file).map_err(|err| {
             eco_vec![SourceDiagnostic::error(Span::detached(), EcoString::from(err))]
         })?;
+        let on_disk = self.ctx.root.join(file.vpath().get_without_slash());
 
-        // Transform. Phase 0: identity for both (grass for Sass lands in
-        // Phase 1). The fingerprint is of the *output* bytes, like zola/hugo.
-        let output: Emit = match spec {
-            AssetSpec::File { .. } => Emit::Copy(self.ctx.root.join(file.vpath().get_without_slash())),
-            AssetSpec::Sass { .. } => Emit::Bytes(bytes.clone()),
-        };
-        let hash = match &output {
-            Emit::Copy(_) => hash128(&bytes),
-            Emit::Bytes(b) => hash128(b),
+        // Transform, then fingerprint the *output* bytes (like zola/hugo). A
+        // `File` keeps only the source path — stream-copied at emit time, never
+        // held in memory; `Sass` holds its (small) compiled CSS.
+        let (emit, hash) = match spec {
+            AssetSpec::File { .. } => (Emit::Copy(on_disk), hash128(&bytes)),
+            AssetSpec::Sass { .. } => {
+                let css = compile_sass(&bytes, &on_disk)?;
+                let css = Bytes::new(css.into_bytes());
+                let hash = hash128(&css);
+                (Emit::Bytes(css), hash)
+            }
         };
 
         let name = match source_stem(file) {
@@ -407,7 +440,7 @@ impl AssetResolver {
             spec: spec.clone(),
             url,
             output_path,
-            emit: output,
+            emit,
         })
     }
 
@@ -415,6 +448,33 @@ impl AssetResolver {
     pub fn into_resolved(self) -> Vec<ResolvedAsset> {
         self.resolved.into_values().collect()
     }
+}
+
+/// Compile Sass/SCSS source to CSS via grass. `@use`/`@import` resolve against
+/// the source file's directory on disk — those imports aren't yet seen by the
+/// watcher (that lands with dependency tracking); the entry file is, since it's
+/// read through the tracked World.
+fn compile_sass(source: &Bytes, on_disk: &Path) -> SourceResult<String> {
+    let src = std::str::from_utf8(source).map_err(|e| {
+        eco_vec![SourceDiagnostic::error(
+            Span::detached(),
+            eco_format!("sass source is not valid UTF-8: {e}"),
+        )]
+    })?;
+    // Pick syntax by extension: `.sass` is the indented syntax, everything
+    // else (`.scss`) is SCSS — grass's `from_string` would otherwise assume
+    // SCSS for both.
+    let syntax = match on_disk.extension().and_then(|e| e.to_str()) {
+        Some("sass") => grass::InputSyntax::Sass,
+        _ => grass::InputSyntax::Scss,
+    };
+    let mut options = grass::Options::default().input_syntax(syntax);
+    if let Some(parent) = on_disk.parent() {
+        options = options.load_path(parent);
+    }
+    grass::from_string(src.to_string(), &options).map_err(|e| {
+        eco_vec![SourceDiagnostic::error(Span::detached(), eco_format!("sass: {e}"))]
+    })
 }
 
 /// File stem of a project file id, for naming (`main.scss` -> `main`).
@@ -505,6 +565,26 @@ mod tests {
         );
     }
 
+    /// Two *separate* compiles in one process (sharing comemo's global cache)
+    /// must each resolve independently. This is the regression that the
+    /// per-resolver epoch fixes: with a globally-constant sink hash, the second
+    /// compile would hit the first's cached placeholder and never re-fire its
+    /// discovery `send`, leaking the placeholder.
+    #[test]
+    fn separate_compiles_each_resolve() {
+        let files: &[(&str, &str)] = &[
+            ("content/index.typ", "#context link(asset.file(\"logo.svg\").url())[logo]"),
+            ("content/logo.svg", "<svg/>"),
+        ];
+        let (ctx_a, _a) = site(files);
+        let (html_a, _) = compile(&ctx_a);
+        assert!(!html_a.contains("__twyla-asset-pending__"), "compile A leaked:\n{html_a}");
+
+        let (ctx_b, _b) = site(files);
+        let (html_b, _) = compile(&ctx_b);
+        assert!(!html_b.contains("__twyla-asset-pending__"), "compile B leaked:\n{html_b}");
+    }
+
     /// Two assets on one page both resolve (loop converges with several
     /// outstanding placeholders), and `sass` fingerprints to a `.css` name.
     #[test]
@@ -534,7 +614,7 @@ mod tests {
     /// Hash discipline (the comemo split): the resolved-map hashes by *content*
     /// and is order-independent; the sink hashes *constant*.
     #[test]
-    fn map_hashes_by_content_sink_is_excluded() {
+    fn map_hashes_by_content_sink_keys_on_epoch() {
         let a = AssetSpec::File { file: fid("content/a.css") };
         let b = AssetSpec::Sass { file: fid("content/b.scss") };
 
@@ -559,15 +639,17 @@ mod tests {
         let m3 = make(&[(&a, "CHANGED"), (&b, "ub")]);
         assert_ne!(hash128(&m1), hash128(&m3), "map must track its contents");
 
-        // The sink: two distinct channels must hash identically as style fields.
+        // The sink keys on epoch, not channel: same epoch → equal hash (stable
+        // across a resolver's iterations); different epoch → different hash
+        // (a fresh resolver must miss the cache, never reuse a stale send).
+        let sink = |epoch, tx| TwylaAssetSink::sink.set(Value::dynamic(AssetSink { epoch, tx })).wrap();
         let (tx1, _r1) = unbounded::<AssetRequest>();
         let (tx2, _r2) = unbounded::<AssetRequest>();
-        let s1: LazyHash<Style> = TwylaAssetSink::sink.set(Value::dynamic(AssetSink(tx1))).wrap();
-        let s2: LazyHash<Style> = TwylaAssetSink::sink.set(Value::dynamic(AssetSink(tx2))).wrap();
-        assert_eq!(
-            hash128(&s1),
-            hash128(&s2),
-            "sink identity must be invisible to comemo",
-        );
+        let (tx3, _r3) = unbounded::<AssetRequest>();
+        let same_a: LazyHash<Style> = sink(7, tx1);
+        let same_b: LazyHash<Style> = sink(7, tx2);
+        let other: LazyHash<Style> = sink(8, tx3);
+        assert_eq!(hash128(&same_a), hash128(&same_b), "same epoch must hash equal regardless of channel");
+        assert_ne!(hash128(&same_a), hash128(&other), "distinct epochs must hash differently");
     }
 }

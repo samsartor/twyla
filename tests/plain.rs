@@ -15,12 +15,14 @@ use twyla::render::render_site;
 
 fn render_plain() -> Vec<twyla::render::OutputDoc> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_site_plain");
-    let ctx = TwylaContext::new(root, Some("https://example.com".to_string())).expect("ctx");
+    // No base_url: asset URLs come out root-relative (`/assets/..`), which the
+    // native link rule treats as internal (no rel/target).
+    let ctx = TwylaContext::new(root, None).expect("ctx");
     render_site(&ctx).expect("render test_site_plain")
 }
 
 #[test]
-fn native_asset_url_builtin_resolves_with_zero_imports() {
+fn native_asset_builtin_resolves_with_zero_imports() {
     let docs = render_plain();
     let page = &docs
         .iter()
@@ -28,13 +30,13 @@ fn native_asset_url_builtin_resolves_with_zero_imports() {
         .expect("index page rendered")
         .html;
 
-    // The page imports nothing and applies no show rule, yet `asset-url`
-    // resolved — it lives in the global scope, injected from Rust.
-    // The native fn fingerprints the path, so the output differs from the
-    // input by an inserted digest: logo.svg -> /assets/logo.<hash>.svg.
+    // The page imports nothing and applies no show rule, yet `asset.file(..)`
+    // resolved through the compile loop — it lives in the global scope,
+    // injected from Rust. The asset is fingerprinted by its content hash:
+    // logo.svg -> /assets/logo-<hash>.svg.
     assert!(
-        page.contains("href=\"/assets/logo.") && page.contains(".svg\""),
-        "native asset-url builtin did not resolve; got:\n{page}",
+        page.contains("href=\"/assets/logo-") && page.contains(".svg\""),
+        "native asset builtin did not resolve; got:\n{page}",
     );
     // And a bare content file still produced a full document shell.
     assert!(page.contains("<html"), "no document shell for bare content");
@@ -68,8 +70,8 @@ fn native_html_rules_apply_without_show_rules() {
     // left alone — no rel/target leaks onto non-external links.
     let asset_anchor = page
         .split("<a ")
-        .find(|frag| frag.contains("/assets/logo."))
-        .expect("asset-url anchor present");
+        .find(|frag| frag.contains("/assets/logo-"))
+        .expect("asset anchor present");
     let asset_anchor = &asset_anchor[..asset_anchor.find('>').unwrap_or(asset_anchor.len())];
     assert!(
         !asset_anchor.contains("rel=") && !asset_anchor.contains("target="),

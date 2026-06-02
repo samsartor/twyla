@@ -31,17 +31,18 @@ use std::time::Instant;
 use notify::{EventKind, RecursiveMode, Watcher as _};
 use typst_kit::watcher::Watcher;
 
+use crate::asset::Emit;
 use crate::project::TwylaContext;
-use crate::render::{OutputDoc, RenderError, RenderWorld};
+use crate::render::{OutputDoc, RenderError, RenderWorld, SiteOutput};
 
 pub struct Serve {
     pub ctx: TwylaContext,
     pub addr: SocketAddr,
 }
 
-/// Result of the most recent bundle compile. Published by the watcher
-/// thread, read by request handlers.
-type LastOutput = Mutex<Result<Vec<OutputDoc>, RenderError>>;
+/// Result of the most recent bundle compile (pages + processed assets).
+/// Published by the watcher thread, read by request handlers.
+type LastOutput = Mutex<Result<SiteOutput, RenderError>>;
 
 /// Live Server-Sent-Events connections subscribed to `/__twyla/reload`.
 /// Request handlers push new ones; the watcher threads write reload
@@ -68,11 +69,12 @@ pub fn run(serve: Serve) -> io::Result<()> {
     };
 
     let warm_start = Instant::now();
-    let initial = world.lock().unwrap().compile_bundle();
+    let initial = world.lock().unwrap().compile_site();
     match &initial {
-        Ok(docs) => eprintln!(
-            "twyla serve: warmed {} doc(s) in {:.1?}",
-            docs.len(),
+        Ok(site) => eprintln!(
+            "twyla serve: warmed {} doc(s), {} asset(s) in {:.1?}",
+            site.docs.len(),
+            site.assets.len(),
             warm_start.elapsed(),
         ),
         Err(e) => eprintln!(
@@ -186,13 +188,14 @@ fn run_watcher(
             comemo::evict(10);
             let mut w = world.lock().unwrap();
             w.files.reset();
-            w.compile_bundle()
+            w.compile_site()
         };
         let elapsed = start.elapsed();
         match &result {
-            Ok(docs) => eprintln!(
-                "twyla serve: recompiled {} doc(s) in {:.1?}",
-                docs.len(),
+            Ok(site) => eprintln!(
+                "twyla serve: recompiled {} doc(s), {} asset(s) in {:.1?}",
+                site.docs.len(),
+                site.assets.len(),
                 elapsed,
             ),
             Err(e) => eprintln!(
@@ -469,7 +472,31 @@ fn dispatch(state: &ServeState, path: &str) -> Response {
         if res.status == 200 {
             return res;
         }
+        if let Some(res) = serve_asset(state, path) {
+            return res;
+        }
         serve_static(&state.ctx, path)
+    }
+}
+
+/// Serve a processed (`asset.*`) asset from the latest compile, matched by its
+/// bundle-relative `output_path` (e.g. `assets/main-<hash>.css`). Returns
+/// `None` if the path isn't a known asset, so the caller falls through to
+/// static serving.
+fn serve_asset(state: &ServeState, path: &str) -> Option<Response> {
+    let guard = state.last_output.lock().unwrap();
+    let site = guard.as_ref().ok()?;
+    let asset = site
+        .assets
+        .iter()
+        .find(|a| a.output_path.to_string_lossy().replace('\\', "/") == path)?;
+    let dest = Path::new(path);
+    match &asset.emit {
+        Emit::Copy(src) => match std::fs::read(src) {
+            Ok(body) => Some(Response::bytes(200, mime_for(dest), body)),
+            Err(_) => Some(Response::text(404, "asset source unreadable")),
+        },
+        Emit::Bytes(bytes) => Some(Response::bytes(200, mime_for(dest), bytes.as_slice().to_vec())),
     }
 }
 
@@ -477,11 +504,11 @@ fn dispatch(state: &ServeState, path: &str) -> Response {
 fn serve_doc(state: &ServeState, bundle_path: &Path) -> Response {
     let guard = state.last_output.lock().unwrap();
     match &*guard {
-        Ok(docs) => match docs.iter().find(|d| d.path == bundle_path) {
+        Ok(site) => match site.docs.iter().find(|d| d.path == bundle_path) {
             Some(d) => Response::html(200, d.html.clone()),
             None => {
                 if bundle_path == Path::new("index.html") {
-                    placeholder_main(docs, &state.ctx)
+                    placeholder_main(&site.docs, &state.ctx)
                 } else {
                     Response::text(404, "page not found in bundle")
                 }

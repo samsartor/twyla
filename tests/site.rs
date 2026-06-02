@@ -222,6 +222,60 @@ fn build_emits_pages_static_and_colocated_assets() {
     assert!(!exists("draft/index.html"), "draft page was written");
 }
 
+/// End-to-end asset pipeline: `asset.sass` compiles SCSS → CSS via grass,
+/// `asset.file` copies verbatim, both fingerprinted, and `twyla build` emits
+/// them under `assets/`.
+#[test]
+fn build_emits_fingerprinted_sass_and_file_assets() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir(root.join("content")).unwrap();
+    std::fs::write(
+        root.join("content/main.typ"),
+        "#context asset.sass(\"main.scss\").url() \
+         #context asset.file(\"robots.txt\").url()",
+    )
+    .unwrap();
+    // Nested SCSS — proves grass actually compiled (nesting gets flattened).
+    std::fs::write(
+        root.join("content/main.scss"),
+        ".card { color: red; .title { font-weight: bold; } }",
+    )
+    .unwrap();
+    std::fs::write(root.join("content/robots.txt"), "User-agent: *\n").unwrap();
+
+    let out = tempfile::tempdir().expect("out");
+    let ctx = TwylaContext::new(root, Some(BASE_URL.to_string())).expect("ctx");
+    let summary = build_run(Build {
+        ctx,
+        output_dir: out.path().to_path_buf(),
+    })
+    .expect("build");
+
+    assert_eq!(summary.assets, 2, "expected 2 processed assets");
+
+    let assets_dir = out.path().join("assets");
+    let files: Vec<_> = std::fs::read_dir(&assets_dir)
+        .expect("assets/ dir written")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+
+    let css = files
+        .iter()
+        .find(|f| f.starts_with("main-") && f.ends_with(".css"))
+        .unwrap_or_else(|| panic!("no fingerprinted main-*.css in {files:?}"));
+    let css_body = std::fs::read_to_string(assets_dir.join(css)).unwrap();
+    assert!(
+        css_body.contains(".card .title"),
+        "SCSS nesting not compiled by grass; got:\n{css_body}",
+    );
+
+    assert!(
+        files.iter().any(|f| f.starts_with("robots-") && f.ends_with(".txt")),
+        "verbatim file asset not emitted: {files:?}",
+    );
+}
+
 // =========================================================================
 // Pending — features twyla doesn't implement yet. Each is `#[ignore]`d and
 // fails today; un-ignore (and add the fixture content noted) as the
@@ -317,7 +371,7 @@ fn spike_harvest_reads_per_doc_extra() {
 
     let world = RenderWorld::new(&ctx()).expect("world");
     // Harvest shares the single eval/compile with the rendered HTML.
-    let (_rendered, docs) = world.compile_bundle_with_meta().expect("compile+harvest");
+    let (_rendered, docs, _assets) = world.compile_bundle_with_meta().expect("compile+harvest");
     let spike = docs
         .iter()
         .find(|d| d.url == "https://example.com/spike-doc/")

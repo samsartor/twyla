@@ -18,8 +18,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::asset::Emit;
 use crate::project::TwylaContext;
-use crate::render::{RenderError, render_site};
+use crate::render::{RenderError, render_site_with_assets};
 
 pub struct Build {
     pub ctx: TwylaContext,
@@ -44,14 +45,14 @@ impl std::fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 pub fn run(build: Build) -> Result<BuildSummary, BuildError> {
-    let docs = render_site(&build.ctx).map_err(BuildError::Render)?;
+    let site = render_site_with_assets(&build.ctx).map_err(BuildError::Render)?;
 
     fs::create_dir_all(&build.output_dir).map_err(|e| BuildError::Io {
         context: format!("creating {}", build.output_dir.display()),
         source: e,
     })?;
 
-    for doc in &docs {
+    for doc in &site.docs {
         let dest = build.output_dir.join(&doc.path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| BuildError::Io {
@@ -63,6 +64,32 @@ pub fn run(build: Build) -> Result<BuildSummary, BuildError> {
             context: format!("writing {}", dest.display()),
             source: e,
         })?;
+    }
+
+    // Processed assets (fingerprinted): stream-copy verbatim files, write
+    // transformed bytes (e.g. compiled CSS).
+    for asset in &site.assets {
+        let dest = build.output_dir.join(&asset.output_path);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| BuildError::Io {
+                context: format!("creating {}", parent.display()),
+                source: e,
+            })?;
+        }
+        match &asset.emit {
+            Emit::Copy(src) => {
+                fs::copy(src, &dest).map_err(|e| BuildError::Io {
+                    context: format!("copying {} → {}", src.display(), dest.display()),
+                    source: e,
+                })?;
+            }
+            Emit::Bytes(bytes) => {
+                fs::write(&dest, bytes.as_slice()).map_err(|e| BuildError::Io {
+                    context: format!("writing {}", dest.display()),
+                    source: e,
+                })?;
+            }
+        }
     }
 
     let static_dir = build.ctx.static_dir();
@@ -82,7 +109,8 @@ pub fn run(build: Build) -> Result<BuildSummary, BuildError> {
     };
 
     Ok(BuildSummary {
-        pages: docs.len(),
+        pages: site.docs.len(),
+        assets: site.assets.len(),
         static_files: static_copied,
         content_assets: content_copied,
     })
@@ -91,6 +119,8 @@ pub fn run(build: Build) -> Result<BuildSummary, BuildError> {
 #[derive(Debug, Clone, Copy)]
 pub struct BuildSummary {
     pub pages: usize,
+    /// Processed (`asset.*`) assets emitted under `assets/`.
+    pub assets: usize,
     pub static_files: usize,
     pub content_assets: usize,
 }

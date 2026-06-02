@@ -23,6 +23,7 @@ use typst_kit::fonts::FontStore;
 use typst_kit::packages::SystemPackages;
 use typst_library::Feature;
 
+use crate::asset::ResolvedAsset;
 use crate::compile::HarvestedDoc;
 use crate::project::TwylaContext;
 
@@ -72,6 +73,14 @@ pub struct OutputDoc {
     pub html: String,
 }
 
+/// A full compile: the routed pages plus every processed asset. `build` writes
+/// both to disk; `serve` serves both from the latest compile.
+#[derive(Debug, Clone)]
+pub struct SiteOutput {
+    pub docs: Vec<OutputDoc>,
+    pub assets: Vec<ResolvedAsset>,
+}
+
 /// Compile every page under `<root>/content/` as a single bundle.
 ///
 /// One-shot wrapper: builds a fresh [`RenderWorld`], compiles, drops.
@@ -80,6 +89,13 @@ pub struct OutputDoc {
 pub fn render_site(ctx: &TwylaContext) -> Result<Vec<OutputDoc>, RenderError> {
     let world = RenderWorld::new(ctx)?;
     world.compile_bundle()
+}
+
+/// Like [`render_site`] but also returns the processed assets — what `build`
+/// needs to emit `<dir>/assets/...` alongside the pages.
+pub fn render_site_with_assets(ctx: &TwylaContext) -> Result<SiteOutput, RenderError> {
+    let world = RenderWorld::new(ctx)?;
+    world.compile_site()
 }
 
 /// Replace every `<script type="x-twyla-raw-html">..</script>` with its
@@ -204,14 +220,20 @@ impl RenderWorld {
         Ok(self.compile_bundle_with_meta()?.0)
     }
 
+    /// Compile both pages and assets — what `build`/`serve` emit. The assets
+    /// come from the same single eval as the pages.
+    pub fn compile_site(&self) -> Result<SiteOutput, RenderError> {
+        let (docs, _harvested, assets) = self.compile_bundle_with_meta()?;
+        Ok(SiteOutput { docs, assets })
+    }
+
     /// Like [`compile_bundle`](Self::compile_bundle) but also returns the
-    /// per-page twyla `document` metadata harvested from the *same*
-    /// compile (one eval). Both come out of [`crate::compile::compile_bundle`].
-    /// The harvested metadata is what `documents`/feeds will be built from;
-    /// `compile_bundle` just drops it for callers that only want HTML.
+    /// per-page twyla `document` metadata and the processed [`ResolvedAsset`]s
+    /// harvested/resolved during the *same* compile (one eval). Both come out
+    /// of [`crate::compile::compile_bundle`].
     pub fn compile_bundle_with_meta(
         &self,
-    ) -> Result<(Vec<OutputDoc>, Vec<HarvestedDoc>), RenderError> {
+    ) -> Result<(Vec<OutputDoc>, Vec<HarvestedDoc>, Vec<ResolvedAsset>), RenderError> {
         let sources = self.ctx.scan_pages().map_err(|e| setup_err(e))?;
         let fileids: Vec<_> = sources
             .into_iter()
@@ -228,10 +250,7 @@ impl RenderWorld {
             eprintln!("warning: {}", w.message);
         }
 
-        // Phase 0: asset resolution runs inside the compile loop, but emission
-        // into the output bundle / dev server (and watcher deps) lands in
-        // Phase 1 — drop the resolved assets here for now.
-        let (bundle, harvested, _assets) = output.map_err(|errors| RenderError {
+        let (bundle, harvested, assets) = output.map_err(|errors| RenderError {
             messages: errors.iter().map(|e| format_diagnostic(self, e)).collect(),
             kind: RenderErrorKind::Compile,
         })?;
@@ -260,7 +279,7 @@ impl RenderWorld {
         }
 
         docs.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok((docs, harvested))
+        Ok((docs, harvested, assets))
     }
 }
 
