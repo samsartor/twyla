@@ -1,7 +1,7 @@
 //! Twyla's version typst's `compile` / `compile_impl` fixed-point loop,
 //! plus twyla's per-document metadata harvest.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use comemo::{Track, Tracked, TrackedMut};
 use ecow::{EcoString, EcoVec, eco_vec};
@@ -67,11 +67,13 @@ pub fn compile_bundle(
     ctx: &TwylaContext,
     world: &dyn World,
     sources: &[FileId],
+    resolver: &mut AssetResolver,
 ) -> Warned<SourceResult<CompiledBundle>> {
     let mut sink = Sink::new();
     let traced = Traced::default();
-    let output = compile_bundle_impl(ctx, world.track(), traced.track(), &mut sink, sources)
-        .map_err(deduplicate);
+    let output =
+        compile_bundle_impl(ctx, world.track(), traced.track(), &mut sink, sources, resolver)
+            .map_err(deduplicate);
     Warned {
         output,
         warnings: sink.warnings(),
@@ -84,7 +86,12 @@ fn compile_bundle_impl(
     traced: Tracked<Traced>,
     sink: &mut Sink,
     sources: &[FileId],
+    resolver: &mut AssetResolver,
 ) -> SourceResult<CompiledBundle> {
+    // Evict assets whose sources changed since the last compile (no-op on the
+    // first compile / a fresh resolver). What survives seeds this compile.
+    resolver.revalidate();
+
     let library = world.library();
     let empty = EmptyIntrospector;
     let mut engine = Engine {
@@ -117,15 +124,12 @@ fn compile_bundle_impl(
     // Inject the page list onto the style chain so `documents()` resolves it during the render pass.
     let docs_style = TwylaDocumentList::all.set(documents).wrap();
 
-    // The resolver drains discovered assets between relayout iterations and
-    // processes them. Cold seed for now; `serve` will seed from a warm store.
-    let mut resolver = AssetResolver::new(ctx, HashMap::new());
-
+    // The (caller-owned, persistent) resolver drains discovered assets between
+    // relayout iterations and processes them; its store survives across compiles.
     let content = Content::sequence(bodies);
     let injected = [docs_style];
-    let bundle =
-        relayout::<Bundle>(world, traced, sink, &content, &injected, Some(&mut resolver))?;
-    Ok((bundle, harvested, resolver.into_resolved()))
+    let bundle = relayout::<Bundle>(world, traced, sink, &content, &injected, resolver)?;
+    Ok((bundle, harvested, resolver.resolved_assets()))
 }
 
 /// Evaluate a single content file into its body content. Mirrors the eval
@@ -163,13 +167,13 @@ fn relayout<T: Output>(
     sink: &mut Sink,
     content: &Content,
     injected: &[LazyHash<Style>],
-    mut assets: Option<&mut AssetResolver>,
+    assets: &mut AssetResolver,
 ) -> SourceResult<T> {
     let library = world.library();
     let base = StyleChain::new(&library.styles);
     let target = TargetElem::target.set(T::target()).wrap();
-    // Constant across iterations (and constant-hashing) — build once.
-    let sink_style = assets.as_deref().map(|a| a.sink_style());
+    // Constant across iterations within one discovery generation — build once.
+    let sink_style = assets.sink_style();
     let empty_introspector = EmptyIntrospector;
 
     let mut history: Vec<T> = Vec::new();
@@ -182,15 +186,11 @@ fn relayout<T: Output>(
         // done link-by-link (each link must outlive the chain), so fold target
         // + injected + resolved-map + sink into one `Styles` and chain it once.
         // The resolved-map is rebuilt each iteration as the resolver drains.
-        let mut links: Vec<LazyHash<Style>> = Vec::with_capacity(injected.len() + 3);
+        let mut links: Vec<LazyHash<Style>> = Vec::with_capacity(injected.len() + 2);
         links.push(target.clone());
         links.extend(injected.iter().cloned());
-        if let Some(a) = assets.as_deref() {
-            links.push(a.map_style());
-        }
-        if let Some(ss) = &sink_style {
-            links.push(ss.clone());
-        }
+        links.push(assets.map_style());
+        links.push(sink_style.clone());
         let combined: Styles = links.into_iter().collect();
         let styles = base.chain(&combined);
 
@@ -214,10 +214,7 @@ fn relayout<T: Output>(
 
         // Drain discovered assets and process them off to the side; `settled`
         // is true when nothing new was resolved this round.
-        let assets_settled = match assets.as_deref_mut() {
-            Some(a) => a.drain_and_process(world)?,
-            None => true,
-        };
+        let assets_settled = assets.drain_and_process(world)?;
 
         if constraint.validate(document.introspector()) && assets_settled {
             sink.extend_from_sink(subsink);

@@ -31,7 +31,7 @@ use std::time::Instant;
 use notify::{EventKind, RecursiveMode, Watcher as _};
 use typst_kit::watcher::Watcher;
 
-use crate::asset::Emit;
+use crate::asset::{AssetResolver, Emit};
 use crate::project::TwylaContext;
 use crate::render::{OutputDoc, RenderError, RenderWorld, SiteOutput};
 
@@ -68,8 +68,13 @@ pub fn run(serve: Serve) -> io::Result<()> {
         }
     };
 
+    // The asset resolver persists across recompiles (its store seeds each
+    // compile's map; `revalidate` evicts changed sources). Lives here, moves
+    // into the watcher thread — the only place that compiles.
+    let mut resolver = AssetResolver::new(&serve.ctx);
+
     let warm_start = Instant::now();
-    let initial = world.lock().unwrap().compile_site();
+    let initial = world.lock().unwrap().compile_site(&mut resolver);
     match &initial {
         Ok(site) => eprintln!(
             "twyla serve: warmed {} doc(s), {} asset(s) in {:.1?}",
@@ -95,7 +100,7 @@ pub fn run(serve: Serve) -> io::Result<()> {
         let reload_clients = Arc::clone(&reload_clients);
         thread::Builder::new()
             .name("twyla-watcher".to_string())
-            .spawn(move || run_watcher(world, last_output, content_dir, reload_clients))
+            .spawn(move || run_watcher(world, last_output, content_dir, reload_clients, resolver))
             .map_err(io::Error::other)?;
     }
 
@@ -149,6 +154,7 @@ fn run_watcher(
     last_output: Arc<LastOutput>,
     content_dir: PathBuf,
     reload_clients: Arc<ReloadClients>,
+    mut resolver: AssetResolver,
 ) {
     let mut watcher = match Watcher::new(None) {
         Ok(w) => w,
@@ -165,12 +171,20 @@ fn run_watcher(
         // Subscribe to the latest dep set + always to `content/`
         // (non-recursive directory watch picks up create/delete of
         // top-level posts that weren't in the dep list).
-        let paths: Vec<PathBuf> = {
+        let mut paths: Vec<PathBuf> = {
             let mut w = world.lock().unwrap();
             let mut v: Vec<PathBuf> = w.dependencies().collect();
             v.push(content_dir.clone());
             v
         };
+        // Asset upstreams (e.g. sass `@import` partials) are read by twyla's
+        // own pass, not typst, so they're not in `world.dependencies()` — add
+        // them explicitly or an edit to a partial wouldn't trigger a recompile.
+        if let Ok(site) = &*last_output.lock().unwrap() {
+            for asset in &site.assets {
+                paths.extend(asset.upstream_paths().map(Path::to_path_buf));
+            }
+        }
         if let Err(e) = watcher.update(paths) {
             eprintln!("twyla serve: watcher update failed: {e}");
             return;
@@ -188,7 +202,7 @@ fn run_watcher(
             comemo::evict(10);
             let mut w = world.lock().unwrap();
             w.files.reset();
-            w.compile_site()
+            w.compile_site(&mut resolver)
         };
         let elapsed = start.elapsed();
         match &result {

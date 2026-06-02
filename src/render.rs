@@ -23,7 +23,7 @@ use typst_kit::fonts::FontStore;
 use typst_kit::packages::SystemPackages;
 use typst_library::Feature;
 
-use crate::asset::ResolvedAsset;
+use crate::asset::{AssetResolver, ResolvedAsset};
 use crate::compile::HarvestedDoc;
 use crate::project::TwylaContext;
 
@@ -81,6 +81,10 @@ pub struct SiteOutput {
     pub assets: Vec<ResolvedAsset>,
 }
 
+/// The full output of one compile: rendered pages, harvested per-page metadata,
+/// and processed assets — all from the single eval.
+type CompiledPages = (Vec<OutputDoc>, Vec<HarvestedDoc>, Vec<ResolvedAsset>);
+
 /// Compile every page under `<root>/content/` as a single bundle.
 ///
 /// One-shot wrapper: builds a fresh [`RenderWorld`], compiles, drops.
@@ -88,14 +92,14 @@ pub struct SiteOutput {
 /// the comemo cache survives between requests.
 pub fn render_site(ctx: &TwylaContext) -> Result<Vec<OutputDoc>, RenderError> {
     let world = RenderWorld::new(ctx)?;
-    world.compile_bundle()
+    world.compile_bundle(&mut AssetResolver::new(ctx))
 }
 
 /// Like [`render_site`] but also returns the processed assets — what `build`
 /// needs to emit `<dir>/assets/...` alongside the pages.
 pub fn render_site_with_assets(ctx: &TwylaContext) -> Result<SiteOutput, RenderError> {
     let world = RenderWorld::new(ctx)?;
-    world.compile_site()
+    world.compile_site(&mut AssetResolver::new(ctx))
 }
 
 /// Replace every `<script type="x-twyla-raw-html">..</script>` with its
@@ -216,14 +220,14 @@ impl RenderWorld {
     /// cache. Between compiles, call [`reset`](Self::reset) and
     /// `comemo::evict(..)` to invalidate; for content/ shape changes,
     /// also call [`refresh_main`](Self::refresh_main).
-    pub fn compile_bundle(&self) -> Result<Vec<OutputDoc>, RenderError> {
-        Ok(self.compile_bundle_with_meta()?.0)
+    pub fn compile_bundle(&self, resolver: &mut AssetResolver) -> Result<Vec<OutputDoc>, RenderError> {
+        Ok(self.compile_bundle_with_meta(resolver)?.0)
     }
 
     /// Compile both pages and assets — what `build`/`serve` emit. The assets
     /// come from the same single eval as the pages.
-    pub fn compile_site(&self) -> Result<SiteOutput, RenderError> {
-        let (docs, _harvested, assets) = self.compile_bundle_with_meta()?;
+    pub fn compile_site(&self, resolver: &mut AssetResolver) -> Result<SiteOutput, RenderError> {
+        let (docs, _harvested, assets) = self.compile_bundle_with_meta(resolver)?;
         Ok(SiteOutput { docs, assets })
     }
 
@@ -231,10 +235,17 @@ impl RenderWorld {
     /// per-page twyla `document` metadata and the processed [`ResolvedAsset`]s
     /// harvested/resolved during the *same* compile (one eval). Both come out
     /// of [`crate::compile::compile_bundle`].
+    ///
+    /// The `resolver` is caller-owned (not stored in the world): a one-shot
+    /// caller passes a fresh one; `serve` reuses one across recompiles so its
+    /// store persists. Passing it in keeps these methods `&self` — a field
+    /// would force interior mutability, since `self` is also handed to typst as
+    /// `&dyn World` for the duration of the compile.
     pub fn compile_bundle_with_meta(
         &self,
-    ) -> Result<(Vec<OutputDoc>, Vec<HarvestedDoc>, Vec<ResolvedAsset>), RenderError> {
-        let sources = self.ctx.scan_pages().map_err(|e| setup_err(e))?;
+        resolver: &mut AssetResolver,
+    ) -> Result<CompiledPages, RenderError> {
+        let sources = self.ctx.scan_pages().map_err(setup_err)?;
         let fileids: Vec<_> = sources
             .into_iter()
             .map(|path| {
@@ -245,7 +256,8 @@ impl RenderWorld {
                 ))
             })
             .collect();
-        let Warned { output, warnings } = crate::compile::compile_bundle(&self.ctx, self, &fileids);
+        let Warned { output, warnings } =
+            crate::compile::compile_bundle(&self.ctx, self, &fileids, resolver);
         for w in &warnings {
             eprintln!("warning: {}", w.message);
         }
