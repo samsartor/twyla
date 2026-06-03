@@ -1,3 +1,7 @@
+// See the same allow in `mod.rs`: `AssetSpec` is a content-hashed key whose
+// `Bytes` only *looks* interior-mutable to clippy (`Arc` refcount).
+#![allow(clippy::mutable_key_type)]
+
 use std::collections::HashMap;
 use std::time::Duration;
 

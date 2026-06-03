@@ -298,23 +298,61 @@ fn nested_section_routes_under_subdir() {
     );
 }
 
-/// Asset fingerprinting: an `asset-url(..)` primitive should emit images
-/// at content-hashed paths and rewrite references to match. Blocked on
-/// the asset-url primitive + resolution-pass registry.
+/// The native image rule: a plain `#image("pic.svg")` (no `#context`) emits a
+/// fingerprinted asset and rewrites `<img src>` to its base_url-prefixed URL —
+/// not upstream's base64 inline, not a verbatim path, not a leaked placeholder.
 #[test]
-#[ignore = "asset fingerprinting not implemented (no asset-url primitive yet)"]
 fn referenced_image_is_fingerprinted() {
-    let out = tempfile::tempdir().expect("tempdir");
-    build_run(Build {
-        ctx: ctx(),
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir(root.join("content")).unwrap();
+    // Bare markup (renders to index.html); the rule fires without `#context`.
+    std::fs::write(
+        root.join("content/main.typ"),
+        "#image(\"pic.svg\", alt: \"a red square\")",
+    )
+    .unwrap();
+    // A minimal valid SVG (usvg needs intrinsic size); path-source → File asset.
+    std::fs::write(
+        root.join("content/pic.svg"),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"4\">\
+         <rect width=\"4\" height=\"4\" fill=\"red\"/></svg>",
+    )
+    .unwrap();
+
+    let out = tempfile::tempdir().expect("out");
+    let ctx = TwylaContext::new(root, Some(BASE_URL.to_string())).expect("ctx");
+    let summary = build_run(Build {
+        ctx,
         output_dir: out.path().to_path_buf(),
     })
     .expect("build");
-    // Expect e.g. assets/diagram-demo.<hash>.svg rather than a verbatim copy.
-    let assets = out.path().join("assets");
+
+    assert_eq!(summary.assets, 1, "expected the image to be processed once");
+
+    // Emitted as a fingerprinted file: assets/pic-<hash>.svg.
+    let assets_dir = out.path().join("assets");
+    let files: Vec<_> = std::fs::read_dir(&assets_dir)
+        .expect("assets/ dir written")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
     assert!(
-        assets.is_dir(),
-        "no assets/ output dir — fingerprinting not wired"
+        files.iter().any(|f| f.starts_with("pic-") && f.ends_with(".svg")),
+        "no fingerprinted pic-*.svg emitted: {files:?}",
+    );
+
+    // <img src> points at that asset's base_url-prefixed URL; alt passes
+    // through; no base64 inline and no unresolved placeholder.
+    let html = std::fs::read_to_string(out.path().join("index.html")).expect("index.html");
+    assert!(
+        html.contains(&format!("{BASE_URL}/assets/pic-")) && html.contains(".svg\""),
+        "img src not rewritten to a fingerprinted asset URL:\n{html}",
+    );
+    assert!(html.contains("alt=\"a red square\""), "alt not passed through:\n{html}");
+    assert!(!html.contains("data:image"), "image was base64-inlined:\n{html}");
+    assert!(
+        !html.contains("__twyla-asset-pending__"),
+        "asset placeholder leaked (non-convergence):\n{html}",
     );
 }
 

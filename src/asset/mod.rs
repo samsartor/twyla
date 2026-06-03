@@ -29,7 +29,13 @@
 //!   `placeholder + send`, skipping the discovery `send` (a side effect inside
 //!   memoized code) and starving re-discovery.
 
+// `AssetSpec::Raw` carries `Bytes`, whose `Arc` refcount reads to clippy as
+// interior mutability — but the spec's `Hash`/`Eq` are purely content-based, so
+// it's a sound `HashMap` key (the same reason typst hashes `Bytes` freely).
+#![allow(clippy::mutable_key_type)]
+
 mod file;
+mod raw;
 mod sass;
 
 use std::collections::HashMap;
@@ -47,8 +53,8 @@ use ecow::EcoString;
 use typst::World;
 use typst::diag::{At, HintedStrResult, SourceResult};
 use typst::foundations::{
-    Binding, Bytes, Context, Module, PathOrStr, Repr, Scope, Str, Style, Value, elem, func, scope,
-    ty,
+    Binding, Bytes, Context, Module, PathOrStr, Repr, Scope, Str, Style, StyleChain, Value, elem,
+    func, scope, ty,
 };
 use typst::syntax::{FileId, Spanned};
 use typst::utils::LazyHash;
@@ -63,18 +69,34 @@ use crate::project::TwylaContext;
 /// What produces an asset's bytes — the cache/store key. An asset's output is
 /// a pure function of its spec, so this is what every map keys on.
 ///
-/// FileId-based on purpose: `FileId` is `Eq + Hash` (usable as a `HashMap`
-/// key), whereas typst's `Bytes`/`DataSource` are neither `Eq` nor `Ord`. When
-/// `asset.raw` lands we'll unify the source behind `loading::DataSource` and
-/// hand-impl `Eq` (it's a reflexive marker) to keep this keyable. Likely to
-/// grow into a trait once there are more variants; an enum for now.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+/// `File`/`Sass` are FileId-based on purpose: `FileId` is `Eq + Hash` (usable
+/// as a `HashMap` key). `Raw` instead carries `Bytes` directly — typst's
+/// `Bytes` is `Hash + PartialEq` but **not `Eq`**, so the derive of `Eq` is
+/// replaced by a hand-written marker impl (sound because `Bytes`' `PartialEq`
+/// is reflexive; see [`impl Eq`](#impl-Eq)). When the user-facing `asset.raw`
+/// lands we'll likely unify the on-disk variants behind `loading::DataSource`;
+/// likely to grow into a trait once there are more variants, an enum for now.
+#[derive(Clone, PartialEq, Hash, Debug)]
 pub enum AssetSpec {
     /// Copy a project file verbatim (fingerprinted). See [`file`].
     File { file: FileId },
     /// Compile a Sass/SCSS file to CSS. See [`sass`].
     Sass { file: FileId },
+    /// Emit in-memory bytes verbatim (fingerprinted), content-addressed by the
+    /// bytes themselves. Used today by the image rule for inline/byte-source
+    /// images that have no project `FileId`. See [`raw`].
+    Raw {
+        bytes: Bytes,
+        /// Output extension (drives the static server's Content-Type), sniffed
+        /// by the caller; `None` → `bin`.
+        ext: Option<EcoString>,
+    },
 }
+
+/// Marker `Eq` for the `Raw` variant's non-`Eq` `Bytes` field. Sound because
+/// every variant's `PartialEq` is reflexive (`Bytes` compares by content, so
+/// `b == b`), which is all `Eq` asserts beyond `PartialEq`.
+impl Eq for AssetSpec {}
 
 /// A spec plus its (future) output policy. The `output: auto | str | info => str`
 /// argument will live here; keeping the wrapper now makes adding it
@@ -119,26 +141,36 @@ impl Asset {
     /// ```
     #[func(contextual)]
     fn url(&self, context: Tracked<Context>) -> HintedStrResult<Str> {
-        let styles = context.styles()?;
-
-        // Tracked read: a hit here is what makes the page converge.
-        if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetMap::map)
-            && let Some(map) = dynamic.downcast::<ResolvedAssets>()
-            && let Some(url) = map.get(&self.request.spec)
-        {
-            return Ok(Str::from(url.as_str()));
-        }
-
-        // Miss: report the request on the write-only sink (its epoch is in the
-        // comemo key, the channel isn't) and return a placeholder. A later
-        // relayout iteration re-runs this against the populated map.
-        if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetSink::sink)
-            && let Some(sink) = dynamic.downcast::<AssetSink>()
-        {
-            let _ = sink.tx.send(self.request.clone());
-        }
-        Ok(Str::from(ASSET_PENDING))
+        Ok(resolve_or_request(context.styles()?, &self.request.spec))
     }
+}
+
+/// Resolve a spec's URL off the style chain, or request it. The placeholder
+/// protocol both `asset.*` consumers obey, in one place:
+///
+/// - **Hit** — the injected resolved-map ([`TwylaAssetMap`]) already has this
+///   spec's URL. This tracked read is what makes the page *converge*.
+/// - **Miss** — report the spec on the write-only discovery sink
+///   ([`TwylaAssetSink`]; its epoch is in the comemo key, the channel isn't)
+///   and return [`ASSET_PENDING`]. A later relayout iteration re-runs this
+///   against the now-populated map.
+///
+/// Shared by [`Asset::url`] (contextual, reads `context.styles()`) and the
+/// native image rule (reads the show rule's `styles` directly — no `#context`).
+pub(crate) fn resolve_or_request(styles: StyleChain, spec: &AssetSpec) -> Str {
+    if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetMap::map)
+        && let Some(map) = dynamic.downcast::<ResolvedAssets>()
+        && let Some(url) = map.get(spec)
+    {
+        return Str::from(url.as_str());
+    }
+
+    if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetSink::sink)
+        && let Some(sink) = dynamic.downcast::<AssetSink>()
+    {
+        let _ = sink.tx.send(AssetRequest { spec: spec.clone() });
+    }
+    Str::from(ASSET_PENDING)
 }
 
 impl Repr for Asset {
@@ -427,6 +459,7 @@ impl AssetResolver {
         let built = match spec {
             AssetSpec::File { file } => file::build(world, *file, &self.ctx)?,
             AssetSpec::Sass { file } => sass::build(world, *file, &self.ctx)?,
+            AssetSpec::Raw { bytes, ext } => raw::build(bytes.clone(), ext.clone()),
         };
 
         let output_path = self.ctx.default_asset_output(&built);
