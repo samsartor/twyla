@@ -2151,6 +2151,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulldown-cmark-to-cmark"
+version = "22.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50793def1b900256624a709439404384204a5dc3a6ec580281bfaac35e882e90"
+dependencies = [
+ "pulldown-cmark",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3010,6 +3019,7 @@ dependencies = [
  "markup5ever_rcdom",
  "notify",
  "pulldown-cmark",
+ "pulldown-cmark-to-cmark",
  "slug",
  "tempfile",
  "toml 0.9.12+spec-1.1.0",

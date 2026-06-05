@@ -73,7 +73,7 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
         findings: Vec::new(),
         message,
     })?;
-    let draft_findings = draft::ensure_drafts(&pages, opts.mode).map_err(|e| ConvertError {
+    let draft_findings = draft::ensure_drafts(ctx, &pages, opts.mode).map_err(|e| ConvertError {
         findings: Vec::new(),
         message: format!("writing drafts: {e}"),
     })?;

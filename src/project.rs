@@ -113,6 +113,30 @@ impl TwylaContext {
         }
     }
 
+    /// The default `kind` for a page, used when it doesn't set `document.kind`.
+    /// Drives both the harvested metadata (in [`crate::compile`]) and the
+    /// `convert` draft's `{kind}-template` import.
+    ///
+    /// Keyed on the *source* path (root- or content-relative `.typ`), because
+    /// the discriminator is the filename — `main.typ` is a directory index, a
+    /// leaf file is a page — which the output path (always `…/index.html`)
+    /// would erase:
+    /// - `content/main.typ` → `root` (the site index)
+    /// - `content/<dir>/main.typ` → `dir` (a section index)
+    /// - anything else → `page`
+    pub fn default_kind(&self, source: &str) -> String {
+        let rel = source.strip_prefix("content/").unwrap_or(source);
+        let path = Path::new(rel);
+        if path.file_stem().and_then(|s| s.to_str()) == Some("main") {
+            match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => "dir".to_string(),
+                _ => "root".to_string(),
+            }
+        } else {
+            "page".to_string()
+        }
+    }
+
     pub fn document_url(&self, output: &str) -> String {
         let path = match output.strip_suffix("index.html") {
             Some(rest) => rest,
@@ -255,6 +279,18 @@ mod tests {
             rels,
             vec!["guis-1.typ", "what-is-color/ai_cut.typ", "what-is-color/main.typ"],
         );
+    }
+
+    #[test]
+    fn default_kind_keys_on_source_filename() {
+        let ctx = TwylaContext {
+            root: PathBuf::from("/tmp"),
+            base_url: None,
+        };
+        assert_eq!(ctx.default_kind("content/main.typ"), "root");
+        assert_eq!(ctx.default_kind("content/what-is-color/main.typ"), "dir");
+        assert_eq!(ctx.default_kind("content/guis-1.typ"), "page");
+        assert_eq!(ctx.default_kind("content/what-is-color/ai_cut.typ"), "page");
     }
 
     #[test]

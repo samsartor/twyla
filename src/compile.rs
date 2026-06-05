@@ -319,11 +319,8 @@ fn harvest_metadata(
     }
     let output =
         output.unwrap_or_else(|| ctx.default_document_output(id.vpath().get_without_slash()));
-    let kind = kind.unwrap_or_else(|| match output.as_str() {
-        "index.html" => EcoString::inline("root"),
-        _ if output.ends_with("/index.html") => EcoString::inline("dir"),
-        _ => EcoString::inline("page"),
-    });
+    let kind =
+        kind.unwrap_or_else(|| EcoString::from(ctx.default_kind(id.vpath().get_without_slash())));
     let url = ctx.document_url(&output);
 
     Ok(HarvestedDoc {

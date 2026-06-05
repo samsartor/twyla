@@ -32,6 +32,9 @@ pub struct MappedPage {
     /// Zola's route as a manifest key, e.g. `guis-1/index.html`,
     /// `content-aware-tiles/index.html`, `index.html`.
     pub route: String,
+    /// The page kind (`root`/`dir`/`page`), derived from the output path —
+    /// selects the `{kind}-template` the draft shows.
+    pub kind: String,
     /// `Some(route)` when zola's route differs from twyla's default output for
     /// `typ_path`; the draft must `#set document(output: route)`.
     pub output_override: Option<String>,
@@ -121,10 +124,14 @@ fn map_page(ctx: &TwylaContext, content_dir: &Path, md_path: PathBuf) -> Result<
         Some(route.clone())
     };
 
+    // Kind follows the source filename (main.typ = index), not the route.
+    let kind = ctx.default_kind(&typ_rel_to_root.to_string_lossy());
+
     Ok(MappedPage {
         md_path,
         typ_path,
         route,
+        kind,
         output_override,
     })
 }
@@ -165,11 +172,13 @@ mod tests {
         let home = find(&pages, "_index.md");
         assert!(home.typ_path.ends_with("content/main.typ"));
         assert_eq!(home.route, "index.html");
+        assert_eq!(home.kind, "root");
         assert_eq!(home.output_override, None);
 
         let guis = find(&pages, "guis-1.md");
         assert!(guis.typ_path.ends_with("content/guis-1.typ"));
         assert_eq!(guis.route, "guis-1/index.html");
+        assert_eq!(guis.kind, "page");
         assert_eq!(guis.output_override, None);
 
         // Underscore stem: filename identity, route slugified, override set.
@@ -181,16 +190,18 @@ mod tests {
             Some("content-aware-tiles/index.html")
         );
 
-        // Page-bundle index → main.typ, no override.
+        // Page-bundle index → main.typ → `dir` kind, no override.
         let wic = find(&pages, "what-is-color/index.md");
         assert!(wic.typ_path.ends_with("content/what-is-color/main.typ"));
         assert_eq!(wic.route, "what-is-color/index.html");
+        assert_eq!(wic.kind, "dir");
         assert_eq!(wic.output_override, None);
 
-        // Nested non-index underscore: identity filename, slugified route + override.
+        // Nested non-index underscore: leaf `page`, slugified route + override.
         let ai = find(&pages, "what-is-color/ai_cut.md");
         assert!(ai.typ_path.ends_with("content/what-is-color/ai_cut.typ"));
         assert_eq!(ai.route, "what-is-color/ai-cut/index.html");
+        assert_eq!(ai.kind, "page");
         assert_eq!(
             ai.output_override.as_deref(),
             Some("what-is-color/ai-cut/index.html")

@@ -241,7 +241,7 @@ fn cmd_import(input: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match import_md(&src, None) {
+    match import_md(&src, "page", None) {
         Ok(out) => {
             print!("{out}");
             ExitCode::from(0)

@@ -55,10 +55,12 @@ pub struct TwylaDocument {
     pub description: Option<Content>,
 
     /// What kind of page this is, e.g. `"post"` or `"page"` — used to group
-    /// pages in listings and feeds. If `auto`, will be set to:
-    /// - "home" for `main.typ`
-    /// - "dir" for `*/main.typ`
-    /// - "page" for for all others
+    /// pages in listings and feeds, and to pick the `{kind}-template` a
+    /// `convert` draft shows. If `auto`, defaults from the source filename
+    /// ([`TwylaContext::default_kind`](crate::project::TwylaContext::default_kind)):
+    /// - "root" for `content/main.typ` (the site index)
+    /// - "dir" for `content/<dir>/main.typ` (a section index)
+    /// - "page" for any other file
     pub kind: Smart<EcoString>,
 
     /// Arbitrary extra data for your own use. Available as `document.extra`

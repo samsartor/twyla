@@ -53,6 +53,7 @@ grass = { version = "0.13", default-features = false }
 # `id="my-heading"` matches zola's auto-anchors byte-for-byte (including
 # unicode transliteration). Used by the native heading HTML rule.
 slug = "0.1"
+pulldown-cmark-to-cmark = "22.0.0"
 
 [dev-dependencies]
 # Scratch output dir for the `twyla build` integration test (tests/site.rs).
