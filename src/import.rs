@@ -59,6 +59,9 @@ struct Meta {
     description: String,
     date: Option<(i64, u8, u8)>,
     draft: bool,
+    /// The frontmatter `[extra]` table, carried verbatim onto
+    /// `#set document(extra: ..)`. `None` when absent or empty.
+    extra: Option<toml::value::Table>,
 }
 
 fn split_frontmatter(input: &str) -> Result<(&str, &str), String> {
@@ -104,12 +107,75 @@ fn parse_frontmatter(fm: &str) -> Result<Meta, String> {
         Some((y, m, d))
     });
     let draft = val.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
+    let extra = val
+        .get("extra")
+        .and_then(|v| v.as_table())
+        .filter(|t| !t.is_empty())
+        .cloned();
     Ok(Meta {
         title,
         description,
         date,
         draft,
+        extra,
     })
+}
+
+/// Render a TOML value as a typst value literal. Tables become typst
+/// dictionaries (`(key: val)`), arrays become typst arrays, scalars map
+/// directly; TOML datetimes are emitted as strings (a draft author can promote
+/// them to `datetime(..)` if they want). `indent` is the nesting depth — the
+/// level the value's *closing* delimiter sits at; children indent one deeper.
+fn toml_to_typst(v: &toml::Value, indent: usize) -> String {
+    let pad = "  ".repeat(indent);
+    let pad1 = "  ".repeat(indent + 1);
+    match v {
+        toml::Value::String(s) => format!("\"{}\"", ir::escape_typst_string(s)),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Datetime(dt) => format!("\"{dt}\""),
+        toml::Value::Array(arr) if arr.is_empty() => "()".to_string(),
+        toml::Value::Array(arr) => {
+            // Inline arrays of scalars; break arrays that nest.
+            let nested = arr
+                .iter()
+                .any(|x| matches!(x, toml::Value::Array(_) | toml::Value::Table(_)));
+            if !nested {
+                let items: Vec<_> = arr.iter().map(|x| toml_to_typst(x, indent)).collect();
+                // A one-element typst array needs a trailing comma: `(x,)`.
+                let trailing = if items.len() == 1 { "," } else { "" };
+                format!("({}{trailing})", items.join(", "))
+            } else {
+                let items: Vec<_> = arr
+                    .iter()
+                    .map(|x| format!("{pad1}{}", toml_to_typst(x, indent + 1)))
+                    .collect();
+                format!("(\n{},\n{pad})", items.join(",\n"))
+            }
+        }
+        toml::Value::Table(t) if t.is_empty() => "(:)".to_string(),
+        toml::Value::Table(t) => {
+            let items: Vec<_> = t
+                .iter()
+                .map(|(k, val)| format!("{pad1}{}: {}", typst_dict_key(k), toml_to_typst(val, indent + 1)))
+                .collect();
+            format!("(\n{},\n{pad})", items.join(",\n"))
+        }
+    }
+}
+
+/// A dictionary key as typst source: a bare identifier when it is one, else a
+/// quoted string key (typst dicts accept both).
+fn typst_dict_key(k: &str) -> String {
+    let is_ident = !k.is_empty()
+        && k.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if is_ident {
+        k.to_string()
+    } else {
+        format!("\"{}\"", ir::escape_typst_string(k))
+    }
 }
 
 // ---- shortcode preprocessing --------------------------------------------
@@ -853,6 +919,11 @@ fn assemble(meta: &Meta, body: &str, kind: &str, output: Option<&str>) -> String
         // Zola's route diverges from twyla's filename default — pin it.
         writeln!(out, "  output: \"{}\",", esc(output)).unwrap();
     }
+    if let Some(extra) = &meta.extra {
+        // Carry the frontmatter `[extra]` table onto the document verbatim.
+        let dict = toml_to_typst(&toml::Value::Table(extra.clone()), 1);
+        writeln!(out, "  extra: {dict},").unwrap();
+    }
     writeln!(out, ")").unwrap();
     writeln!(out, "#show: {kind}-template").unwrap();
     writeln!(out).unwrap();
@@ -880,6 +951,27 @@ mod tests {
         let (fm, b) = split_frontmatter(src).unwrap();
         assert_eq!(fm, "title = \"Hi\"");
         assert_eq!(b, "body\n");
+    }
+
+    #[test]
+    fn extra_table_carried_onto_document() {
+        let src = "+++\ntitle = \"T\"\n[extra]\nfeatured = true\ntags = [\"a\", \"b\"]\n\
+                   weight = 2\n\"odd key\" = \"v\"\n[extra.nested]\nx = 1\n+++\nbody\n";
+        let out = import_md(src, "page", None).unwrap();
+        assert!(out.contains("extra: ("), "got: {out}");
+        assert!(out.contains("featured: true"), "got: {out}");
+        assert!(out.contains("tags: (\"a\", \"b\")"), "got: {out}");
+        assert!(out.contains("weight: 2"), "got: {out}");
+        assert!(out.contains("\"odd key\": \"v\""), "got: {out}");
+        assert!(out.contains("nested: (") && out.contains("x: 1"), "got: {out}");
+    }
+
+    #[test]
+    fn no_extra_field_when_absent_or_empty() {
+        let absent = import_md("+++\ntitle = \"T\"\n+++\nbody\n", "page", None).unwrap();
+        assert!(!absent.contains("extra:"), "got: {absent}");
+        let empty = import_md("+++\ntitle = \"T\"\n[extra]\n+++\nbody\n", "page", None).unwrap();
+        assert!(!empty.contains("extra:"), "got: {empty}");
     }
 
     #[test]
