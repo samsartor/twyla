@@ -149,10 +149,11 @@ fn paint(s: &str, sev: Severity, color: bool) -> String {
     if !color {
         return s.to_string();
     }
-    let code = match sev {
-        Severity::Info => "32",  // green
-        Severity::Warn => "33",  // yellow
-        Severity::Fail => "31",  // red
+    use owo_colors::{OwoColorize, Style};
+    let style = match sev {
+        Severity::Info => Style::new().green(),
+        Severity::Warn => Style::new().yellow(),
+        Severity::Fail => Style::new().red().bold(),
     };
-    format!("\x1b[{code}m{s}\x1b[0m")
+    s.style(style).to_string()
 }

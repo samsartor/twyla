@@ -60,6 +60,12 @@ unscanny = "0.1.0"
 # error page, so the browser shows the same colored output as the terminal.
 ansi-to-html = "0.2"
 
+# Terminal styling for twyla's own CLI output (serve logs, convert report).
+# Inline `.green()`-style API; `supports-colors` auto-disables off-tty and
+# under NO_COLOR. (Diagnostics use typst-kit/termcolor; this is everything we
+# print ourselves.)
+owo-colors = { version = "4", features = ["supports-colors"] }
+
 [dev-dependencies]
 # Scratch output dir for the `twyla build` integration test (tests/site.rs).
 tempfile = "3"

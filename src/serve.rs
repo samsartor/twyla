@@ -26,14 +26,41 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecursiveMode, Watcher as _};
 use typst_kit::watcher::Watcher;
 
+use owo_colors::{AnsiColors, OwoColorize, Stream, Style};
+
 use crate::asset::{AssetResolver, Emit};
 use crate::project::TwylaContext;
 use crate::render::{OutputDoc, RenderError, RenderWorld, SiteOutput};
+
+/// All of serve's own logging goes to stderr; color follows that stream's tty.
+const OUT: Stream = Stream::Stderr;
+
+/// Color an HTTP status code by class: 2xx green, 3xx cyan, 4xx yellow, else red.
+fn status_color(status: u16) -> AnsiColors {
+    match status / 100 {
+        2 => AnsiColors::Green,
+        3 => AnsiColors::Cyan,
+        4 => AnsiColors::Yellow,
+        _ => AnsiColors::Red,
+    }
+}
+
+/// One aligned request-log line: status colored by class, then the method and
+/// path, then a dimmed trailing detail (the timing, or a note).
+fn log_request(status: u16, method: &str, path: &str, detail: &str) {
+    let code = format!("{status:>3}");
+    let req = format!("{method} {path}");
+    eprintln!(
+        "  {}  {req:<34}{}",
+        code.if_supports_color(OUT, |s| s.style(Style::new().color(status_color(status)).bold())),
+        detail.if_supports_color(OUT, |s| s.dimmed()),
+    );
+}
 
 pub struct Serve {
     pub ctx: TwylaContext,
@@ -55,6 +82,54 @@ struct ServeState {
     reload_clients: Arc<ReloadClients>,
 }
 
+/// The startup banner: the URL, the site root, and the warm-up result.
+fn print_banner(
+    local: SocketAddr,
+    root: &Path,
+    initial: &Result<SiteOutput, RenderError>,
+    elapsed: Duration,
+) {
+    // Show the root relative to the cwd when possible — `test_site/` reads
+    // better than an absolute path. The zero-flag `serve` runs in the site
+    // root, where that relative path is empty, so fall back to `.`.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let root = root.strip_prefix(&cwd).unwrap_or(root);
+    let root = match root.to_str() {
+        Some("") => ".".to_string(),
+        _ => format!("{}/", root.display()),
+    };
+
+    let mark = "▲"
+        .if_supports_color(OUT, |s| s.style(Style::new().cyan().bold()))
+        .to_string();
+    let arrow = "→".if_supports_color(OUT, |s| s.dimmed()).to_string();
+    let url = format!("http://{local}/")
+        .if_supports_color(OUT, |s| s.cyan())
+        .to_string();
+
+    eprintln!();
+    eprintln!("  {mark} {}", "twyla serve".if_supports_color(OUT, |s| s.bold()));
+    eprintln!();
+    eprintln!("  {arrow}  Local:  {url}");
+    eprintln!("  {arrow}  Root:   {root}");
+    match initial {
+        Ok(site) => eprintln!(
+            "  {}  ready in {elapsed:.1?} ({} pages, {} assets)",
+            "✓".if_supports_color(OUT, |s| s.style(Style::new().green().bold())),
+            site.docs.len(),
+            site.assets.len(),
+        ),
+        Err(e) => {
+            eprintln!(
+                "  {}  initial compile failed in {elapsed:.1?} — the browser will show the error",
+                "✗".if_supports_color(OUT, |s| s.style(Style::new().red().bold())),
+            );
+            eprintln!("\n{e}");
+        }
+    }
+    eprintln!();
+}
+
 pub fn run(serve: Serve) -> io::Result<()> {
     // Build the persistent world and run the warm-up compile on the
     // foreground thread. Doing it before bind means a startup error is
@@ -63,10 +138,20 @@ pub fn run(serve: Serve) -> io::Result<()> {
     let world = match RenderWorld::new(&serve.ctx) {
         Ok(w) => Arc::new(Mutex::new(w)),
         Err(e) => {
-            eprintln!("twyla serve: setup failed:\n{e}");
+            eprintln!(
+                "  {} setup failed",
+                "✗".if_supports_color(OUT, |s| s.style(Style::new().red().bold()))
+            );
+            eprintln!("{e}");
             return Err(io::Error::other("setup failed"));
         }
     };
+
+    // Bind before the warm-up so the banner can show the URL next to the
+    // compile result. Binding only reserves the port; we don't accept until
+    // the loop below, so the warm cache is still ready before any request.
+    let listener = TcpListener::bind(serve.addr)?;
+    let local = listener.local_addr()?;
 
     // The asset resolver persists across recompiles (its store seeds each
     // compile's map; `revalidate` evicts changed sources). Lives here, moves
@@ -75,18 +160,8 @@ pub fn run(serve: Serve) -> io::Result<()> {
 
     let warm_start = Instant::now();
     let initial = world.lock().unwrap().compile_site(&mut resolver);
-    match &initial {
-        Ok(site) => eprintln!(
-            "twyla serve: warmed {} doc(s), {} asset(s) in {:.1?}",
-            site.docs.len(),
-            site.assets.len(),
-            warm_start.elapsed(),
-        ),
-        Err(e) => eprintln!(
-            "twyla serve: initial compile errored — continuing; the \
-             error page will surface in the browser on first request:\n{e}",
-        ),
-    }
+    print_banner(local, &serve.ctx.root, &initial, warm_start.elapsed());
+
     let last_output: Arc<LastOutput> = Arc::new(Mutex::new(initial));
     let reload_clients: Arc<ReloadClients> = Arc::new(Mutex::new(Vec::new()));
 
@@ -116,14 +191,6 @@ pub fn run(serve: Serve) -> io::Result<()> {
             .map_err(io::Error::other)?;
     }
 
-    let listener = TcpListener::bind(serve.addr)?;
-    let local = listener.local_addr()?;
-    eprintln!(
-        "twyla serve: http://{}  (site root: {})",
-        local,
-        serve.ctx.root.display(),
-    );
-
     let state = ServeState {
         ctx: serve.ctx,
         last_output,
@@ -134,12 +201,12 @@ pub fn run(serve: Serve) -> io::Result<()> {
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("accept error: {e}");
+                eprintln!("  {}", format!("accept error: {e}").if_supports_color(OUT, |s| s.red()));
                 continue;
             }
         };
         if let Err(e) = handle(&state, stream) {
-            eprintln!("connection error: {e}");
+            eprintln!("  {}", format!("connection error: {e}").if_supports_color(OUT, |s| s.red()));
         }
     }
     Ok(())
@@ -186,11 +253,11 @@ fn run_watcher(
             }
         }
         if let Err(e) = watcher.update(paths) {
-            eprintln!("twyla serve: watcher update failed: {e}");
+            eprintln!("  {}", format!("watcher update failed: {e}").if_supports_color(OUT, |s| s.red()));
             return;
         }
         if let Err(e) = watcher.wait() {
-            eprintln!("twyla serve: watcher wait failed: {e}");
+            eprintln!("  {}", format!("watcher wait failed: {e}").if_supports_color(OUT, |s| s.red()));
             return;
         }
 
@@ -207,14 +274,14 @@ fn run_watcher(
         let elapsed = start.elapsed();
         match &result {
             Ok(site) => eprintln!(
-                "twyla serve: recompiled {} doc(s), {} asset(s) in {:.1?}",
+                "  {}  rebuilt in {elapsed:.1?} ({} pages, {} assets)",
+                "✓".if_supports_color(OUT, |s| s.style(Style::new().green().bold())),
                 site.docs.len(),
                 site.assets.len(),
-                elapsed,
             ),
             Err(e) => eprintln!(
-                "twyla serve: recompile errored (after {:.1?}):\n{e}",
-                elapsed,
+                "  {}  rebuild failed in {elapsed:.1?}\n{e}",
+                "✗".if_supports_color(OUT, |s| s.style(Style::new().red().bold())),
             ),
         }
         *last_output.lock().unwrap() = result;
@@ -240,19 +307,19 @@ fn run_static_watcher(static_dir: PathBuf, reload_clients: Arc<ReloadClients>) {
     let mut watcher = match notify::recommended_watcher(tx) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!(
-                "twyla serve: static watcher unavailable ({e}); \
-                 static asset edits won't hot-reload."
+            let msg = format!(
+                "static watcher unavailable ({e}); static asset edits won't hot-reload."
             );
+            eprintln!("  {}", msg.if_supports_color(OUT, |s| s.yellow()));
             return;
         }
     };
     if let Err(e) = watcher.watch(&static_dir, RecursiveMode::Recursive) {
-        eprintln!(
-            "twyla serve: cannot watch {} ({e}); \
-             static asset edits won't hot-reload.",
+        let msg = format!(
+            "cannot watch {} ({e}); static asset edits won't hot-reload.",
             static_dir.display(),
         );
+        eprintln!("  {}", msg.if_supports_color(OUT, |s| s.yellow()));
         return;
     }
 
@@ -261,7 +328,7 @@ fn run_static_watcher(static_dir: PathBuf, reload_clients: Arc<ReloadClients>) {
         let event = match res {
             Ok(ev) => ev,
             Err(e) => {
-                eprintln!("twyla serve: static watch error: {e}");
+                eprintln!("  {}", format!("static watch error: {e}").if_supports_color(OUT, |s| s.red()));
                 continue;
             }
         };
@@ -277,7 +344,11 @@ fn run_static_watcher(static_dir: PathBuf, reload_clients: Arc<ReloadClients>) {
             // `<link>`/`<img>` URLs, so a `base_url`/version prefix on the
             // page is tolerated.
             let url = format!("/{}", rel.to_string_lossy().replace('\\', "/"));
-            eprintln!("twyla serve: static asset changed → {url}");
+            eprintln!(
+                "  {}  {url}  {}",
+                "↻".if_supports_color(OUT, |s| s.cyan()),
+                "(static reload)".if_supports_color(OUT, |s| s.dimmed()),
+            );
             broadcast(&reload_clients, &format!("asset:{url}"));
         }
     }
@@ -321,7 +392,7 @@ fn handle(state: &ServeState, mut stream: TcpStream) -> io::Result<()> {
         inject_reload_script(&mut response.body);
     }
     let elapsed = start.elapsed();
-    eprintln!("{method:>4} {path} → {} ({elapsed:.0?})", response.status);
+    log_request(response.status, &method, &path, &format!("{elapsed:.0?}"));
 
     write_response(&mut stream, &response)
 }
@@ -343,7 +414,7 @@ fn accept_reload_client(state: &ServeState, mut stream: TcpStream) -> io::Result
          retry: 1000\n\n",
     )?;
     stream.flush()?;
-    eprintln!(" GET /__twyla/reload → 200 (reload client connected)");
+    log_request(200, "GET", "/__twyla/reload", "reload client connected");
     state.reload_clients.lock().unwrap().push(stream);
     Ok(())
 }
