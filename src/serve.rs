@@ -529,15 +529,29 @@ fn serve_doc(state: &ServeState, bundle_path: &Path) -> Response {
                 }
             }
         },
-        Err(e) => {
-            let body = format!(
-                "<!doctype html><html><body><h1>twyla: render error</h1>\
-                 <pre style=\"white-space:pre-wrap\">{}</pre></body></html>",
-                html_escape(&e.to_string()),
-            );
-            Response::html(500, body)
-        }
+        Err(e) => Response::html(500, error_page(e.html())),
     }
+}
+
+/// Wrap a rendered diagnostic block (HTML from `ansi-to-html`) in a dark error
+/// page. `ansi-to-html` emits ANSI 4-bit colors as `var(--name, fallback)`, so
+/// the `--*` palette below retunes typst's colors for a dark background —
+/// otherwise the default `#00a` blue / `#a00` red are unreadable on dark grey.
+fn error_page(diagnostic_html: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><style>\
+         body{{background:#1e1e1e;color:#d4d4d4;font-family:ui-monospace,monospace;\
+         margin:0;padding:1.5rem 2rem;line-height:1.5;\
+         --black:#5c6370;--red:#e06c75;--green:#98c379;--yellow:#e5c07b;\
+         --blue:#61afef;--magenta:#c678dd;--cyan:#56b6c2;--white:#abb2bf;\
+         --bright-black:#7f848e;--bright-red:#ff7b86;--bright-green:#b5e890;\
+         --bright-yellow:#ffd596;--bright-blue:#80c4ff;--bright-magenta:#d790ee;\
+         --bright-cyan:#6fd3df;--bright-white:#ffffff}}\
+         h1{{font-size:1rem;font-weight:600;color:#ff7b86;margin:0 0 1rem}}\
+         pre{{white-space:pre-wrap;margin:0;font:inherit}}\
+         </style></head>\
+         <body><h1>twyla: render error</h1><pre>{diagnostic_html}</pre></body></html>",
+    )
 }
 
 /// Plain-list index of available slugs, served at `/` when no

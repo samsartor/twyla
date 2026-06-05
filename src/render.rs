@@ -17,6 +17,8 @@ use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
 use typst_bundle::{BundleDocument, BundleFile};
+use typst_kit::diagnostics::termcolor::{Buffer, ColorChoice, StandardStream};
+use typst_kit::diagnostics::{self, DiagnosticFormat, DiagnosticWorld};
 use typst_kit::downloader::SystemDownloader;
 use typst_kit::files::{FileLoader, FileStore};
 use typst_kit::fonts::FontStore;
@@ -33,10 +35,24 @@ use crate::project::TwylaContext;
 /// inlined.
 const RAW_HTML_MARKER: &str = r#"<script type="x-twyla-raw-html">"#;
 
-/// Pre-formatted errors. Caller prints these on stderr and exits.
+/// A pre-rendered render/compile failure.
+///
+/// Compile failures are formatted through typst-kit's diagnostic emitter
+/// (the same one `typst-cli` uses): colored source snippets, carets, and
+/// hints. Because the emitter borrows the [`World`] to look up source files,
+/// the rendering happens *here*, at the failure site, while the world is
+/// still alive — the dev server, which holds the error long after the world
+/// is dropped, can't render it lazily.
+///
+/// Two renderings are kept: [`term`](Self::term) (what [`Display`] yields, so
+/// any caller that prints the error gets the rich block, colored when stderr
+/// is a tty) and [`html`](Self::html) (for the dev server's error page).
 #[derive(Debug)]
 pub struct RenderError {
-    pub messages: Vec<String>,
+    /// Terminal-ready block returned by [`Display`]. Colored when appropriate.
+    term: String,
+    /// Browser-ready HTML block for the dev server's error page.
+    html: String,
     pub kind: RenderErrorKind,
 }
 
@@ -44,21 +60,22 @@ pub struct RenderError {
 pub enum RenderErrorKind {
     /// World setup, project layout, or path resolution failed.
     Setup,
-    /// Typst compilation failed. `messages` holds the diagnostics.
+    /// Typst compilation failed.
     Compile,
     /// The bundle didn't contain the expected HTML documents.
     Bundle,
 }
 
+impl RenderError {
+    /// The error rendered as an HTML block, for the dev server error page.
+    pub fn html(&self) -> &str {
+        &self.html
+    }
+}
+
 impl fmt::Display for RenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, m) in self.messages.iter().enumerate() {
-            if i > 0 {
-                writeln!(f)?;
-            }
-            write!(f, "{m}")?;
-        }
-        Ok(())
+        f.write_str(self.term.trim_end())
     }
 }
 
@@ -125,11 +142,78 @@ pub fn resolve_raw_html_placeholders(input: &str) -> String {
     out
 }
 
-fn setup_err(msg: impl Into<String>) -> RenderError {
+/// A render failure with no source span (setup/layout/bundle problems). The
+/// message is shown verbatim — there's no snippet to draw.
+fn plain_err(msg: impl Into<String>, kind: RenderErrorKind) -> RenderError {
+    let msg = msg.into();
+    let html = to_html(&msg);
     RenderError {
-        messages: vec![msg.into()],
-        kind: RenderErrorKind::Setup,
+        term: format!("error: {msg}"),
+        html,
+        kind,
     }
+}
+
+fn setup_err(msg: impl Into<String>) -> RenderError {
+    plain_err(msg, RenderErrorKind::Setup)
+}
+
+/// Whether to colorize terminal diagnostics: only when stderr is a tty and
+/// `NO_COLOR` is unset (matches `twyla convert`'s color rule).
+fn terminal_color() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// Render diagnostics to a string via typst-kit's emitter. With `color`, the
+/// string carries ANSI escapes; otherwise it's plain text. Emitting into an
+/// in-memory buffer only fails on encoding errors, which we don't expect.
+fn emit_to_string(
+    world: &dyn DiagnosticWorld,
+    diags: &[SourceDiagnostic],
+    color: bool,
+) -> String {
+    let mut buf = if color { Buffer::ansi() } else { Buffer::no_color() };
+    let _ = diagnostics::emit(&mut buf, world, diags, DiagnosticFormat::Human);
+    String::from_utf8_lossy(&buf.into_inner()).into_owned()
+}
+
+/// Convert an ANSI (or plain) string to an HTML block for the dev server. The
+/// crate escapes HTML entities; on the rare conversion failure, fall back to
+/// the raw text (browsers render unknown escapes harmlessly).
+fn to_html(s: &str) -> String {
+    ansi_to_html::convert(s).unwrap_or_else(|_| s.to_string())
+}
+
+/// Build a [`RenderError`] from typst compile diagnostics, rendering the rich
+/// (colored) block now while the `world` is still alive — see [`RenderError`].
+fn compile_err(world: &dyn DiagnosticWorld, errors: &[SourceDiagnostic]) -> RenderError {
+    let ansi = emit_to_string(world, errors, true);
+    let term = if terminal_color() {
+        ansi.clone()
+    } else {
+        emit_to_string(world, errors, false)
+    };
+    RenderError {
+        html: to_html(&ansi),
+        term,
+        kind: RenderErrorKind::Compile,
+    }
+}
+
+/// Emit compile warnings to stderr through the same pretty emitter. Warnings
+/// don't block rendering, so they only go to the terminal (not the browser).
+fn emit_warnings(world: &dyn DiagnosticWorld, warnings: &[SourceDiagnostic]) {
+    if warnings.is_empty() {
+        return;
+    }
+    let choice = if terminal_color() {
+        ColorChoice::Always
+    } else {
+        ColorChoice::Never
+    };
+    let mut stream = StandardStream::stderr(choice);
+    let _ = diagnostics::emit(&mut stream, world, warnings, DiagnosticFormat::Human);
 }
 
 /// Long-lived typst compile state.
@@ -257,14 +341,10 @@ impl RenderWorld {
             .collect();
         let Warned { output, warnings } =
             crate::compile::compile_bundle(&self.ctx, self, &fileids, resolver);
-        for w in &warnings {
-            eprintln!("warning: {}", w.message);
-        }
+        emit_warnings(self, &warnings);
 
-        let (bundle, harvested, assets) = output.map_err(|errors| RenderError {
-            messages: errors.iter().map(|e| format_diagnostic(self, e)).collect(),
-            kind: RenderErrorKind::Compile,
-        })?;
+        let (bundle, harvested, assets) =
+            output.map_err(|errors| compile_err(self, &errors))?;
 
         let mut docs = Vec::new();
         for (path, file) in bundle.files.iter() {
@@ -272,10 +352,7 @@ impl RenderWorld {
                 BundleFile::Document(BundleDocument::Html(doc)) => doc,
                 _ => continue,
             };
-            let raw = typst_html::html(doc).map_err(|errors| RenderError {
-                messages: errors.iter().map(|e| format_diagnostic(self, e)).collect(),
-                kind: RenderErrorKind::Compile,
-            })?;
+            let raw = typst_html::html(doc).map_err(|errors| compile_err(self, &errors))?;
             docs.push(OutputDoc {
                 path: PathBuf::from(path.get_without_slash()),
                 html: resolve_raw_html_placeholders(&raw),
@@ -283,10 +360,10 @@ impl RenderWorld {
         }
 
         if docs.is_empty() {
-            return Err(RenderError {
-                messages: vec!["bundle produced no HTML documents".to_string()],
-                kind: RenderErrorKind::Bundle,
-            });
+            return Err(plain_err(
+                "bundle produced no HTML documents",
+                RenderErrorKind::Bundle,
+            ));
         }
 
         docs.sort_by(|a, b| a.path.cmp(&b.path));
@@ -344,27 +421,16 @@ impl FileLoader for TwylaLoader {
     }
 }
 
-/// Format a typst diagnostic with the file path and line/col of the
-/// reported span — the default `e.message` omits both, which makes the
-/// "expected string, found content" kind of message hard to act on.
-fn format_diagnostic(world: &dyn World, e: &SourceDiagnostic) -> String {
-    let span = e.span;
-    let Some(id) = span.id() else {
-        return format!("error: {}", e.message);
-    };
-    let Ok(src) = world.source(id) else {
-        return format!("error: {}", e.message);
-    };
-    let Some(range) = src.range(span) else {
-        return format!("error: {}", e.message);
-    };
-    // line/col of the start of the range.
-    let (line, col) = src
-        .lines()
-        .byte_to_line_column(range.start)
-        .unwrap_or((0, 0));
-    let path = id.vpath().get_without_slash();
-    format!("error: {} ({}:{}:{})", e.message, path, line + 1, col + 1)
+/// Names files for diagnostic snippets. Project files show as their root-
+/// relative path; package files are prefixed with the package spec.
+impl DiagnosticWorld for RenderWorld {
+    fn name(&self, id: FileId) -> String {
+        let vpath = id.vpath().get_without_slash();
+        match id.root() {
+            VirtualRoot::Project => vpath.to_string(),
+            VirtualRoot::Package(spec) => format!("{spec}/{vpath}"),
+        }
+    }
 }
 
 impl World for RenderWorld {

@@ -212,7 +212,9 @@ fn cmd_build(args: ContextArgs, output_dir: Option<PathBuf>) -> ExitCode {
             ExitCode::from(0)
         }
         Err(e) => {
-            eprintln!("build error: {e}");
+            // `e` is already a self-describing `error: …` block (typst's rich
+            // diagnostics for compile failures); no redundant prefix.
+            eprintln!("{e}");
             ExitCode::from(1)
         }
     }

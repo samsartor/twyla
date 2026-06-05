@@ -16,7 +16,7 @@ typst-bundle = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6a
 # directly, hence a direct dep at the same pinned rev.
 typst-eval = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
 typst-html = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
-typst-kit = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070", default-features = false, features = ["scan-fonts", "embedded-fonts", "watcher", "system-packages", "system-downloader"] }
+typst-kit = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070", default-features = false, features = ["scan-fonts", "embedded-fonts", "watcher", "system-packages", "system-downloader", "emit-diagnostics"] }
 typst-library = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
 # Referenced by the `#[func]` macro expansion (`typst_utils::Static`); a
 # direct dep so twyla can define native typst builtins. Same pinned rev.
@@ -55,6 +55,10 @@ grass = { version = "0.13", default-features = false }
 slug = "0.1"
 pulldown-cmark-to-cmark = "22.0.0"
 unscanny = "0.1.0"
+
+# Render typst-kit's ANSI diagnostics into HTML for the dev server's in-browser
+# error page, so the browser shows the same colored output as the terminal.
+ansi-to-html = "0.2"
 
 [dev-dependencies]
 # Scratch output dir for the `twyla build` integration test (tests/site.rs).
