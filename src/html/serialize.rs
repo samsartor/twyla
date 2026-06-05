@@ -2,15 +2,14 @@
 //!
 //! Counterpart to `parse_html`. The roundtrip
 //! `parse_html → serialize → parse_html` is idempotent, since both ends
-//! apply the same normalization rules. That's what makes
-//! `twyla-extract | twyla-diff` work: the extracted fragment can be
+//! apply the same normalization rules: an extracted fragment can be
 //! re-parsed and compared without losing meaning.
 //!
 //! This is not a faithful HTML producer; it doesn't preserve original
 //! whitespace, attribute order, or comments. Use it for diffing flows
 //! only, not for serving HTML to browsers.
 
-use crate::diff::{Element, Node};
+use crate::html::{Element, Node};
 
 /// Serialize a sequence of nodes (e.g. a fragment) as HTML.
 pub fn serialize_fragment(nodes: &[Node]) -> String {
@@ -137,7 +136,7 @@ fn is_raw_text(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::parse::parse_html;
+    use crate::html::parse::parse_html;
 
     fn roundtrip(s: &str) -> String {
         serialize(&parse_html(s))

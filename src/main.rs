@@ -12,22 +12,25 @@
 //!
 //! Porting harness:
 //!
-//! - `twyla render <slug>` — compile a single page.
-//! - `twyla check  <slug>` — render + diff against
-//!   `<root>/public/<slug>/index.html` under the porting relaxations.
-//!   Requires `--base-url` (or `TWYLA_BASE_URL`) for the
-//!   anchor-link rewrite.
-//! - `twyla diff <expected> <actual>` — structural AST diff.
-//! - `twyla import <md>` — md→typ draft generator.
+//! - `twyla convert --from zola` — discover markdown, generate the missing
+//!   typst neighbours, compile the whole site, and diff + link-audit it against
+//!   the zola ground truth (`public/`). `--verify` is the read-only gate;
+//!   `--only <slug>` scopes to one page. Requires `--base-url` (or
+//!   `TWYLA_BASE_URL`) for the link audit and anchor-link rewrite.
+//! - `twyla diff <expected> <actual>` — structural AST diff (primitive).
+//! - `twyla import <md>` — md→typ draft generator (primitive).
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use twyla::build::{Build, run as build_run};
-use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff, parse_html};
+use twyla::convert::{self, ConvertMode, ConvertOptions};
+use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff};
+use twyla::html::parse_html;
 use twyla::import::import_md;
 use twyla::project::TwylaContext;
 use twyla::serve::{Serve, run as serve_run};
@@ -110,25 +113,44 @@ enum Cmd {
         expected: PathBuf,
         actual: PathBuf,
     },
-    /// Render a ported page and diff it against the zola-built version.
+    /// Port a markdown site: generate the missing typst drafts, compile the
+    /// whole site, and diff + link-audit it against the zola ground truth.
     ///
-    /// Zola's content/public layout is the manifest: given a slug, the
-    /// inputs are `<root>/content/<slug>.typ` and
-    /// `<root>/public/<slug>/index.html`. Requires `--base-url` for
-    /// reconciling zola's absolutized anchor links against twyla's
-    /// fragment-only form.
-    Check {
+    /// Requires `--base-url` (or `TWYLA_BASE_URL`) for the link audit and the
+    /// anchor-link rewrite.
+    Convert {
         #[command(flatten)]
         ctx: ContextArgs,
-        /// Page slug — `guis-2` for `content/guis-2.typ` and
-        /// `public/guis-2/index.html`.
-        slug: String,
+        /// Source format. Today only `zola`.
+        #[arg(long = "from", default_value = "zola")]
+        from: FromFormat,
+        /// Regenerate every draft, clobbering existing `.typ` files.
+        #[arg(long, conflicts_with = "verify")]
+        overwrite: bool,
+        /// Never generate; diff + audit only (the read-only CI/skill gate).
+        #[arg(long)]
+        verify: bool,
+        /// Also write twyla's compiled HTML here for inspection.
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+        /// Ground-truth dir to diff against. Defaults to `<root>/public/`.
+        #[arg(long)]
+        ground_truth: Option<PathBuf>,
+        /// Scope diff + audit + completeness to a single route slug.
+        #[arg(long)]
+        only: Option<String>,
     },
     /// Convert a zola markdown post to a typst draft on stdout.
     Import {
         /// Path to the source markdown file.
         input: PathBuf,
     },
+}
+
+/// Source site format for `twyla convert`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FromFormat {
+    Zola,
 }
 
 fn main() -> ExitCode {
@@ -142,7 +164,15 @@ fn main() -> ExitCode {
             expected,
             actual,
         } => cmd_diff(textonly_pre, &ignore_attr, &expected, &actual),
-        Cmd::Check { ctx, slug } => cmd_check(ctx, &slug),
+        Cmd::Convert {
+            ctx,
+            from,
+            overwrite,
+            verify,
+            output_dir,
+            ground_truth,
+            only,
+        } => cmd_convert(ctx, from, overwrite, verify, output_dir, ground_truth, only),
         Cmd::Import { input } => cmd_import(&input),
     }
 }
@@ -211,7 +241,7 @@ fn cmd_import(input: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match import_md(&src) {
+    match import_md(&src, None) {
         Ok(out) => {
             print!("{out}");
             ExitCode::from(0)
@@ -278,86 +308,65 @@ fn cmd_diff(
     }
 }
 
-/// Render `<root>/content/<slug>.typ` and diff against
-/// `<root>/public/<slug>/index.html` under the porting relaxations.
-///
-/// Requires `--base-url` (or `TWYLA_BASE_URL`) for
-/// `rewrite_own_page_anchor_hrefs` — zola absolutizes anchor-only
-/// links against the base, typst emits fragment-only, so we rewrite
-/// zola's form back before comparison.
-fn cmd_check(_args: ContextArgs, _slug: &str) -> ExitCode {
-    todo!("revive the check function")
-    /*
+/// `twyla convert` — port a zola markdown site and validate it against the
+/// ground truth. Drafts the missing `.typ`, compiles the whole site, diffs
+/// every page, and runs the link audit; prints the finding list and a
+/// `RESULT:` line. Exit 0 = clean, 1 = failures, 2 = setup/IO/compile error.
+#[allow(clippy::too_many_arguments)]
+fn cmd_convert(
+    args: ContextArgs,
+    from: FromFormat,
+    overwrite: bool,
+    verify: bool,
+    output_dir: Option<PathBuf>,
+    ground_truth: Option<PathBuf>,
+    only: Option<String>,
+) -> ExitCode {
+    let FromFormat::Zola = from; // only zola today
     let ctx = match resolve_ctx(args) {
         Ok(c) => c,
         Err(code) => return code,
     };
-
-    let base_url = match ctx.require_base_url() {
-        Ok(u) => u.to_string(),
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(2);
-        }
-    };
-
-    let zola_html_path = ctx.root.join(format!("public/{slug}/index.html"));
-
-    eprintln!(">>> rendering {slug}");
-    let typst_html = match render_path(&ctx, slug) {
-        Ok(doc) => doc.html,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let zola_html = match std::fs::read_to_string(&zola_html_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading {}: {e}", zola_html_path.display());
-            return ExitCode::from(2);
-        }
-    };
-
-    // Universal relaxations — each is a known structural divergence
-    // between typst's HTML export and zola's pulldown+tera output. See
-    // `doc/index.typ` § Lessons for the full reasoning per item.
-    // - `<pre>`: zola syntect spans vs typst's verbatim text body.
-    // - `td`/`th` `style`: typst `#table(align: ..)` is layout-only and
-    //   doesn't reflect into per-cell `style="text-align:.."`.
-    let cfg = RelaxConfig::new()
-        .relax(Matcher::Tag("pre".to_string()), RelaxationRule::TextOnly)
-        .relax(
-            Matcher::Tag("td".to_string()),
-            RelaxationRule::IgnoreAttribute("style".to_string()),
-        )
-        .relax(
-            Matcher::Tag("th".to_string()),
-            RelaxationRule::IgnoreAttribute("style".to_string()),
+    if ctx.base_url.is_none() {
+        eprintln!(
+            "convert requires --base-url (or TWYLA_BASE_URL) for the link \
+             audit and anchor-link rewrite"
         );
+        return ExitCode::from(2);
+    }
 
-    let mut expected = parse_html(&zola_html);
-    // Zola absolutizes anchor-only links (`[t](#frag)`) against the
-    // page's base URL: `<a href="<base>/<slug>/#frag">`. Typst's
-    // label-based `#link(<frag>)` emits the unabsolutized form
-    // `<a href="#frag">`. Both resolve to the same target, so for
-    // diff purposes rewrite the zola form back to the fragment-only
-    // form before comparison.
-    let route_url = ctx.default_route(slug).url_path;
-    rewrite_own_page_anchor_hrefs(&mut expected, &format!("{base_url}{route_url}#"));
-    let actual = parse_html(&typst_html);
+    let mode = if verify {
+        ConvertMode::Verify
+    } else if overwrite {
+        ConvertMode::Overwrite
+    } else {
+        ConvertMode::Generate
+    };
+    let ground_truth = ground_truth.unwrap_or_else(|| ctx.default_output_dir());
+    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 
-    eprintln!(">>> diff");
-    match diff(&expected, &actual, &cfg) {
-        Ok(()) => {
-            println!("match: {} == typst render", zola_html_path.display());
-            ExitCode::from(0)
+    let opts = ConvertOptions {
+        ctx,
+        mode,
+        ground_truth,
+        output_dir,
+        only,
+    };
+    match convert::run(opts) {
+        Ok(findings) => {
+            print!("{}", convert::report::render(&findings, color));
+            if convert::report::has_failure(&findings) {
+                ExitCode::from(1)
+            } else {
+                ExitCode::from(0)
+            }
         }
-        Err(d) => {
-            println!("{d}");
-            ExitCode::from(1)
+        Err(e) => {
+            if !e.findings.is_empty() {
+                print!("{}", convert::report::render(&e.findings, color));
+            }
+            eprintln!("{}", e.message);
+            ExitCode::from(2)
         }
     }
-    */
 }

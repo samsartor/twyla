@@ -13,10 +13,13 @@
 pub mod asset;
 pub mod build;
 pub mod compile;
+pub mod convert;
 pub mod diff;
 pub mod document;
+pub mod html;
 pub mod import;
 pub mod project;
 pub mod render;
 pub mod rules;
 pub mod serve;
+pub mod slug;

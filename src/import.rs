@@ -30,13 +30,21 @@ use std::fmt::Write as _;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
+use crate::slug::slugify;
+
 /// Convert a zola markdown source into a typst draft.
-pub fn import_md(input: &str) -> Result<String, String> {
+///
+/// `output` is an optional explicit output path: when zola's route diverges
+/// from twyla's filename-derived default (e.g. an underscore that zola
+/// slugifies to a hyphen), the convert harness passes it through so the draft
+/// carries `#set document(output: ..)`. Pass `None` for the standalone
+/// `twyla import` primitive.
+pub fn import_md(input: &str, output: Option<&str>) -> Result<String, String> {
     let (fm_text, body) = split_frontmatter(input)?;
     let meta = parse_frontmatter(fm_text)?;
     let preprocessed = preprocess_shortcodes(body);
     let body_typst = render_body(&preprocessed);
-    Ok(assemble(&meta, &body_typst))
+    Ok(assemble(&meta, &body_typst, output))
 }
 
 // ---- frontmatter ---------------------------------------------------------
@@ -519,42 +527,26 @@ fn escape_typst_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Slugify a heading's plain text into a typst label name. Matches
-/// zola's auto-slug rule for the corpus (no diacritics): lowercase,
-/// runs of non-alphanumeric collapse to one `-`, trailing `-` stripped.
-/// Used by `Walker::end` to emit `= Heading <slug>` so the heading is
-/// link-targetable via `#link(<slug>)`.
-fn slugify(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last_dash = true;
-    for ch in s.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.extend(ch.to_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
-}
-
 // ---- assembly ------------------------------------------------------------
 
-fn assemble(meta: &Meta, body: &str) -> String {
+fn assemble(meta: &Meta, body: &str, output: Option<&str>) -> String {
     let mut out = String::new();
     writeln!(out, "// twyla-import draft. Manual cleanup expected:").unwrap();
-    writeln!(out, "// - fill in `path` (replace PAGE-SLUG)").unwrap();
     writeln!(out, "// - inspect any `// TODO twyla-import:` markers below").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "#import \"/templates/shortcodes.typ\": *").unwrap();
     writeln!(out, "#import \"/templates/page.typ\": page-template").unwrap();
     writeln!(out).unwrap();
+    if let Some(output) = output {
+        // Zola's route diverges from twyla's filename default — pin it.
+        writeln!(
+            out,
+            "#set document(output: \"{}\")",
+            escape_typst_string(output)
+        )
+        .unwrap();
+    }
     writeln!(out, "#show: page-template.with(").unwrap();
-    writeln!(out, "  path: \"PAGE-SLUG\", // TODO twyla-import").unwrap();
     writeln!(
         out,
         "  title: \"{}\",",

@@ -1,7 +1,7 @@
 //! Subtree selection on parsed HTML.
 //!
-//! Used by `twyla-extract` to isolate the relevant region of a page before
-//! diffing — e.g. "match just the post body."
+//! Isolates the relevant region of a page before diffing — e.g. "match just
+//! the post body."
 //!
 //! Selector grammar today is intentionally minimal:
 //!
@@ -14,7 +14,7 @@
 //! sides of a porting comparison can use different wrapper selectors but
 //! still diff the same inner fragment.
 
-use crate::diff::{Element, Node};
+use crate::html::{Element, Node};
 
 /// A subtree selector. Parse from a `"<kind>:<value>"` string.
 #[derive(Debug, Clone)]
@@ -68,7 +68,7 @@ fn walk<'a>(node: &'a Node, sel: &Selector) -> Option<&'a [Node]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::parse::parse_html;
+    use crate::html::parse::parse_html;
 
     #[test]
     fn class_match_returns_inner() {

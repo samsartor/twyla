@@ -73,28 +73,15 @@ impl TwylaContext {
         })
     }
 
-    /// Discover routed pages from the filesystem layout. Top-level
-    /// `content/*.typ` only — no subdirectory recursion yet (the
-    /// corpus doesn't need it).
+    /// Discover routed pages from the filesystem layout. Recurses
+    /// `content/` and collects every `*.typ` whose stem doesn't start
+    /// with `_` (the private/partial convention). Subdirectories route
+    /// through [`default_document_output`](Self::default_document_output)
+    /// (`foo/bar.typ` → `foo/bar/index.html`, `foo/main.typ` →
+    /// `foo/index.html`).
     pub fn scan_pages(&self) -> Result<Vec<PathBuf>, String> {
-        let content_dir = self.content_dir();
-        let entries = std::fs::read_dir(&content_dir)
-            .map_err(|e| format!("cannot read {}: {e}", content_dir.display()))?;
         let mut paths = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("scan error: {e}"))?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("typ") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if stem.starts_with('_') {
-                continue;
-            }
-            paths.push(path);
-        }
+        scan_pages_into(&self.content_dir(), &mut paths)?;
         paths.sort();
         Ok(paths)
     }
@@ -179,6 +166,35 @@ impl TwylaContext {
     }
 }
 
+/// Recursively collect `*.typ` pages under `dir` into `out`. Skips files
+/// whose stem starts with `_` (private/partial convention); recurses every
+/// subdirectory. Directory traversal order is unspecified — the caller sorts.
+fn scan_pages_into(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("scan error: {e}"))?;
+        let path = entry.path();
+        let meta = std::fs::metadata(&path)
+            .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+        if meta.is_dir() {
+            scan_pages_into(&path, out)?;
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("typ") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem.starts_with('_') {
+            continue;
+        }
+        out.push(path);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +227,34 @@ mod tests {
         };
         let r = ctx.default_document_output("content/guis-2.typ");
         assert_eq!(r, PathBuf::from("guis-2/index.html"));
+    }
+
+    #[test]
+    fn scan_pages_recurses_and_skips_underscores() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = dir.path().join("content");
+        let sub = content.join("what-is-color");
+        std::fs::create_dir_all(&sub).unwrap();
+        for rel in [
+            "guis-1.typ",
+            "_index.typ", // private — skipped
+            "notes.md",   // not typst — skipped
+            "what-is-color/main.typ",
+            "what-is-color/ai_cut.typ",
+            "what-is-color/index.md", // not typst — skipped
+        ] {
+            std::fs::write(content.join(rel), "").unwrap();
+        }
+        let ctx = TwylaContext::new(dir.path(), None).unwrap();
+        let pages = ctx.scan_pages().unwrap();
+        let rels: Vec<_> = pages
+            .iter()
+            .map(|p| p.strip_prefix(&content).unwrap().to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            rels,
+            vec!["guis-1.typ", "what-is-color/ai_cut.typ", "what-is-color/main.typ"],
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ use html5ever::tree_builder::TreeBuilderOpts;
 use html5ever::{ParseOpts, parse_document};
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 
-use crate::diff::{Element, Node};
+use crate::html::{Element, Node};
 
 /// Tags whose text content is preserved verbatim — no whitespace
 /// collapsing, no dropping of pure-whitespace children.

@@ -8,7 +8,7 @@
 //! (and ideally discussed before becoming a default) so the porting harness
 //! stays honest about where twyla and zola diverge.
 
-use crate::diff::Element;
+use crate::html::Element;
 
 /// A list of relaxation rules. Constructed via the builder methods.
 #[derive(Debug, Clone, Default)]
@@ -27,11 +27,15 @@ impl RelaxConfig {
         self
     }
 
-    /// Returns the first rule whose matcher applies to `el`, if any.
-    pub fn find_rule(&self, el: &Element) -> Option<&RelaxationRule> {
+    /// Every rule whose matcher applies to `el`, in declaration order. The
+    /// comparator short-circuits on the first `IgnoreEntirely`/`TextOnly` and
+    /// otherwise unions the per-attribute rules — so an element can have
+    /// several attributes relaxed at once (e.g. both `src` and `srcset`).
+    pub fn find_rules(&self, el: &Element) -> Vec<&RelaxationRule> {
         self.rules
             .iter()
-            .find_map(|(m, r)| m.matches(el).then_some(r))
+            .filter_map(|(m, r)| m.matches(el).then_some(r))
+            .collect()
     }
 }
 
@@ -48,6 +52,9 @@ pub enum Matcher {
     },
     /// Match elements with this tag name AND `attr` present (any value).
     TagAttrExists { tag: String, attr: String },
+    /// Match *any* element that has `attr` present, regardless of tag. Used to
+    /// relax URL-bearing attributes (`src`, `srcset`) across all elements.
+    AnyTagAttrExists { attr: String },
 }
 
 impl Matcher {
@@ -60,6 +67,7 @@ impl Matcher {
             Matcher::TagAttrExists { tag, attr } => {
                 &el.name == tag && el.attrs.contains_key(attr)
             }
+            Matcher::AnyTagAttrExists { attr } => el.attrs.contains_key(attr),
         }
     }
 }
@@ -69,9 +77,14 @@ impl Matcher {
 pub enum RelaxationRule {
     /// Treat the entire subtree as equal regardless of content.
     IgnoreEntirely,
-    /// Ignore a specific attribute on the matched element. Other attrs and
-    /// children still compared strictly.
+    /// Ignore a specific attribute on the matched element entirely — present
+    /// or absent, any value. Other attrs and children still compared strictly.
     IgnoreAttribute(String),
+    /// Require the attribute to be *present on both sides* (missing on either is
+    /// a divergence) but ignore its *value*. The URL-attr relaxation: an
+    /// `<img src>` must exist on both, but a content-hashed value may differ
+    /// from zola's plain filename.
+    IgnoreAttributeValue(String),
     /// Compare only the concatenated text content of the element. Useful for
     /// e.g. `<pre>` blocks where syntax-highlighting markup differs across
     /// generators but the source text should match.

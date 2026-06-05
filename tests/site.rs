@@ -18,7 +18,8 @@
 use std::path::{Path, PathBuf};
 
 use twyla::build::{Build, BuildSummary, run as build_run};
-use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff, parse_html};
+use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff};
+use twyla::html::parse_html;
 use twyla::project::TwylaContext;
 use twyla::render::{OutputDoc, render_site};
 
