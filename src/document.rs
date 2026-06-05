@@ -21,7 +21,8 @@ use comemo::Tracked;
 use ecow::EcoString;
 use typst::diag::HintedStrResult;
 use typst::foundations::{
-    Array, Binding, Content, Context, Datetime, NativeElement as _, Scope, Smart, Value, elem, func,
+    Array, Binding, Content, Context, Datetime, Dict, NativeElement as _, Scope, Smart, Value, elem,
+    func,
 };
 
 /// Metadata for the current page.
@@ -64,8 +65,10 @@ pub struct TwylaDocument {
     pub kind: Smart<EcoString>,
 
     /// Arbitrary extra data for your own use. Available as `document.extra`
-    /// and as the `extra` field of this page's [`documents`] entry.
-    #[default(Value::None)]
+    /// and as the `extra` field of this page's [`documents`] entry. Defaults to
+    /// an empty dictionary, so templates can `document.extra.at(.., default: ..)`
+    /// without first checking for `none`.
+    #[default(Value::Dict(Dict::new()))]
     pub extra: Value,
 
     /// Whether this page is a draft. Drafts are still built, but are
