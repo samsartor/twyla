@@ -1,8 +1,8 @@
 //! HTML AST-equivalence harness — the porting feedback loop.
 //!
 //! Walks two normalized [`crate::html::Node`] trees in lockstep and reports the
-//! first structural divergence. Used as both a CLI (`twyla diff`) and a library
-//! (the convert harness diffs every page).
+//! first structural divergence. Used by the convert harness, which diffs every
+//! page against the zola ground truth.
 //!
 //! Parsing, the `Node`/`Element` types, serialization, and subtree selection
 //! live in [`crate::html`] — this module is purely the *comparator* plus its
@@ -13,6 +13,7 @@
 //! out of the box it's the strictest comparison the normalization permits.
 
 pub mod compare;
+pub mod patch;
 pub mod relax;
 
 pub use compare::{Divergence, DivergenceReason, PathStep, diff};

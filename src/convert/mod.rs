@@ -116,7 +116,7 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
                     }),
                     Err(d) => findings.push(Finding::PageDiff {
                         route: route.clone(),
-                        divergence: d.to_string(),
+                        divergence: d.render_patch(&expected, &actual),
                     }),
                 }
             }

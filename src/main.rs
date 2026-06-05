@@ -17,7 +17,6 @@
 //!   the zola ground truth (`public/`). `--verify` is the read-only gate;
 //!   `--only <slug>` scopes to one page. Requires `--base-url` (or
 //!   `TWYLA_BASE_URL`) for the link audit and anchor-link rewrite.
-//! - `twyla diff <expected> <actual>` — structural AST diff (primitive).
 //! - `twyla import <md>` — md→typ draft generator (primitive).
 
 use std::io::IsTerminal;
@@ -29,8 +28,6 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use twyla::build::{Build, run as build_run};
 use twyla::convert::{self, ConvertMode, ConvertOptions};
-use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff};
-use twyla::html::parse_html;
 use twyla::import::import_md;
 use twyla::project::TwylaContext;
 use twyla::serve::{Serve, run as serve_run};
@@ -102,17 +99,6 @@ enum Cmd {
         #[arg(long, short = 'o')]
         output_dir: Option<PathBuf>,
     },
-    /// Structurally diff two HTML files.
-    Diff {
-        /// Relax `<pre>` blocks to text-only equality.
-        #[arg(long)]
-        textonly_pre: bool,
-        /// Ignore attribute on tag, format `<tag>:<attr>`. Repeatable.
-        #[arg(long, value_name = "TAG:ATTR")]
-        ignore_attr: Vec<String>,
-        expected: PathBuf,
-        actual: PathBuf,
-    },
     /// Port a markdown site: generate the missing typst drafts, compile the
     /// whole site, and diff + link-audit it against the zola ground truth.
     ///
@@ -158,12 +144,6 @@ fn main() -> ExitCode {
     match cli.cmd {
         Cmd::Serve { ctx } => cmd_serve(ctx),
         Cmd::Build { ctx, output_dir } => cmd_build(ctx, output_dir),
-        Cmd::Diff {
-            textonly_pre,
-            ignore_attr,
-            expected,
-            actual,
-        } => cmd_diff(textonly_pre, &ignore_attr, &expected, &actual),
         Cmd::Convert {
             ctx,
             from,
@@ -250,61 +230,6 @@ fn cmd_import(input: &Path) -> ExitCode {
         }
         Err(e) => {
             eprintln!("import error: {e}");
-            ExitCode::from(1)
-        }
-    }
-}
-
-fn cmd_diff(
-    textonly_pre: bool,
-    ignore_attr: &[String],
-    expected_path: &Path,
-    actual_path: &Path,
-) -> ExitCode {
-    let mut cfg = RelaxConfig::new();
-    if textonly_pre {
-        cfg = cfg.relax(Matcher::Tag("pre".to_string()), RelaxationRule::TextOnly);
-    }
-    for spec in ignore_attr {
-        let Some((tag, attr)) = spec.split_once(':') else {
-            eprintln!("--ignore-attr expects <tag>:<attr>, got {spec:?}");
-            return ExitCode::from(2);
-        };
-        cfg = cfg.relax(
-            Matcher::Tag(tag.to_string()),
-            RelaxationRule::IgnoreAttribute(attr.to_string()),
-        );
-    }
-
-    let expected_src = match std::fs::read_to_string(expected_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading {}: {e}", expected_path.display());
-            return ExitCode::from(2);
-        }
-    };
-    let actual_src = match std::fs::read_to_string(actual_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading {}: {e}", actual_path.display());
-            return ExitCode::from(2);
-        }
-    };
-
-    let expected = parse_html(&expected_src);
-    let actual = parse_html(&actual_src);
-
-    match diff(&expected, &actual, &cfg) {
-        Ok(()) => {
-            println!(
-                "match: {} == {}",
-                expected_path.display(),
-                actual_path.display()
-            );
-            ExitCode::from(0)
-        }
-        Err(d) => {
-            println!("{d}");
             ExitCode::from(1)
         }
     }
