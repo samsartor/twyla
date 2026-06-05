@@ -29,11 +29,11 @@ use crate::asset::{AssetResolver, ResolvedAsset};
 use crate::compile::HarvestedDoc;
 use crate::project::TwylaContext;
 
-/// Twyla's emit-raw-HTML placeholder. Matches the helper in user typst
-/// code: `raw-html(content)` produces a `<script>` with this type, and the
-/// resolution pass below replaces each instance with the script body
-/// inlined.
-const RAW_HTML_MARKER: &str = r#"<script type="x-twyla-raw-html">"#;
+/// The `type` attribute marking a raw-HTML carrier `<script>`. The builtin
+/// [`crate::content::raw_html`] produces an element with this type; the
+/// resolution pass below strips the wrapper and inlines the body. Shared so
+/// producer and consumer agree on the sentinel.
+pub const RAW_HTML_SCRIPT_TYPE: &str = "x-twyla-raw-html";
 
 /// A pre-rendered render/compile failure.
 ///
@@ -123,11 +123,12 @@ pub fn render_site_with_assets(ctx: &TwylaContext) -> Result<SiteOutput, RenderE
 /// inner body. The workaround for typst's lack of a first-class
 /// `html.raw` — see `doc/index.typ` § Resolution pass.
 pub fn resolve_raw_html_placeholders(input: &str) -> String {
+    let marker = format!(r#"<script type="{RAW_HTML_SCRIPT_TYPE}">"#);
     let mut out = String::with_capacity(input.len());
     let mut cursor = 0;
-    while let Some(start) = input[cursor..].find(RAW_HTML_MARKER) {
+    while let Some(start) = input[cursor..].find(&marker) {
         let abs = cursor + start;
-        let body_start = abs + RAW_HTML_MARKER.len();
+        let body_start = abs + marker.len();
         let Some(rel_end) = input[body_start..].find("</script>") else {
             // Unterminated — bail by emitting the rest unchanged. Shouldn't
             // happen in practice unless typst's serializer changes.
@@ -377,6 +378,7 @@ pub fn install_stdlib(library: &mut Library) {
     let global = library.global.scope_mut();
     crate::document::install(global);
     crate::asset::install(global);
+    crate::content::install(global);
 }
 
 /// FileLoader for [`FileStore`]. Serves the (empty) virtual main from

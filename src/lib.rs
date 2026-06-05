@@ -13,6 +13,7 @@
 pub mod asset;
 pub mod build;
 pub mod compile;
+pub mod content;
 pub mod convert;
 pub mod diff;
 pub mod document;
