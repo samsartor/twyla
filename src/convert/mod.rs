@@ -7,6 +7,7 @@
 
 pub mod audit;
 pub mod draft;
+pub mod ir;
 pub mod manifest;
 pub mod report;
 pub mod zola;

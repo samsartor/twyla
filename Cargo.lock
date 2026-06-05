@@ -3030,6 +3030,7 @@ dependencies = [
  "typst-kit",
  "typst-library",
  "typst-utils",
+ "unscanny",
 ]
 
 [[package]]

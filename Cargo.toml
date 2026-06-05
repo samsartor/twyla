@@ -54,6 +54,7 @@ grass = { version = "0.13", default-features = false }
 # unicode transliteration). Used by the native heading HTML rule.
 slug = "0.1"
 pulldown-cmark-to-cmark = "22.0.0"
+unscanny = "0.1.0"
 
 [dev-dependencies]
 # Scratch output dir for the `twyla build` integration test (tests/site.rs).
