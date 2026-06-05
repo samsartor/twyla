@@ -97,13 +97,13 @@ impl Finding {
             Finding::PagePass { route } => route.clone(),
             Finding::PageDiff { route, divergence } => format!("{route}\n{divergence}"),
             Finding::Unreachable { page, url, .. } => {
-                format!("{page}: {url} — not in twyla's manifest (never satisfied by public/)")
+                format!("{page} -> {url} — (not produced by twyla)")
             }
             Finding::NavigableDropped { page, url, hint } => {
-                format!("{page}: {url}\n{hint}")
+                format!("{page} -> {url}\n{hint}")
             }
-            Finding::RouteMissing { route } => format!("{route} — expected, not produced by twyla"),
-            Finding::RouteExtra { route } => format!("{route} — produced, no ground-truth peer"),
+            Finding::RouteMissing { route } => format!("{route} (not produced by twyla)"),
+            Finding::RouteExtra { route } => format!("{route} (not in the ground-truth dir)"),
         }
     }
 }
@@ -135,7 +135,11 @@ pub fn render(findings: &[Finding], color: bool) -> String {
         }
     }
     let result = if fails > 0 {
-        paint(&format!("FAIL ({fails} failures, {warns} warnings)"), Severity::Fail, color)
+        paint(
+            &format!("FAIL ({fails} failures, {warns} warnings)"),
+            Severity::Fail,
+            color,
+        )
     } else if warns > 0 {
         paint(&format!("OK ({warns} warnings)"), Severity::Warn, color)
     } else {

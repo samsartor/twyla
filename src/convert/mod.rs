@@ -43,6 +43,9 @@ pub struct ConvertOptions {
     pub output_dir: Option<PathBuf>,
     /// When set, scope diff + audit + completeness to a single route slug.
     pub only: Option<String>,
+    /// Sibling nodes of context to show above/below a divergence in the diff.
+    pub above: usize,
+    pub below: usize,
 }
 
 /// A setup/IO failure (exit code 2). Carries any findings already collected
@@ -116,7 +119,7 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
                     }),
                     Err(d) => findings.push(Finding::PageDiff {
                         route: route.clone(),
-                        divergence: d.render_patch(&expected, &actual),
+                        divergence: d.render_patch(&expected, &actual, opts.above, opts.below),
                     }),
                 }
             }

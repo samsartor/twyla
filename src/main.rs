@@ -125,6 +125,12 @@ enum Cmd {
         /// Scope diff + audit + completeness to a single route slug.
         #[arg(long)]
         only: Option<String>,
+        /// Sibling nodes of context to show above a divergence in the diff.
+        #[arg(short = 'A', long, default_value_t = 1)]
+        above: usize,
+        /// Sibling nodes of context to show below a divergence in the diff.
+        #[arg(short = 'B', long, default_value_t = 1)]
+        below: usize,
     },
     /// Convert a zola markdown post to a typst draft on stdout.
     Import {
@@ -152,7 +158,19 @@ fn main() -> ExitCode {
             output_dir,
             ground_truth,
             only,
-        } => cmd_convert(ctx, from, overwrite, verify, output_dir, ground_truth, only),
+            above,
+            below,
+        } => cmd_convert(
+            ctx,
+            from,
+            overwrite,
+            verify,
+            output_dir,
+            ground_truth,
+            only,
+            above,
+            below,
+        ),
         Cmd::Import { input } => cmd_import(&input),
     }
 }
@@ -248,6 +266,8 @@ fn cmd_convert(
     output_dir: Option<PathBuf>,
     ground_truth: Option<PathBuf>,
     only: Option<String>,
+    above: usize,
+    below: usize,
 ) -> ExitCode {
     let FromFormat::Zola = from; // only zola today
     let ctx = match resolve_ctx(args) {
@@ -278,6 +298,8 @@ fn cmd_convert(
         ground_truth,
         output_dir,
         only,
+        above,
+        below,
     };
     match convert::run(opts) {
         Ok(findings) => {
