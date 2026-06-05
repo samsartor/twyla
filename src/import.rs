@@ -9,27 +9,36 @@
 //!   heading text.
 //! - Paragraphs, blockquotes, ATX rules, ordered/unordered lists,
 //!   fenced code, inline code, emphasis, strong, soft/hard breaks.
+//! - Tables → `#table(columns:, align:, table.header(..), ..)` (with a
+//!   TODO to check the styling).
 //! - Links: external → `#link(..)` (the show rule handles `rel`/
 //!   `target` in user code); internal anchor `#frag` → `#link(..)`;
 //!   root-relative `/foo` → `#link(..)`.
+//! - Inline and block HTML → `#html.elem("tag", attrs: (..))[..]`, parsed
+//!   the same way the diff harness parses HTML.
 //! - Zola shortcodes (`{{ name(args) }}` / `{% name(args) %}…{% end %}`)
-//!   for the four block helpers we've ported so far: `centered`, `svg`,
-//!   `image`, `diagram`. Unknown shortcodes pass through unchanged with
-//!   a `// TODO twyla-convert: review` comment.
+//!   anywhere — mid-paragraph and inside table cells, not just whole-line —
+//!   become `#name(args)` / `#name(args)[body]`. Args translate
+//!   `k="v"` → `k: "v"`; the porter defines the `#name` helpers.
 //!
 //! What we *don't* try to do:
 //!
-//! - Inline raw HTML beyond pass-through (the porter wraps it in
-//!   `raw-html(..)` where needed).
 //! - Heading slugification beyond the simple ascii-fold rule (zola's
 //!   actual slugifier handles unicode; we'd diverge on accented chars).
-//! - Custom shortcodes (`tagline`, `var`, `math`) — added when a page
-//!   forces them.
+//! - Render the shortcode helpers themselves — they're function calls the
+//!   porter implements in `templates/`.
 
+use std::cell::RefCell;
 use std::fmt::Write as _;
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use html5ever::tendril::StrTendril;
+use html5ever::tokenizer::{
+    BufferQueue, CommentToken, EndTag, StartTag, TagToken, Token, TokenSink, TokenSinkResult,
+    Tokenizer, TokenizerOpts,
+};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
+use crate::html::{self, Node};
 use crate::slug::slugify;
 
 /// Convert a zola markdown source into a typst draft.
@@ -141,35 +150,103 @@ fn preprocess_shortcodes(body: &str) -> String {
     out
 }
 
+/// Scan one (non-fenced) line, replacing shortcodes with marker comments
+/// *in place* — so a `{{ … }}` mid-paragraph or inside a table cell is caught,
+/// not just whole-line ones (mirroring how zola's grammar matches anywhere).
+/// Inline `{{ … }}` becomes an inline marker; block `{% … %}` / `{% end %}` is
+/// forced onto its own block with surrounding blank lines so its body stays
+/// block-level markdown. Inline `` `code` `` spans are skipped verbatim.
 fn rewrite_line(line: &str, out: &mut String) {
-    let stripped = line.trim_matches(['\n', '\r']);
-    let leading_ws = &line[..line.len() - line.trim_start().len()];
-
-    // Whole-line block-open: `{% name(args) %}` (no body on same line).
-    if let Some(rest) = stripped.trim().strip_prefix("{%") {
-        if let Some(inner) = rest.strip_suffix("%}") {
-            let inner = inner.trim();
-            if inner == "end" {
-                writeln!(out, "{leading_ws}\n{MARKER_CLOSE}\n").unwrap();
-                return;
+    let b = line.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        match b[i] {
+            // Inline code span: copy the backtick run, then everything up to
+            // and including the matching close run, verbatim.
+            b'`' => {
+                let start = i;
+                let mut ticks = 0;
+                while i < n && b[i] == b'`' {
+                    ticks += 1;
+                    i += 1;
+                }
+                out.push_str(&line[start..i]);
+                if let Some(close) = find_code_span_close(line, i, ticks) {
+                    let end = close + ticks;
+                    out.push_str(&line[i..end]);
+                    i = end;
+                }
+                // No close on this line → not a code span; keep scanning.
             }
-            writeln!(out, "{leading_ws}\n{MARKER_OPEN}{inner}-->\n").unwrap();
-            return;
+            // Inline shortcode `{{ name(args) }}` → in-place inline marker.
+            b'{' if i + 1 < n && b[i + 1] == b'{' => match line[i..].find("}}") {
+                Some(rel) => {
+                    let inner = line[i + 2..i + rel].trim();
+                    write!(out, "{MARKER_INLINE}{inner}{MARKER_END}").unwrap();
+                    i += rel + 2;
+                }
+                None => {
+                    out.push_str("{{");
+                    i += 2;
+                }
+            },
+            // Block shortcode `{% name(args) %}` / `{% end %}` → block marker.
+            b'{' if i + 1 < n && b[i + 1] == b'%' => match line[i..].find("%}") {
+                Some(rel) => {
+                    let inner = line[i + 2..i + rel].trim();
+                    if inner == "end" {
+                        write!(out, "\n\n{MARKER_CLOSE}\n\n").unwrap();
+                    } else {
+                        write!(out, "\n\n{MARKER_OPEN}{inner}{MARKER_END}\n\n").unwrap();
+                    }
+                    i += rel + 2;
+                }
+                None => {
+                    out.push_str("{%");
+                    i += 2;
+                }
+            },
+            _ => {
+                let len = utf8_len(b[i]);
+                out.push_str(&line[i..i + len]);
+                i += len;
+            }
         }
     }
+}
 
-    // Whole-line inline shortcode: `{{ name(args) }}`.
-    if let Some(rest) = stripped.trim().strip_prefix("{{") {
-        if let Some(inner) = rest.strip_suffix("}}") {
-            let inner = inner.trim();
-            writeln!(out, "{leading_ws}\n{MARKER_INLINE}{inner}-->\n").unwrap();
-            return;
+/// Find the start index of the next run of exactly `ticks` backticks at or
+/// after `from`, per CommonMark's same-length close rule. `None` if absent.
+fn find_code_span_close(line: &str, from: usize, ticks: usize) -> Option<usize> {
+    let b = line.as_bytes();
+    let mut j = from;
+    while j < b.len() {
+        if b[j] == b'`' {
+            let run_start = j;
+            let mut run = 0;
+            while j < b.len() && b[j] == b'`' {
+                run += 1;
+                j += 1;
+            }
+            if run == ticks {
+                return Some(run_start);
+            }
+        } else {
+            j += 1;
         }
     }
+    None
+}
 
-    // Otherwise — pass through. Inline shortcodes mid-paragraph (rare in
-    // this corpus) won't be matched; the porter cleans those up by hand.
-    out.push_str(line);
+/// Byte length of the UTF-8 sequence beginning with `first`.
+fn utf8_len(first: u8) -> usize {
+    match first {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
 }
 
 // ---- markdown → typst walk ----------------------------------------------
@@ -207,6 +284,12 @@ struct Walker<'a> {
     /// Depth within an unsupported tag, and all the events encountered therin.
     unsupported_depth: u32,
     unsupported_events: Vec<Event<'a>>,
+    /// Open inline-HTML elements (`<col-s>…`), so a `</col-s>` knows to close
+    /// the matching `#html.elem(..)[` content block.
+    html_stack: Vec<String>,
+    /// Accumulates the raw text of a block-level HTML block (`<div>…</div>`),
+    /// parsed and converted to `#html.elem` calls at `End(HtmlBlock)`.
+    html_block_buf: String,
 }
 
 #[derive(Clone, Copy)]
@@ -236,6 +319,8 @@ impl<'a> Walker<'a> {
             list_ordered: Vec::new(),
             unsupported_depth: 0,
             unsupported_events: Vec::new(),
+            html_stack: Vec::new(),
+            html_block_buf: String::new(),
         }
     }
 
@@ -273,7 +358,8 @@ impl<'a> Walker<'a> {
                     write!(buf, "`{s}`").unwrap();
                 }
             }
-            Event::Html(s) | Event::InlineHtml(s) => self.html(&s),
+            Event::Html(s) => self.block_html(&s),
+            Event::InlineHtml(s) => self.inline_html(&s),
             Event::SoftBreak => self.push("\n"),
             Event::HardBreak => self.push(" \\\n"),
             Event::Rule => self.push("\n#html.hr()\n\n"),
@@ -323,9 +409,21 @@ impl<'a> Walker<'a> {
                 self.stack.push(Block::ListItem);
             }
             Tag::HtmlBlock => {
-                // The body is one or more `Event::Html` events we
-                // handle in `html()`. No fence to emit here.
+                // Body arrives as `Event::Html` events accumulated in
+                // `block_html`, converted at `End(HtmlBlock)`.
+                self.html_block_buf.clear();
             }
+            Tag::Table(aligns) => {
+                self.push("\n// TODO twyla-convert: check table styling\n");
+                self.push(&format!("#table(\n  columns: {},\n", aligns.len()));
+                if aligns.iter().any(|a| *a != Alignment::None) {
+                    let cols: Vec<&str> = aligns.iter().map(|a| align_name(*a)).collect();
+                    self.push(&format!("  align: ({}),\n", cols.join(", ")));
+                }
+            }
+            Tag::TableHead => self.push("  table.header("),
+            Tag::TableRow => self.push("  "),
+            Tag::TableCell => self.push("["),
             Tag::Emphasis => {
                 self.push("_");
                 self.stack.push(Block::Emphasis);
@@ -406,6 +504,11 @@ impl<'a> Walker<'a> {
                 self.in_link_text -= 1;
                 self.push("]");
             }
+            TagEnd::Table => self.push(")\n\n"),
+            TagEnd::TableHead => self.push("),\n"),
+            TagEnd::TableRow => self.push("\n"),
+            TagEnd::TableCell => self.push("], "),
+            TagEnd::HtmlBlock => self.flush_html_block(),
             _ => {}
         }
     }
@@ -429,57 +532,102 @@ impl<'a> Walker<'a> {
         }
     }
 
-    fn html(&mut self, s: &str) {
-        let trimmed = s.trim();
-        if trimmed.starts_with(MARKER_OPEN) {
-            let inner = trimmed
-                .trim_start_matches(MARKER_OPEN)
-                .trim_end_matches(MARKER_END);
+    /// Block-level HTML (`Event::Html`): a shortcode marker, or raw HTML text
+    /// accumulated for conversion at `End(HtmlBlock)`.
+    fn block_html(&mut self, s: &str) {
+        if self.handle_marker(s.trim(), false) {
+            return;
+        }
+        self.html_block_buf.push_str(s);
+    }
+
+    /// Convert the accumulated HTML block into `#html.elem` calls by parsing it
+    /// the same way the diff harness does, then walking the tree.
+    fn flush_html_block(&mut self) {
+        if self.html_block_buf.trim().is_empty() {
+            self.html_block_buf.clear();
+            return;
+        }
+        let buf = std::mem::take(&mut self.html_block_buf);
+        let mut converted = String::from("\n");
+        convert_html_node(&html::parse_html(&buf), &mut converted);
+        converted.push_str("\n\n");
+        self.push(&converted);
+    }
+
+    /// Inline HTML (`Event::InlineHtml`): a single open/close/void tag. Open
+    /// tags become `#html.elem("name", ..)[`, the markdown content between
+    /// flows in normally, and the close tag emits the matching `]`.
+    fn inline_html(&mut self, s: &str) {
+        if self.handle_marker(s.trim(), true) {
+            return;
+        }
+        match parse_html_tag(s) {
+            HtmlTag::Open {
+                name,
+                attrs,
+                self_closing,
+            } => {
+                let dict = typst_attrs(attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+                if self_closing || is_void(&name) {
+                    self.push(&format!("#html.elem(\"{name}\"{dict})"));
+                } else {
+                    self.push(&format!("#html.elem(\"{name}\"{dict})["));
+                    self.html_stack.push(name);
+                }
+            }
+            HtmlTag::Close => {
+                if self.html_stack.pop().is_some() {
+                    self.push("]");
+                }
+            }
+            HtmlTag::Comment => {}
+            HtmlTag::Other(raw) => {
+                self.push(&format!("/* TODO twyla-convert: review raw html {raw} */"));
+            }
+        }
+    }
+
+    /// Handle a preprocessed shortcode marker comment. Returns `true` if `s`
+    /// was a marker (and was emitted), `false` otherwise. `inline` is set when
+    /// the marker came from `Event::InlineHtml` (mid-paragraph / table cell),
+    /// where the call must be emitted tight rather than as its own block.
+    fn handle_marker(&mut self, s: &str, inline: bool) -> bool {
+        if let Some(inner) = s.strip_prefix(MARKER_OPEN).and_then(|x| x.strip_suffix(MARKER_END)) {
             if let Some((name, args)) = parse_shortcode(inner) {
                 writeln!(self.out, "\n#{}({})[", name, args).unwrap();
             } else {
-                writeln!(
-                    self.out,
-                    "\n// TODO twyla-convert: review block shortcode {inner}"
-                )
-                .unwrap();
+                writeln!(self.out, "\n// TODO twyla-convert: review block shortcode {inner}")
+                    .unwrap();
             }
-            return;
+            return true;
         }
-        if trimmed == MARKER_CLOSE {
-            // Strip trailing whitespace from accumulated output before
-            // closing the block. Pulldown emits `End(Paragraph)` as
-            // `\n\n`; left in place inside a block shortcode that
-            // becomes a paragraph break, which makes typst wrap the
-            // body in nested `<p>`s — html5ever then splits them into
-            // siblings and the centered/etc. div ends up with > 1
-            // child. Trim restores the single-paragraph shape.
+        if s == MARKER_CLOSE {
+            // Strip trailing whitespace before closing the block, so a
+            // paragraph break inside the body doesn't split the wrapped
+            // content into sibling `<p>`s.
             while self.out.ends_with(|c: char| c.is_whitespace()) {
                 self.out.pop();
             }
             self.push("]\n\n");
-            return;
+            return true;
         }
-        if trimmed.starts_with(MARKER_INLINE) {
-            let inner = trimmed
-                .trim_start_matches(MARKER_INLINE)
-                .trim_end_matches(MARKER_END);
-            if let Some((name, args)) = parse_shortcode(inner) {
-                writeln!(self.out, "\n#{}({})\n", name, args).unwrap();
-            } else {
-                writeln!(
-                    self.out,
-                    "\n// TODO twyla-convert: review inline shortcode {inner}"
-                )
-                .unwrap();
+        if let Some(inner) = s.strip_prefix(MARKER_INLINE).and_then(|x| x.strip_suffix(MARKER_END)) {
+            match parse_shortcode(inner) {
+                Some((name, args)) if inline => {
+                    write!(self.push_to(), "#{}({})", name, args).unwrap();
+                }
+                Some((name, args)) => {
+                    writeln!(self.out, "\n#{}({})\n", name, args).unwrap();
+                }
+                None => {
+                    writeln!(self.out, "\n// TODO twyla-convert: review inline shortcode {inner}")
+                        .unwrap();
+                }
             }
-            return;
+            return true;
         }
-        // Real inline/block HTML the porter has to look at — pass
-        // through unchanged with a comment flag.
-        self.out.push_str("/* TODO ");
-        self.out.push_str(s);
-        self.out.push_str("*/");
+        false
     }
 
     fn push_to(&mut self) -> &mut String {
@@ -560,6 +708,157 @@ fn split_top_commas(s: &str) -> Vec<&str> {
     parts
 }
 
+// ---- html → html.elem ----------------------------------------------------
+
+/// A single inline HTML tag, as pulldown hands them to us one at a time.
+enum HtmlTag {
+    Open {
+        name: String,
+        attrs: Vec<(String, String)>,
+        self_closing: bool,
+    },
+    Close,
+    Comment,
+    /// Not a recognizable tag (stray text, malformed) — passed through.
+    Other(String),
+}
+
+/// Collects the first tag/comment token from the html5ever tokenizer, ignoring
+/// the rest. The `process_token` signature is `&self`, so the result rides a
+/// `RefCell`.
+#[derive(Default)]
+struct TagSink {
+    tag: RefCell<Option<HtmlTag>>,
+}
+
+impl TokenSink for TagSink {
+    type Handle = ();
+
+    fn process_token(&self, token: Token, _line: u64) -> TokenSinkResult<()> {
+        if self.tag.borrow().is_some() {
+            return TokenSinkResult::Continue;
+        }
+        let parsed = match token {
+            TagToken(tag) => {
+                let name = tag.name.to_string();
+                let attrs = tag
+                    .attrs
+                    .iter()
+                    .map(|a| (a.name.local.to_string(), a.value.to_string()))
+                    .collect();
+                match tag.kind {
+                    StartTag => Some(HtmlTag::Open {
+                        name,
+                        attrs,
+                        self_closing: tag.self_closing,
+                    }),
+                    EndTag => Some(HtmlTag::Close),
+                }
+            }
+            CommentToken(_) => Some(HtmlTag::Comment),
+            _ => None,
+        };
+        if parsed.is_some() {
+            *self.tag.borrow_mut() = parsed;
+        }
+        TokenSinkResult::Continue
+    }
+}
+
+/// Parse one inline HTML tag (`<col-s space="x">`, `</col-s>`, `<br/>`,
+/// `<!--…-->`) with the html5ever tokenizer — spec-compliant attribute parsing
+/// (quote styles, entity decoding) and the start/end/self-closing distinction,
+/// without building a tree (which would erase that distinction).
+fn parse_html_tag(raw: &str) -> HtmlTag {
+    let tok = Tokenizer::new(TagSink::default(), TokenizerOpts::default());
+    let input = BufferQueue::default();
+    input.push_back(StrTendril::from(raw));
+    let _ = tok.feed(&input);
+    tok.end();
+    tok.sink
+        .tag
+        .borrow_mut()
+        .take()
+        .unwrap_or_else(|| HtmlTag::Other(raw.to_string()))
+}
+
+/// Render an attribute set as the `, attrs: ("k": "v", ..)` part of an
+/// `html.elem` call (empty string when there are no attributes). String keys
+/// keep hyphenated names like `data-foo` valid.
+fn typst_attrs<'a>(attrs: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+    let parts: Vec<String> = attrs
+        .map(|(k, v)| format!("\"{}\": \"{}\"", escape_typst_string(k), escape_typst_string(v)))
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(", attrs: ({})", parts.join(", "))
+    }
+}
+
+/// Recursively convert a parsed HTML node into `#html.elem` calls. The
+/// document/html/head/body wrappers html5ever inserts are unwrapped.
+fn convert_html_node(node: &Node, out: &mut String) {
+    match node {
+        Node::Document(children) => {
+            for c in children {
+                convert_html_node(c, out);
+            }
+        }
+        Node::Doctype(_) | Node::Comment(_) => {}
+        Node::Text(t) => out.push_str(&escape_markup(t)),
+        Node::Element(el) => {
+            if matches!(el.name.as_str(), "html" | "head" | "body") {
+                for c in &el.children {
+                    convert_html_node(c, out);
+                }
+                return;
+            }
+            let dict = typst_attrs(el.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            write!(out, "#html.elem(\"{}\"{dict})", el.name).unwrap();
+            if el.children.is_empty() && is_void(&el.name) {
+                return;
+            }
+            out.push('[');
+            for c in &el.children {
+                convert_html_node(c, out);
+            }
+            out.push(']');
+        }
+    }
+}
+
+/// HTML5 void elements — emitted without a body.
+fn is_void(name: &str) -> bool {
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+/// Map a pulldown table-column alignment to a typst alignment keyword.
+fn align_name(a: Alignment) -> &'static str {
+    match a {
+        Alignment::Left => "left",
+        Alignment::Center => "center",
+        Alignment::Right => "right",
+        Alignment::None => "auto",
+    }
+}
+
 // ---- helpers -------------------------------------------------------------
 
 fn escape_typst_string(s: &str) -> String {
@@ -573,7 +872,7 @@ fn escape_typst_string(s: &str) -> String {
 fn escape_markup(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if matches!(c, '\\' | '#' | '$' | '*' | '_' | '`' | '<' | '@' | '~') {
+        if matches!(c, '\\' | '#' | '$' | '*' | '_' | '`' | '<' | '@' | '~' | '[' | ']') {
             out.push('\\');
         }
         out.push(c);
@@ -656,5 +955,69 @@ mod tests {
         // Fenced code is emitted verbatim — not escaped.
         assert!(out.contains("let x = #foo;"), "got: {out}");
         assert!(!out.contains(r"\#foo"), "code block was escaped: {out}");
+    }
+
+    #[test]
+    fn converts_inline_html_to_html_elem() {
+        let out = render_body("a <col-s space=\"bgr\">[0, 0, 1]</col-s> b");
+        assert!(
+            out.contains(r#"#html.elem("col-s", attrs: ("space": "bgr"))[\[0, 0, 1\]]"#),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn converts_empty_inline_html_and_void() {
+        // Empty element keeps an (empty) body; void elements get none.
+        let out = render_body("x <col-s value='656nm'></col-s> y <br> z");
+        assert!(
+            out.contains(r#"#html.elem("col-s", attrs: ("value": "656nm"))[]"#),
+            "got: {out}"
+        );
+        assert!(out.contains(r#"#html.elem("br")"#), "got: {out}");
+        assert!(
+            !out.contains(r#"#html.elem("br")["#),
+            "void br should have no body: {out}"
+        );
+    }
+
+    #[test]
+    fn converts_markdown_table() {
+        let out = render_body("| a | b |\n|---|:-:|\n| 1 | 2 |\n");
+        assert!(out.contains("#table("), "got: {out}");
+        assert!(out.contains("columns: 2"), "got: {out}");
+        assert!(out.contains("align: (auto, center)"), "got: {out}");
+        assert!(out.contains("table.header([a], [b], )"), "got: {out}");
+        assert!(out.contains("[1], [2], "), "got: {out}");
+    }
+
+    /// The full shortcode path: preprocess (text → markers) then render.
+    fn convert(md: &str) -> String {
+        render_body(&preprocess_shortcodes(md))
+    }
+
+    #[test]
+    fn shortcode_inside_table_cell_converts() {
+        let out = convert("| a | {{ diagram(asset=\"x_y.svg\") }} |\n|---|---|\n| 1 | 2 |\n");
+        assert!(out.contains(r#"#diagram(asset: "x_y.svg")"#), "got: {out}");
+        // arg underscores must NOT be markup-escaped (they go via parse_shortcode)
+        assert!(!out.contains(r"x\_y"), "got: {out}");
+    }
+
+    #[test]
+    fn shortcode_mid_paragraph_converts() {
+        let out = convert("before {{ var(name=\"x\") }} after\n");
+        assert!(out.contains(r#"#var(name: "x")"#), "got: {out}");
+    }
+
+    #[test]
+    fn shortcode_inside_inline_code_is_left_literal() {
+        let pre = preprocess_shortcodes("use `{{ foo() }}` here");
+        assert!(
+            !pre.contains(MARKER_INLINE),
+            "shortcode in a code span should not be marked: {pre}"
+        );
+        let out = convert("use `{{ foo() }}` here");
+        assert!(!out.contains("#foo()"), "got: {out}");
     }
 }
