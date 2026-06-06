@@ -110,6 +110,17 @@ impl Emit {
             Emit::Copy(src) => fs::copy(src, dest).map(drop),
         }
     }
+
+    /// The output bytes — the in-memory buffer, or a fresh read of the
+    /// path-backed source. Backs `asset.*().read()`; once a content-addressed
+    /// cache lands this reads the cache file uniformly. Not held in RAM for the
+    /// `Copy` case, so reading a large asset is pay-as-you-go.
+    pub(crate) fn read(&self) -> io::Result<Bytes> {
+        match self {
+            Emit::Bytes(bytes) => Ok(bytes.clone()),
+            Emit::Copy(src) => Ok(Bytes::new(fs::read(src)?)),
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -11,12 +11,16 @@
 //! opposite comemo requirements.
 //!
 //! - **Resolved-map — tracked/hashed (data IN, drives convergence).**
-//!   [`ResolvedAssets`] (`AssetSpec -> url`) rides the relayout style chain via
-//!   [`TwylaAssetMap`]. The `StyleChain` is hashed *by value* into typst's
-//!   `realize` memo key, so injecting a more-complete map is a comemo miss for
-//!   every `asset.*` consumer — which is what re-resolves them. Its `Hash` is
-//!   *order-independent* so the same entry set hashes identically regardless of
-//!   discovery order (lets a warm rebuild reuse the cache).
+//!   [`ResolvedAssets`] (`AssetSpec -> ResolvedAsset`) rides the relayout style
+//!   chain via [`TwylaAssetMap`]. The full record rides the chain so `.url()`
+//!   *and* `.read()` answer off it; its `Hash`/`Eq` key only on each entry's
+//!   `(spec, content_hash, url)`, never the bytes (the `content_hash`
+//!   fingerprint stands in for them — see [`ResolvedAssets`]). The `StyleChain`
+//!   is hashed *by value* into typst's `realize` memo key, so injecting a
+//!   more-complete map is a comemo miss for every `asset.*` consumer — which is
+//!   what re-resolves them. Its `Hash` is *order-independent* so the same entry
+//!   set hashes identically regardless of discovery order (lets a warm rebuild
+//!   reuse the cache).
 //! - **Discovery sink — per-generation epoch (specs OUT, drives discovery).**
 //!   [`AssetSink`] wraps a write-only [`crossbeam_channel::Sender`] and rides
 //!   the chain via [`TwylaAssetSink`]. Its `Hash` keys on the resolver's
@@ -49,7 +53,7 @@ use std::{fs, io};
 
 use comemo::Tracked;
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use ecow::EcoString;
+use ecow::{EcoString, eco_format};
 use typst::World;
 use typst::diag::{At, HintedStrResult, SourceResult};
 use typst::foundations::{
@@ -144,26 +148,49 @@ impl Asset {
     fn url(&self, context: Tracked<Context>) -> HintedStrResult<Str> {
         Ok(resolve_or_request(context.styles()?, &self.request.spec))
     }
+
+    /// The asset's resolved output bytes (e.g. compiled CSS, or a file's
+    /// contents) — for inlining instead of linking.
+    ///
+    /// Contextual, like [`url`](Self::url) — call it inside `#context`:
+    ///
+    /// ```typ
+    /// #context html.elem("style", asset.sass("main.scss").read())
+    /// ```
+    ///
+    /// Reads path-backed assets from disk on demand, so it never holds the
+    /// bytes in RAM longer than the call.
+    #[func(contextual)]
+    fn read(&self, context: Tracked<Context>) -> HintedStrResult<Bytes> {
+        read_or_request(context.styles()?, &self.request.spec)
+    }
 }
 
-/// Resolve a spec's URL off the style chain, or request it. The placeholder
-/// protocol both `asset.*` consumers obey, in one place:
+/// The placeholder protocol every `asset.*` consumer obeys, in one place: look
+/// the spec up in the injected resolved-map ([`TwylaAssetMap`]) and either
+/// answer from the hit or request it on a miss.
 ///
-/// - **Hit** — the injected resolved-map ([`TwylaAssetMap`]) already has this
-///   spec's URL. This tracked read is what makes the page *converge*.
+/// - **Hit** — the map already has this spec's [`ResolvedAsset`]; `hit` reads
+///   what it needs off it (URL, bytes, …). This tracked read is what makes the
+///   page *converge*.
 /// - **Miss** — report the spec on the write-only discovery sink
-///   ([`TwylaAssetSink`]; its epoch is in the comemo key, the channel isn't)
-///   and return [`ASSET_PENDING`]. A later relayout iteration re-runs this
-///   against the now-populated map.
+///   ([`TwylaAssetSink`]; its epoch is in the comemo key, the channel isn't) and
+///   return `miss`. A later relayout iteration re-runs this against the
+///   now-populated map.
 ///
-/// Shared by [`Asset::url`] (contextual, reads `context.styles()`) and the
-/// native image rule (reads the show rule's `styles` directly — no `#context`).
-pub(crate) fn resolve_or_request(styles: StyleChain, spec: &AssetSpec) -> Str {
+/// Used off `context.styles()` (the contextual methods) or a show rule's live
+/// `styles` directly (the native image rule — no `#context` needed).
+fn resolve_with<T>(
+    styles: StyleChain,
+    spec: &AssetSpec,
+    hit: impl FnOnce(&ResolvedAsset) -> T,
+    miss: impl FnOnce() -> T,
+) -> T {
     if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetMap::map)
         && let Some(map) = dynamic.downcast::<ResolvedAssets>()
-        && let Some(url) = map.get(spec)
+        && let Some(asset) = map.get(spec)
     {
-        return Str::from(url.as_str());
+        return hit(asset);
     }
 
     if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetSink::sink)
@@ -171,7 +198,38 @@ pub(crate) fn resolve_or_request(styles: StyleChain, spec: &AssetSpec) -> Str {
     {
         let _ = sink.tx.send(AssetRequest { spec: spec.clone() });
     }
-    Str::from(ASSET_PENDING)
+    miss()
+}
+
+/// Resolve a spec's URL off the style chain, or request it (returns
+/// [`ASSET_PENDING`] on a miss). Shared by [`Asset::url`] and the native image
+/// rule.
+pub(crate) fn resolve_or_request(styles: StyleChain, spec: &AssetSpec) -> Str {
+    resolve_with(
+        styles,
+        spec,
+        |asset| Str::from(asset.url.as_str()),
+        || Str::from(ASSET_PENDING),
+    )
+}
+
+/// Resolve a spec's output *bytes* off the style chain, or request it (returns
+/// empty bytes on a miss — the placeholder, discarded before convergence).
+/// Backs [`Asset::read`]. The bytes come from `built.emit`, so a path-backed
+/// asset is read from disk here rather than held in RAM.
+fn read_or_request(styles: StyleChain, spec: &AssetSpec) -> HintedStrResult<Bytes> {
+    resolve_with(
+        styles,
+        spec,
+        |asset| {
+            asset
+                .built
+                .emit
+                .read()
+                .map_err(|err| eco_format!("failed to read asset bytes: {err}").into())
+        },
+        || Ok(Bytes::new(Vec::<u8>::new())),
+    )
 }
 
 impl Repr for Asset {
@@ -230,25 +288,49 @@ pub struct TwylaAssetSink {
     pub sink: Value,
 }
 
-/// The resolved-URL map carried on the style chain: `AssetSpec -> url`.
+/// The resolved-asset map carried on the style chain: `AssetSpec ->
+/// ResolvedAsset`. The full record rides the chain so both `.url()` and
+/// `.read()` resolve off it; injecting it never loads asset bytes into RAM (see
+/// [`ResolvedAsset`]).
 ///
-/// `Hash` is **order-independent** (per-entry hashes sorted before hashing) so
-/// the same set of entries hashes identically regardless of discovery order.
+/// `Hash`/`Eq` key on each entry's `(spec, content_hash, url)` — the only parts
+/// that change observable output — **never** the bytes or path in `built.emit`.
+/// Hashing the bytes would make this `O(total asset bytes)` per relayout
+/// iteration (and bloat the comemo key); the `content_hash` fingerprint is a
+/// cheap, sound stand-in for "the bytes". `Hash` is **order-independent**
+/// (per-entry hashes sorted) so the same entry set hashes identically
+/// regardless of discovery order, and `Eq` is written to match.
 #[ty(name = "twyla-resolved-assets")]
-#[derive(Clone, PartialEq, Debug)]
-pub struct ResolvedAssets(HashMap<AssetSpec, String>);
+#[derive(Clone, Debug)]
+pub struct ResolvedAssets(HashMap<AssetSpec, ResolvedAsset>);
 
 impl ResolvedAssets {
-    fn get(&self, spec: &AssetSpec) -> Option<&String> {
+    fn get(&self, spec: &AssetSpec) -> Option<&ResolvedAsset> {
         self.0.get(spec)
+    }
+
+    /// The per-entry hash fingerprint — the only fields that affect observable
+    /// output. Shared by `Hash` and `Eq` so the two stay consistent.
+    fn entry_fingerprints(&self) -> Vec<u128> {
+        let mut entries: Vec<u128> = self
+            .0
+            .iter()
+            .map(|(spec, asset)| hash128(&(spec, asset.built.content_hash, &asset.url)))
+            .collect();
+        entries.sort_unstable();
+        entries
+    }
+}
+
+impl PartialEq for ResolvedAssets {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry_fingerprints() == other.entry_fingerprints()
     }
 }
 
 impl Hash for ResolvedAssets {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let mut entries: Vec<u128> = self.0.iter().map(|kv| hash128(&kv)).collect();
-        entries.sort_unstable();
-        entries.hash(state);
+        self.entry_fingerprints().hash(state);
     }
 }
 
@@ -349,6 +431,12 @@ impl Upstream {
 }
 
 /// One processed asset: where it lives, how to emit it, and what it depends on.
+///
+/// This is the value carried on the style chain (inside [`ResolvedAssets`]), so
+/// `asset.*().url()` / `.read()` read straight off it. Its `built.emit` is
+/// either in-memory bytes (Arc-shared, cheap to clone onto the chain) or a path
+/// the bytes are read from on demand — so injecting the whole record never pulls
+/// asset bytes into RAM.
 #[derive(Clone, Debug)]
 pub struct ResolvedAsset {
     /// The spec that produced it (its key).
@@ -357,6 +445,9 @@ pub struct ResolvedAsset {
     pub built: Built,
     /// Bundle-relative output path, e.g. `assets/main-<hash>.css`.
     pub output_path: String,
+    /// The public, root-relative URL `.url()` returns (`output_path` resolved
+    /// through [`TwylaContext::asset_url`], so it folds in any `base_url`).
+    pub url: String,
 }
 
 impl ResolvedAsset {
@@ -411,15 +502,13 @@ impl AssetResolver {
         TwylaAssetSink::sink.set(Value::dynamic(sink)).wrap()
     }
 
-    /// The resolved-map style for the current store — rebuilt each iteration.
+    /// The resolved-map style for the current store — rebuilt each iteration as
+    /// the store drains. Clones the whole store onto the chain; that's cheap
+    /// because `ResolvedAsset`'s bytes are Arc-shared or a path (never deep
+    /// byte copies), and the map's `Hash` ignores them anyway.
     pub fn map_style(&self) -> LazyHash<Style> {
-        let map: HashMap<AssetSpec, String> = self
-            .resolved
-            .iter()
-            .map(|(spec, asset)| (spec.clone(), self.ctx.asset_url(&asset.output_path)))
-            .collect();
         TwylaAssetMap::map
-            .set(Value::dynamic(ResolvedAssets(map)))
+            .set(Value::dynamic(ResolvedAssets(self.resolved.clone())))
             .wrap()
     }
 
@@ -453,11 +542,13 @@ impl AssetResolver {
         };
 
         let output_path = self.ctx.default_asset_output(&built);
+        let url = self.ctx.asset_url(&output_path);
 
         Ok(ResolvedAsset {
             spec: spec.clone(),
             built,
             output_path,
+            url,
         })
     }
 

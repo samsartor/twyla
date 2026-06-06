@@ -6,8 +6,8 @@
 <asset>
 
 The `asset` module turns project files into fingerprinted outputs emitted under
-`/assets/…`. Two constructors exist today; both return an `Asset` whose
-resolved URL you read with `.url()`.
+`/assets/…`. Two constructors exist today; both return an `Asset` you either
+*link* to with `.url()` or *inline* with `.read()`.
 
 == asset.file
 <asset-file>
@@ -35,11 +35,25 @@ and fingerprints the result. The indented `.sass` syntax and `.scss` are both
 supported, chosen by extension. `@use`/`@import` partials are tracked, so
 editing a partial invalidates the compiled CSS.
 
-== .url() is contextual
-<url-is-contextual>
+== .read() for inlining
+<asset-read>
 
-An asset's URL is resolved during compilation, so `.url()` must be called
-inside a `#context` block (or inside a function the template wraps in
+Where `.url()` links to the emitted file, `.read()` returns its resolved output
+*bytes* — for inlining instead of linking. A file asset reads back its
+contents; a sass asset reads back its *compiled* CSS:
+
+```typ
+#context html.elem("style", str(asset.sass("/sass/critical.sass").read()))
+```
+
+Path-backed assets are read from disk on demand, so `.read()` never holds the
+bytes in memory longer than the call (fine for large files).
+
+== .url() and .read() are contextual
+<resolution-is-contextual>
+
+An asset is resolved during compilation, so both `.url()` and `.read()` must be
+called inside a `#context` block (or inside a function the template wraps in
 `#context`):
 
 ```typ

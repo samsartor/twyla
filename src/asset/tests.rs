@@ -6,14 +6,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crossbeam_channel::unbounded;
-use typst::foundations::{Style, Value};
+use typst::foundations::{Bytes, Style, Value};
 use typst::syntax::{FileId, RootedPath, VirtualPath, VirtualRoot};
 use typst::utils::LazyHash;
 use typst_utils::hash128;
 
 use super::*;
 use crate::project::TwylaContext;
-use crate::render::RenderWorld;
+use crate::render::{Emit, RenderWorld};
 
 fn site(files: &[(&str, &str)]) -> (TwylaContext, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -106,6 +106,40 @@ fn multiple_assets_resolve_and_sass_renames_to_css() {
     );
 }
 
+/// `.read()` resolves an asset's *bytes* through the same loop: a file's
+/// contents inline verbatim, and a sass asset inlines its *compiled* CSS (not
+/// the source). The asset is still registered for emission, and no placeholder
+/// (empty-bytes miss) survives to output.
+#[test]
+fn read_inlines_asset_bytes_through_the_loop() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context str(asset.file(\"snippet.txt\").read()) \
+             #context str(asset.sass(\"theme.scss\").read())",
+        ),
+        ("content/snippet.txt", "HELLO-INLINE-CONTENT"),
+        ("content/theme.scss", "a { b { color: red; } }"),
+    ]);
+    let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+
+    assert!(
+        html.contains("HELLO-INLINE-CONTENT"),
+        "file bytes not inlined:\n{html}"
+    );
+    // grass expands the nested rule into a real selector — proof we inlined the
+    // *compiled* CSS, not the raw scss source (which has no `a b` selector).
+    assert!(
+        html.contains("a b"),
+        "compiled sass bytes not inlined:\n{html}"
+    );
+    assert_eq!(assets.len(), 2, "both assets still registered: {assets:?}");
+    assert!(
+        !html.contains("__twyla-asset-pending__"),
+        "placeholder leaked:\n{html}"
+    );
+}
+
 /// Two *separate* resolvers in one process (sharing comemo's global cache) must
 /// each resolve independently — the per-resolver epoch base prevents one from
 /// hitting the other's cached placeholder.
@@ -186,10 +220,24 @@ fn map_hashes_by_content_sink_keys_on_epoch() {
         file: fid("content/b.scss"),
     };
 
+    // A minimal resolved record; the map's hash only looks at `(spec,
+    // content_hash, url)`, so the emit/upstream fields can be empty here.
+    let resolved = |spec: &AssetSpec, url: &str| ResolvedAsset {
+        spec: spec.clone(),
+        built: Built {
+            emit: Emit::Bytes(Bytes::new(Vec::<u8>::new())),
+            upstream: Vec::new(),
+            content_hash: 0,
+            ext: None,
+            stem: None,
+        },
+        output_path: String::from(url),
+        url: String::from(url),
+    };
     let make = |pairs: &[(&AssetSpec, &str)]| {
         let mut m = HashMap::new();
         for (k, v) in pairs {
-            m.insert((*k).clone(), String::from(*v));
+            m.insert((*k).clone(), resolved(k, v));
         }
         ResolvedAssets(m)
     };
