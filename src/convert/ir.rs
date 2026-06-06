@@ -58,6 +58,11 @@ pub enum Inline {
         attrs: Vec<(String, String)>,
         children: Content,
     },
+    /// Inline image: `![alt](src)` → `#html.elem("img", attrs: …)`.
+    Image {
+        src: String,
+        alt: String,
+    },
     SoftBreak,
     HardBreak,
     /// Untranslatable inline content, rendered as a TODO comment.
@@ -370,6 +375,24 @@ fn render_inline(i: &Inline, out: &mut String, prefix: &str) {
             }
             if boxed {
                 out.push(')');
+            }
+        }
+        Inline::Image { src, alt } => {
+            if src.starts_with("http://") || src.starts_with("https://") {
+                let dict = typst_attrs(
+                    [("src", src.as_str()), ("alt", alt.as_str())].into_iter(),
+                );
+                write!(out, "#html.elem(\"img\"{dict})").unwrap();
+            } else if alt.is_empty() {
+                write!(out, "#image(\"{}\")", escape_typst_string(src)).unwrap();
+            } else {
+                write!(
+                    out,
+                    "#image(\"{}\", alt: \"{}\")",
+                    escape_typst_string(src),
+                    escape_typst_string(alt)
+                )
+                .unwrap();
             }
         }
         Inline::SoftBreak => out.push('\n'),

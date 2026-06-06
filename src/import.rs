@@ -570,6 +570,10 @@ enum Frame {
         children: Content,
     },
     TableCell(Content),
+    Image {
+        src: String,
+        alt: Content,
+    },
     // text accumulator
     Code {
         lang: String,
@@ -642,6 +646,9 @@ impl<'a> Builder<'a> {
             Frame::Strong(c) => self.push_inline(Inline::Strong(c)),
             Frame::Strike(c) => self.push_inline(Inline::Strike(c)),
             Frame::Link { dest, content } => self.push_inline(Inline::Link { dest, content }),
+            Frame::Image { src, alt } => {
+                self.push_inline(Inline::Image { src, alt: plain_alt(&alt) })
+            }
             Frame::ShortcodeInline {
                 name,
                 args,
@@ -748,6 +755,10 @@ impl<'a> Builder<'a> {
                 dest: dest_url.to_string(),
                 content: Vec::new(),
             }),
+            Tag::Image { dest_url, .. } => self.stack.push(Frame::Image {
+                src: dest_url.to_string(),
+                alt: Vec::new(),
+            }),
             other => self.unsupported(Event::Start(other)),
         }
     }
@@ -804,6 +815,11 @@ impl<'a> Builder<'a> {
             TagEnd::Link => {
                 if let Some(Frame::Link { dest, content }) = self.stack.pop() {
                     self.push_inline(Inline::Link { dest, content });
+                }
+            }
+            TagEnd::Image => {
+                if let Some(Frame::Image { src, alt }) = self.stack.pop() {
+                    self.push_inline(Inline::Image { src, alt: plain_alt(&alt) });
                 }
             }
             TagEnd::Table => {
@@ -1045,6 +1061,7 @@ impl<'a> Builder<'a> {
                 | Frame::Strong(v)
                 | Frame::Strike(v)
                 | Frame::Link { content: v, .. }
+                | Frame::Image { alt: v, .. }
                 | Frame::ShortcodeInline { content: v, .. }
                 | Frame::HtmlElem { children: v, .. }
                 | Frame::TableCell(v),
@@ -1085,6 +1102,24 @@ impl<'a> Builder<'a> {
             self.push_inline(Inline::Verbatim(ir::render(std::slice::from_ref(&blk))));
         }
     }
+}
+
+/// Extract plain text from an alt-content inline list (for `<img alt="...">``).
+/// Only Text and Code leaves contribute; markup structure is flattened.
+fn plain_alt(content: &Content) -> String {
+    fn collect(inlines: &[Inline], out: &mut String) {
+        for i in inlines {
+            match i {
+                Inline::Text(s) | Inline::Code(s) => out.push_str(s),
+                Inline::Emph(c) | Inline::Strong(c) | Inline::Strike(c) => collect(c, out),
+                Inline::Link { content: c, .. } => collect(c, out),
+                _ => {}
+            }
+        }
+    }
+    let mut s = String::new();
+    collect(content, &mut s);
+    s
 }
 
 fn ir_align(a: Alignment) -> Align {
