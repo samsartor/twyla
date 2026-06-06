@@ -44,6 +44,14 @@ pub enum Inline {
         name: String,
         args: String,
     },
+    /// A paired shortcode (`{% name(args) %}…{% end %}`) used in inline
+    /// position → `#name(args)[…]` on the same line, so typst keeps it in the
+    /// surrounding paragraph instead of splitting a block out.
+    ShortcodeBody {
+        name: String,
+        args: String,
+        content: Content,
+    },
     /// Inline HTML element — children are markdown inlines.
     Html {
         tag: String,
@@ -256,6 +264,15 @@ fn render_inline(i: &Inline, out: &mut String) {
             out.push(']');
         }
         Inline::Shortcode { name, args } => write!(out, "#{name}({args})").unwrap(),
+        Inline::ShortcodeBody {
+            name,
+            args,
+            content,
+        } => {
+            write!(out, "#{name}({args})[").unwrap();
+            render_inlines(content, out);
+            out.push(']');
+        }
         Inline::Html {
             tag,
             attrs,
@@ -299,7 +316,8 @@ fn plain_text_into(i: &Inline, s: &mut String) {
         | Inline::Strong(c)
         | Inline::Strike(c)
         | Inline::Link { content: c, .. }
-        | Inline::Html { children: c, .. } => {
+        | Inline::Html { children: c, .. }
+        | Inline::ShortcodeBody { content: c, .. } => {
             for x in c {
                 plain_text_into(x, s);
             }

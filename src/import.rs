@@ -249,10 +249,15 @@ fn preprocess_shortcodes(body: &str) -> String {
                     return out;
                 }
                 let inner = inner.trim();
+                // Emit the marker in place — no surrounding blank lines — so a
+                // paired shortcode keeps its source position: on its own line it
+                // parses as a block comment (block shortcode); mid-paragraph it
+                // parses as inline HTML (inline shortcode). The builder branches
+                // on that to keep inline ones inline.
                 if inner == "end" {
-                    write!(out, "\n\n{MARKER_CLOSE}\n\n").unwrap();
+                    out.push_str(MARKER_CLOSE);
                 } else {
-                    write!(out, "\n\n{MARKER_OPEN}{inner}{MARKER_END}\n\n").unwrap();
+                    write!(out, "{MARKER_OPEN}{inner}{MARKER_END}").unwrap();
                 }
             } else {
                 out += "{";
@@ -314,6 +319,14 @@ enum Frame {
     Strike(Content),
     Link {
         dest: String,
+        content: Content,
+    },
+    /// A paired shortcode opened in inline position (`{% x() %}…{% end %}`
+    /// mid-paragraph); its body collects inlines and becomes an
+    /// [`Inline::ShortcodeBody`].
+    ShortcodeInline {
+        name: String,
+        args: String,
         content: Content,
     },
     HtmlElem {
@@ -392,6 +405,15 @@ impl<'a> Builder<'a> {
             Frame::Strong(c) => self.push_inline(Inline::Strong(c)),
             Frame::Strike(c) => self.push_inline(Inline::Strike(c)),
             Frame::Link { dest, content } => self.push_inline(Inline::Link { dest, content }),
+            Frame::ShortcodeInline {
+                name,
+                args,
+                content,
+            } => self.push_inline(Inline::ShortcodeBody {
+                name,
+                args,
+                content,
+            }),
             Frame::HtmlElem {
                 tag,
                 attrs,
@@ -662,6 +684,14 @@ impl<'a> Builder<'a> {
             .and_then(|x| x.strip_suffix(MARKER_END))
         {
             match parse_shortcode(inner) {
+                // Position decides block vs inline: a marker on its own line
+                // arrives as `Event::Html` (block), mid-paragraph as
+                // `Event::InlineHtml` (inline).
+                Some((name, args)) if inline => self.stack.push(Frame::ShortcodeInline {
+                    name,
+                    args,
+                    content: Vec::new(),
+                }),
                 Some((name, args)) => self.stack.push(Frame::Shortcode {
                     name,
                     args,
@@ -672,8 +702,27 @@ impl<'a> Builder<'a> {
             return true;
         }
         if s == MARKER_CLOSE {
-            if let Some(Frame::Shortcode { name, args, body }) = self.stack.pop() {
-                self.push_block(Block::Shortcode { name, args, body });
+            // Close whichever shortcode frame is open (its own kind, not the
+            // close marker's position, decides block vs inline).
+            match self.stack.pop() {
+                Some(Frame::Shortcode { name, args, body }) => {
+                    self.push_block(Block::Shortcode { name, args, body });
+                }
+                Some(Frame::ShortcodeInline {
+                    name,
+                    args,
+                    content,
+                }) => self.push_inline(Inline::ShortcodeBody {
+                    name,
+                    args,
+                    content,
+                }),
+                other => {
+                    // Unbalanced `{% end %}` — restore and ignore.
+                    if let Some(f) = other {
+                        self.stack.push(f);
+                    }
+                }
             }
             return true;
         }
@@ -720,6 +769,7 @@ impl<'a> Builder<'a> {
                     | Frame::Strong(_)
                     | Frame::Strike(_)
                     | Frame::Link { .. }
+                    | Frame::ShortcodeInline { .. }
                     | Frame::HtmlElem { .. }
                     | Frame::TableCell(_)
             )
@@ -735,6 +785,7 @@ impl<'a> Builder<'a> {
                 | Frame::Strong(v)
                 | Frame::Strike(v)
                 | Frame::Link { content: v, .. }
+                | Frame::ShortcodeInline { content: v, .. }
                 | Frame::HtmlElem { children: v, .. }
                 | Frame::TableCell(v),
             ) => v.push(inl),
@@ -1064,6 +1115,21 @@ mod tests {
         let out = preprocess_shortcodes("{% centered() %}\n[a](/b)\n{% end %}\n");
         assert!(out.contains(MARKER_OPEN));
         assert!(out.contains(MARKER_CLOSE));
+    }
+
+    #[test]
+    fn inline_paired_shortcode_stays_inline() {
+        // Mid-paragraph paired shortcode renders inline (no block break).
+        let out = convert("A {% note() %}side{% end %} note.\n");
+        assert!(out.contains("A #note()[side] note."), "got:\n{out}");
+    }
+
+    #[test]
+    fn block_paired_shortcode_stays_block() {
+        // On its own line it stays a block shortcode.
+        let out = convert("{% centered() %}\nbody\n{% end %}\n");
+        assert!(out.contains("#centered()["), "got:\n{out}");
+        assert!(out.contains("body"), "got:\n{out}");
     }
 
     #[test]
