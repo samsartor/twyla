@@ -27,7 +27,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use twyla::build::{Build, run as build_run};
-use twyla::convert::{self, ConvertMode, ConvertOptions};
+use twyla::convert::{self, ConvertMode, ConvertOptions, SourceFormat};
 use twyla::import::import_md;
 use twyla::project::TwylaContext;
 use twyla::serve::{Serve, run as serve_run};
@@ -143,6 +143,7 @@ enum Cmd {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum FromFormat {
     Zola,
+    Hugo,
 }
 
 fn main() -> ExitCode {
@@ -268,7 +269,10 @@ fn cmd_convert(
     above: usize,
     below: usize,
 ) -> ExitCode {
-    let FromFormat::Zola = from; // only zola today
+    let source = match from {
+        FromFormat::Zola => SourceFormat::Zola,
+        FromFormat::Hugo => SourceFormat::Hugo,
+    };
     let ctx = match resolve_ctx(args) {
         Ok(c) => c,
         Err(code) => return code,
@@ -293,6 +297,7 @@ fn cmd_convert(
 
     let opts = ConvertOptions {
         ctx,
+        source,
         mode,
         ground_truth,
         output_dir,

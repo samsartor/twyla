@@ -8,10 +8,10 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 
-use crate::convert::ConvertMode;
+use crate::convert::{ConvertMode, SourceFormat};
 use crate::convert::report::Finding;
 use crate::convert::zola::MappedPage;
-use crate::import::import_md;
+use crate::import::{import_hugo_md, import_md};
 use crate::project::TwylaContext;
 
 /// Ensure each mapped page has a `.typ` per `mode`, and (when generating)
@@ -21,6 +21,7 @@ pub fn ensure_drafts(
     ctx: &TwylaContext,
     pages: &[MappedPage],
     mode: ConvertMode,
+    source: SourceFormat,
 ) -> io::Result<Vec<Finding>> {
     let mut findings = Vec::new();
 
@@ -40,7 +41,7 @@ pub fn ensure_drafts(
             // Hand-edited draft already present — leave it (unless overwriting).
             (true, ConvertMode::Generate | ConvertMode::Verify) => {}
             (true, ConvertMode::Overwrite) => {
-                write_draft(page)?;
+                write_draft(page, source)?;
                 findings.push(Finding::DraftWritten {
                     typ: page.typ_path.clone(),
                 });
@@ -54,7 +55,7 @@ pub fn ensure_drafts(
             }
             // Missing draft — generate scaffolding.
             (false, ConvertMode::Generate | ConvertMode::Overwrite) => {
-                write_draft(page)?;
+                write_draft(page, source)?;
                 findings.push(Finding::DraftWritten {
                     typ: page.typ_path.clone(),
                 });
@@ -70,9 +71,15 @@ pub fn ensure_drafts(
     Ok(findings)
 }
 
-fn write_draft(page: &MappedPage) -> io::Result<()> {
+fn write_draft(page: &MappedPage, source: SourceFormat) -> io::Result<()> {
     let src = fs::read_to_string(&page.md_path)?;
-    let draft = import_md(&src, &page.kind, page.output_override.as_deref()).map_err(|e| {
+    let import = match source {
+        SourceFormat::Zola => import_md(&src, &page.kind, page.output_override.as_deref()),
+        SourceFormat::Hugo => {
+            import_hugo_md(&src, &page.kind, page.output_override.as_deref(), &page.route)
+        }
+    };
+    let draft = import.map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{}: {e}", page.md_path.display()),
@@ -128,6 +135,7 @@ fn ensure_lib_templates(ctx: &TwylaContext, kinds: &BTreeSet<&str>) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convert::SourceFormat;
     use std::path::{Path, PathBuf};
 
     fn page(md: PathBuf, typ: PathBuf, output_override: Option<String>) -> MappedPage {
@@ -163,7 +171,7 @@ mod tests {
         let typ = dir.path().join("foo.typ");
         let pages = vec![page(md, typ.clone(), None)];
 
-        let findings = ensure_drafts(&ctx, &pages, ConvertMode::Generate).unwrap();
+        let findings = ensure_drafts(&ctx, &pages, ConvertMode::Generate, SourceFormat::Zola).unwrap();
         assert!(typ.exists());
         assert!(matches!(findings[0], Finding::DraftWritten { .. }));
         assert!(matches!(findings[1], Finding::Note { .. }));
@@ -180,7 +188,7 @@ mod tests {
         let typ = dir.path().join("foo.typ");
         let pages = vec![page(md, typ.clone(), None)];
 
-        let findings = ensure_drafts(&ctx, &pages, ConvertMode::Verify).unwrap();
+        let findings = ensure_drafts(&ctx, &pages, ConvertMode::Verify, SourceFormat::Zola).unwrap();
         assert!(!typ.exists());
         assert!(!ctx.root.join("templates/lib.typ").exists()); // verify writes nothing
         assert!(matches!(&findings[0], Finding::DraftMissing { .. }));
@@ -196,7 +204,7 @@ mod tests {
         std::fs::write(&typ, "// hand-written\n").unwrap();
         let pages = vec![page(md, typ.clone(), None)];
 
-        let findings = ensure_drafts(&ctx, &pages, ConvertMode::Generate).unwrap();
+        let findings = ensure_drafts(&ctx, &pages, ConvertMode::Generate, SourceFormat::Zola).unwrap();
         assert!(findings.is_empty());
         assert_eq!(std::fs::read_to_string(&typ).unwrap(), "// hand-written\n");
     }
@@ -211,7 +219,7 @@ mod tests {
         std::fs::write(&typ, "// hand-written\n").unwrap();
         let pages = vec![page(md, typ.clone(), Some("foo-bar/index.html".to_string()))];
 
-        let findings = ensure_drafts(&ctx, &pages, ConvertMode::Overwrite).unwrap();
+        let findings = ensure_drafts(&ctx, &pages, ConvertMode::Overwrite, SourceFormat::Zola).unwrap();
         assert!(matches!(findings[0], Finding::DraftWritten { .. }));
         let written = std::fs::read_to_string(&typ).unwrap();
         assert!(written.contains(r#"output: "foo-bar/index.html","#));
@@ -225,7 +233,7 @@ mod tests {
         let typ = dir.path().join("foo.typ");
         let pages = vec![page(md, typ, None)];
 
-        ensure_drafts(&ctx, &pages, ConvertMode::Generate).unwrap();
+        ensure_drafts(&ctx, &pages, ConvertMode::Generate, SourceFormat::Zola).unwrap();
         let lib = std::fs::read_to_string(ctx.root.join("templates/lib.typ")).unwrap();
         assert!(lib.contains("#let page-template(body) = body"));
     }
@@ -244,7 +252,7 @@ mod tests {
         let typ = dir.path().join("foo.typ");
         let pages = vec![page(md, typ, None)]; // kind "page"
 
-        ensure_drafts(&ctx, &pages, ConvertMode::Generate).unwrap();
+        ensure_drafts(&ctx, &pages, ConvertMode::Generate, SourceFormat::Zola).unwrap();
         let lib = std::fs::read_to_string(&lib_path).unwrap();
         assert!(lib.contains("#let dir-template(body) = [SECTION #body]")); // preserved
         assert!(lib.contains("#let page-template(body) = body")); // appended

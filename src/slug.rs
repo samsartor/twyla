@@ -29,6 +29,31 @@ pub fn slugify(s: &str) -> String {
     out
 }
 
+/// Hugo/goldmark anchor slugification. Lowercases, drops characters that are
+/// not alphanumeric or hyphen (dots, slashes, punctuation are stripped rather
+/// than converted to hyphens), and collapses runs of spaces/hyphens to one `-`.
+///
+/// "1.1 Higher Salaries" → `11-higher-salaries`  (dots stripped)
+/// "CI/CD"               → `cicd`                (slash stripped)
+pub fn hugo_slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_dash = true;
+    for ch in s.chars() {
+        if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase());
+            last_dash = false;
+        } else if (ch == ' ' || ch == '-') && !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+        // everything else (`.`, `/`, `!`, …) is silently dropped
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,5 +69,13 @@ mod tests {
     fn already_slugged_is_stable() {
         assert_eq!(slugify("guis-1"), "guis-1");
         assert_eq!(slugify("what-is-color"), "what-is-color");
+    }
+
+    #[test]
+    fn hugo_drops_punctuation_not_replace() {
+        assert_eq!(hugo_slugify("1.1 Higher Salaries"), "11-higher-salaries");
+        assert_eq!(hugo_slugify("CI/CD"), "cicd");
+        assert_eq!(hugo_slugify("Walking Tour"), "walking-tour");
+        assert_eq!(hugo_slugify("1.2 Increased Employability"), "12-increased-employability");
     }
 }

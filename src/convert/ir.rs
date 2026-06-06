@@ -14,7 +14,7 @@
 use std::fmt::Write as _;
 
 use crate::html::Node as HtmlNode;
-use crate::slug::slugify;
+use crate::slug::{hugo_slugify, slugify};
 
 /// Per-column table alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +76,10 @@ pub type Content = Vec<Inline>;
 pub enum Block {
     Heading {
         level: u8,
+        /// Explicit heading ID from Hugo/goldmark `{#id}` attribute syntax.
+        /// When set, this is used as-is for the typst label instead of
+        /// slugifying the heading text.
+        id: Option<String>,
         content: Content,
     },
     Para(Content),
@@ -108,29 +112,45 @@ pub enum Block {
 
 // ---- renderer ------------------------------------------------------------
 
-/// Render a document body (sequence of blocks) into typst markup.
+/// Render a document body using Zola's slugification for heading anchors.
 pub fn render(blocks: &[Block]) -> String {
+    render_with_slug(blocks, "", crate::slug::slugify)
+}
+
+/// Render a document body using Hugo/goldmark slugification for heading anchors.
+/// `label_prefix` is prepended to every heading label and same-page anchor
+/// target to prevent cross-page label conflicts in the typst bundle.
+pub fn render_hugo(blocks: &[Block], label_prefix: &str) -> String {
+    render_with_slug(blocks, label_prefix, hugo_slugify)
+}
+
+fn render_with_slug(blocks: &[Block], prefix: &str, slug: fn(&str) -> String) -> String {
     let mut out = String::new();
     for b in blocks {
-        render_block(b, &mut out);
+        render_block(b, &mut out, prefix, slug);
     }
     out
 }
 
-fn render_block(b: &Block, out: &mut String) {
+fn render_block(b: &Block, out: &mut String, prefix: &str, slug: fn(&str) -> String) {
     match b {
-        Block::Heading { level, content } => {
+        Block::Heading { level, id, content } => {
             for _ in 0..*level {
                 out.push('=');
             }
             out.push(' ');
-            render_inlines(content, out);
-            // A `<slug>` label so headings are link targets, matching zola's
-            // pulldown auto-id (computed from the heading's plain text).
-            writeln!(out, " <{}>\n", slugify(&plain_text(content))).unwrap();
+            render_inlines(content, out, prefix);
+            // Label: use explicit `{#id}` attribute when present (Hugo/goldmark),
+            // otherwise slugify the heading text. Always scoped with `prefix` to
+            // avoid cross-page label conflicts in the typst bundle.
+            let label = match id.as_deref() {
+                Some(explicit) => format!("{prefix}{explicit}"),
+                None => format!("{prefix}{}", slug(&plain_text(content))),
+            };
+            writeln!(out, " <{label}>\n").unwrap();
         }
         Block::Para(content) => {
-            render_inlines(content, out);
+            render_inlines(content, out, prefix);
             out.push_str("\n\n");
         }
         Block::Code { lang, text } => {
@@ -146,7 +166,7 @@ fn render_block(b: &Block, out: &mut String) {
         Block::Quote(blocks) => {
             out.push_str("#html.blockquote[\n");
             for b in blocks {
-                render_block(b, out);
+                render_block(b, out, prefix, slug);
             }
             out.push_str("]\n\n");
         }
@@ -154,7 +174,7 @@ fn render_block(b: &Block, out: &mut String) {
             let marker = if *ordered { "+ " } else { "- " };
             for item in items {
                 let mut buf = String::new();
-                render_item(item, &mut buf);
+                render_item(item, &mut buf, prefix, slug);
                 // Indent continuation lines under the marker (width of `- `):
                 // an unindented line ends the item, so typst would split it out
                 // of the list (`</ul><p>…</p><ul>`).
@@ -163,12 +183,12 @@ fn render_block(b: &Block, out: &mut String) {
             }
             out.push('\n');
         }
-        Block::Table { align, head, rows } => render_table(align, head, rows, out),
+        Block::Table { align, head, rows } => render_table(align, head, rows, out, prefix),
         Block::Rule => out.push_str("#html.hr()\n\n"),
         Block::Shortcode { name, args, body } => {
             writeln!(out, "\n#{name}({args})[").unwrap();
             for b in body {
-                render_block(b, out);
+                render_block(b, out, prefix, slug);
             }
             // Trim the trailing block break so the body stays a single
             // paragraph inside the shortcode (avoids a stray empty `<p>`).
@@ -189,13 +209,13 @@ fn render_block(b: &Block, out: &mut String) {
 
 /// A list item: inline the common single-paragraph case (`- text`), otherwise
 /// render its blocks.
-fn render_item(blocks: &[Block], out: &mut String) {
+fn render_item(blocks: &[Block], out: &mut String, prefix: &str, slug: fn(&str) -> String) {
     if let [Block::Para(content)] = blocks {
-        render_inlines(content, out);
+        render_inlines(content, out, prefix);
         out.push('\n');
     } else {
         for b in blocks {
-            render_block(b, out);
+            render_block(b, out, prefix, slug);
         }
     }
 }
@@ -212,7 +232,7 @@ fn indent_continuation(text: &str, pad: &str, out: &mut String) {
     }
 }
 
-fn render_table(align: &[Align], head: &[Content], rows: &[Vec<Content>], out: &mut String) {
+fn render_table(align: &[Align], head: &[Content], rows: &[Vec<Content>], out: &mut String, prefix: &str) {
     out.push_str("\n// TODO twyla-convert: check table styling\n");
     writeln!(out, "#table(").unwrap();
     writeln!(out, "  columns: {},", align.len()).unwrap();
@@ -224,7 +244,7 @@ fn render_table(align: &[Align], head: &[Content], rows: &[Vec<Content>], out: &
         out.push_str("  table.header(");
         for cell in head {
             out.push('[');
-            render_inlines(cell, out);
+            render_inlines(cell, out, prefix);
             out.push_str("], ");
         }
         out.push_str("),\n");
@@ -233,7 +253,7 @@ fn render_table(align: &[Align], head: &[Content], rows: &[Vec<Content>], out: &
         out.push_str("  ");
         for cell in row {
             out.push('[');
-            render_inlines(cell, out);
+            render_inlines(cell, out, prefix);
             out.push_str("], ");
         }
         out.push('\n');
@@ -241,26 +261,80 @@ fn render_table(align: &[Align], head: &[Content], rows: &[Vec<Content>], out: &
     out.push_str(")\n\n");
 }
 
-fn render_inlines(inlines: &[Inline], out: &mut String) {
-    for i in inlines {
-        render_inline(i, out);
+fn render_inlines(inlines: &[Inline], out: &mut String, prefix: &str) {
+    for (idx, i) in inlines.iter().enumerate() {
+        // Typst greedily parses `#expr](text)` / `#expr)(text)` as function
+        // calls. Insert an empty content block to break the ambiguity when a
+        // text node starting with `(` follows a code expression.
+        if idx > 0 && code_expr_ending(&inlines[idx - 1]) {
+            if let Inline::Text(s) = i {
+                if s.starts_with('(') {
+                    out.push_str("/**/");
+                }
+            }
+        }
+
+        // When `_`/`*` would be directly adjacent to an alphanumeric character
+        // on either side, typst won't open or close the delimiter there. Use
+        // the function-call form instead.
+        let needs_func_emph = matches!(i, Inline::Emph(_) | Inline::Strong(_)) && {
+            let next_alnum = inlines.get(idx + 1).is_some_and(|next| {
+                matches!(next, Inline::Text(s) if s.starts_with(|c: char| c.is_alphanumeric()))
+            });
+            let prev_alnum = out.chars().last().is_some_and(|c| c.is_alphanumeric());
+            next_alnum || prev_alnum
+        };
+        match (i, needs_func_emph) {
+            (Inline::Emph(c), true) => {
+                out.push_str("#emph[");
+                render_inlines(c, out, prefix);
+                out.push(']');
+            }
+            (Inline::Strong(c), true) => {
+                out.push_str("#strong[");
+                render_inlines(c, out, prefix);
+                out.push(']');
+            }
+            _ => render_inline(i, out, prefix),
+        }
     }
 }
 
-fn render_inline(i: &Inline, out: &mut String) {
+fn code_expr_ending(i: &Inline) -> bool {
+    matches!(
+        i,
+        Inline::Html { .. }
+            | Inline::Link { .. }
+            | Inline::ShortcodeBody { .. }
+            | Inline::Strike(_)
+    )
+}
+
+fn render_inline(i: &Inline, out: &mut String, prefix: &str) {
     match i {
         Inline::Text(s) => out.push_str(&escape_markup(s)),
         Inline::Code(s) => write!(out, "`{s}`").unwrap(),
-        Inline::Emph(c) => wrap(out, "_", c, "_"),
-        Inline::Strong(c) => wrap(out, "*", c, "*"),
-        Inline::Strike(c) => wrap(out, "#strike[", c, "]"),
+        Inline::Emph(c) => wrap(out, "_", c, "_", prefix),
+        Inline::Strong(c) => wrap(out, "*", c, "*", prefix),
+        Inline::Strike(c) => wrap(out, "#strike[", c, "]", prefix),
         Inline::Link { dest, content } => {
+            // Hugo {{< ref >}} shortcodes in link destinations are mangled by
+            // pulldown-cmark's angle-bracket stripping: `<!--TWYLA-HUGO:...-->`
+            // becomes `!--TWYLA-HUGO:...--`. Render the link text as-is with a
+            // TODO comment so the porter can fix the href manually.
+            if dest.contains("TWYLA-HUGO") {
+                out.push_str("/* TODO twyla-convert: hugo ref link */");
+                render_inlines(content, out, prefix);
+                return;
+            }
             if let Some(frag) = dest.strip_prefix('#') {
-                write!(out, "#link(<{frag}>)[").unwrap();
+                // Same-page anchor link: prefix with the page label prefix so
+                // it matches the correspondingly-prefixed heading label.
+                write!(out, "#link(<{prefix}{frag}>)[").unwrap();
             } else {
                 write!(out, "#link(\"{}\")[", escape_typst_string(dest)).unwrap();
             }
-            render_inlines(content, out);
+            render_inlines(content, out, prefix);
             out.push(']');
         }
         Inline::Shortcode { name, args } => write!(out, "#{name}({args})").unwrap(),
@@ -270,7 +344,7 @@ fn render_inline(i: &Inline, out: &mut String) {
             content,
         } => {
             write!(out, "#{name}({args})[").unwrap();
-            render_inlines(content, out);
+            render_inlines(content, out, prefix);
             out.push(']');
         }
         Inline::Html {
@@ -291,7 +365,7 @@ fn render_inline(i: &Inline, out: &mut String) {
             }
             if !(children.is_empty() && is_void(tag)) {
                 out.push('[');
-                render_inlines(children, out);
+                render_inlines(children, out, prefix);
                 out.push(']');
             }
             if boxed {
@@ -305,9 +379,9 @@ fn render_inline(i: &Inline, out: &mut String) {
     }
 }
 
-fn wrap(out: &mut String, open: &str, content: &[Inline], close: &str) {
+fn wrap(out: &mut String, open: &str, content: &[Inline], close: &str, prefix: &str) {
     out.push_str(open);
-    render_inlines(content, out);
+    render_inlines(content, out, prefix);
     out.push_str(close);
 }
 
@@ -341,7 +415,10 @@ fn plain_text_into(i: &Inline, s: &mut String) {
 
 /// Escape a string for a typst string literal (`"…"`).
 pub fn escape_typst_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Backslash-escape characters that start typst markup syntax, so literal
@@ -383,18 +460,12 @@ fn typst_attrs<'a>(attrs: impl Iterator<Item = (&'a str, &'a str)>) -> String {
 /// document/html/head/body wrappers html5ever inserts are unwrapped.
 fn convert_html_node(node: &HtmlNode, out: &mut String) {
     match node {
-        HtmlNode::Document(children) => {
-            for c in children {
-                convert_html_node(c, out);
-            }
-        }
+        HtmlNode::Document(children) => convert_html_siblings(children, out),
         HtmlNode::Doctype(_) | HtmlNode::Comment(_) => {}
         HtmlNode::Text(t) => out.push_str(&escape_markup(t)),
         HtmlNode::Element(el) => {
             if matches!(el.name.as_str(), "html" | "head" | "body") {
-                for c in &el.children {
-                    convert_html_node(c, out);
-                }
+                convert_html_siblings(&el.children, out);
                 return;
             }
             let dict = typst_attrs(el.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
@@ -403,11 +474,27 @@ fn convert_html_node(node: &HtmlNode, out: &mut String) {
                 return;
             }
             out.push('[');
-            for c in &el.children {
-                convert_html_node(c, out);
-            }
+            convert_html_siblings(&el.children, out);
             out.push(']');
         }
+    }
+}
+
+/// Render a sequence of sibling HTML nodes, inserting `#[]` between an element
+/// node and a following text node that starts with `(` — typst would otherwise
+/// parse the `(` as additional function arguments to the preceding expression.
+fn convert_html_siblings(children: &[HtmlNode], out: &mut String) {
+    let mut prev_was_elem = false;
+    for c in children {
+        if prev_was_elem {
+            if let HtmlNode::Text(t) = c {
+                if t.starts_with('(') {
+                    out.push_str("/**/");
+                }
+            }
+        }
+        prev_was_elem = matches!(c, HtmlNode::Element(_));
+        convert_html_node(c, out);
     }
 }
 

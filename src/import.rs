@@ -30,6 +30,7 @@ use html5ever::tokenizer::{
     Tokenizer, TokenizerOpts,
 };
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use serde_yaml;
 use unscanny::Scanner;
 
 use crate::convert::ir::{self, Align, Block, Content, Inline};
@@ -54,6 +55,51 @@ pub fn import_md(input: &str, kind: &str, output: Option<&str>) -> Result<String
     let summary = summary_md.map(|md| ir::render(&parse_blocks(&preprocess_shortcodes(md))));
     let blocks = parse_blocks(&preprocess_shortcodes(&body));
     Ok(assemble(&meta, &ir::render(&blocks), summary.as_deref(), kind, output))
+}
+
+/// Convert a Hugo markdown source into a typst draft.
+///
+/// `route` is the page's output route (e.g. `posts/my-post/index.html`), used
+/// to derive a per-page label prefix that scopes heading anchors and same-page
+/// links so they don't conflict with identically-named headings in other pages.
+pub fn import_hugo_md(
+    input: &str,
+    kind: &str,
+    output: Option<&str>,
+    route: &str,
+) -> Result<String, String> {
+    let (fm_text, body) = split_yaml_frontmatter(input)?;
+    let meta = parse_yaml_frontmatter(fm_text)?;
+    let prefix = derive_page_prefix(route);
+    let (summary_md, body) = split_summary(body);
+    let summary = summary_md
+        .map(|md| ir::render_hugo(&parse_blocks(&preprocess_hugo_shortcodes(md)), &prefix));
+    let blocks = parse_blocks(&preprocess_hugo_shortcodes(&body));
+    Ok(assemble(
+        &meta,
+        &ir::render_hugo(&blocks, &prefix),
+        summary.as_deref(),
+        kind,
+        output,
+    ))
+}
+
+/// Derive a per-page label prefix from the page's output route.
+/// `"posts/travel/retreat/index.html"` → `"posts-travel-retreat-"`.
+/// The root page returns an empty prefix.
+fn derive_page_prefix(route: &str) -> String {
+    let dir = route
+        .strip_suffix("index.html")
+        .unwrap_or(route)
+        .trim_matches('/');
+    if dir.is_empty() {
+        return String::new();
+    }
+    let mut prefix = dir.replace('/', "-");
+    if !prefix.ends_with('-') {
+        prefix.push('-');
+    }
+    prefix
 }
 
 /// Split a body at zola's first `<!-- more -->` delimiter. Returns the summary
@@ -85,9 +131,9 @@ struct Meta {
     description: String,
     date: Option<(i64, u8, u8)>,
     draft: bool,
-    /// The frontmatter `[extra]` table, carried verbatim onto
-    /// `#set document(extra: ..)`. `None` when absent or empty.
-    extra: Option<toml::value::Table>,
+    /// Pre-rendered typst dict literal for `#set document(extra: ..)`.
+    /// `None` when absent or empty.
+    extra: Option<String>,
 }
 
 fn split_frontmatter(input: &str) -> Result<(&str, &str), String> {
@@ -99,6 +145,20 @@ fn split_frontmatter(input: &str) -> Result<(&str, &str), String> {
     let close = rest
         .find("\n+++")
         .ok_or_else(|| "no closing `+++` for frontmatter block".to_string())?;
+    let fm = &rest[..close];
+    let body = &rest[close + 4..];
+    Ok((fm, body.trim_start_matches('\n')))
+}
+
+fn split_yaml_frontmatter(input: &str) -> Result<(&str, &str), String> {
+    let input = input.trim_start_matches('\u{FEFF}');
+    let rest = input
+        .strip_prefix("---")
+        .ok_or_else(|| "expected `---` frontmatter at start of file".to_string())?;
+    let rest = rest.trim_start_matches('\n');
+    let close = rest
+        .find("\n---")
+        .ok_or_else(|| "no closing `---` for frontmatter block".to_string())?;
     let fm = &rest[..close];
     let body = &rest[close + 4..];
     Ok((fm, body.trim_start_matches('\n')))
@@ -137,7 +197,7 @@ fn parse_frontmatter(fm: &str) -> Result<Meta, String> {
         .get("extra")
         .and_then(|v| v.as_table())
         .filter(|t| !t.is_empty())
-        .cloned();
+        .map(|t| toml_to_typst(&toml::Value::Table(t.clone()), 1));
     Ok(Meta {
         title,
         description,
@@ -204,6 +264,126 @@ fn typst_dict_key(k: &str) -> String {
     }
 }
 
+// ---- YAML helpers -------------------------------------------------------
+
+fn yaml_as_str(v: &serde_yaml::Value) -> Option<&str> {
+    match v {
+        serde_yaml::Value::String(s) => Some(s.as_str()),
+        serde_yaml::Value::Tagged(t) => yaml_as_str(&t.value),
+        _ => None,
+    }
+}
+
+fn yaml_to_typst(v: &serde_yaml::Value, indent: usize) -> String {
+    let pad = "  ".repeat(indent);
+    let pad1 = "  ".repeat(indent + 1);
+    match v {
+        serde_yaml::Value::Null => "none".to_string(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::String(s) => format!("\"{}\"", ir::escape_typst_string(s)),
+        serde_yaml::Value::Sequence(arr) if arr.is_empty() => "()".to_string(),
+        serde_yaml::Value::Sequence(arr) => {
+            let nested = arr.iter().any(|x| {
+                matches!(x, serde_yaml::Value::Sequence(_) | serde_yaml::Value::Mapping(_))
+            });
+            if !nested {
+                let items: Vec<_> = arr.iter().map(|x| yaml_to_typst(x, indent)).collect();
+                let trailing = if items.len() == 1 { "," } else { "" };
+                format!("({}{trailing})", items.join(", "))
+            } else {
+                let items: Vec<_> = arr
+                    .iter()
+                    .map(|x| format!("{pad1}{}", yaml_to_typst(x, indent + 1)))
+                    .collect();
+                format!("(\n{},\n{pad})", items.join(",\n"))
+            }
+        }
+        serde_yaml::Value::Mapping(m) if m.is_empty() => "(:)".to_string(),
+        serde_yaml::Value::Mapping(m) => {
+            let items: Vec<_> = m
+                .iter()
+                .map(|(k, val)| {
+                    let key = yaml_as_str(k)
+                        .map(typst_dict_key)
+                        .unwrap_or_else(|| "\"?\"".to_string());
+                    format!("{pad1}{key}: {}", yaml_to_typst(val, indent + 1))
+                })
+                .collect();
+            format!("(\n{},\n{pad})", items.join(",\n"))
+        }
+        serde_yaml::Value::Tagged(t) => yaml_to_typst(&t.value, indent),
+    }
+}
+
+fn yaml_get_ci<'a>(map: &'a serde_yaml::Mapping, key: &str) -> Option<&'a serde_yaml::Value> {
+    let key_lower = key.to_lowercase();
+    map.iter()
+        .find(|(k, _)| {
+            yaml_as_str(k)
+                .map(|s| s.to_lowercase() == key_lower)
+                .unwrap_or(false)
+        })
+        .map(|(_, v)| v)
+}
+
+fn parse_date_str(s: &str) -> Option<(i64, u8, u8)> {
+    let s = s.trim();
+    if s.len() < 10 {
+        return None;
+    }
+    let mut parts = s[..10].splitn(3, '-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u8 = parts.next()?.parse().ok()?;
+    let d: u8 = parts.next()?.parse().ok()?;
+    Some((y, m, d))
+}
+
+fn parse_yaml_frontmatter(fm: &str) -> Result<Meta, String> {
+    let val: serde_yaml::Value =
+        serde_yaml::from_str(fm).map_err(|e| format!("frontmatter YAML: {e}"))?;
+    let map = match &val {
+        serde_yaml::Value::Mapping(m) => m,
+        _ => return Err("YAML frontmatter must be a mapping".to_string()),
+    };
+
+    let title = yaml_get_ci(map, "title")
+        .and_then(yaml_as_str)
+        .ok_or_else(|| "frontmatter missing `title`".to_string())?
+        .to_string();
+    let description = yaml_get_ci(map, "description")
+        .and_then(yaml_as_str)
+        .unwrap_or("")
+        .to_string();
+    let date = yaml_get_ci(map, "date")
+        .and_then(yaml_as_str)
+        .and_then(parse_date_str);
+    let draft = yaml_get_ci(map, "draft")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let standard = ["title", "date", "description", "draft"];
+    let extra_map: serde_yaml::Mapping = map
+        .iter()
+        .filter(|(k, _)| {
+            yaml_as_str(k)
+                .map(|s| {
+                    let s_lower = s.to_lowercase();
+                    !standard.contains(&s_lower.as_str())
+                })
+                .unwrap_or(true)
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let extra = if extra_map.is_empty() {
+        None
+    } else {
+        Some(yaml_to_typst(&serde_yaml::Value::Mapping(extra_map), 1))
+    };
+
+    Ok(Meta { title, description, date, draft, extra })
+}
+
 // ---- shortcode preprocessing --------------------------------------------
 //
 // Zola shortcodes (`{{ … }}` and `{% … %}`) aren't markdown syntax — pulldown
@@ -214,6 +394,10 @@ const MARKER_OPEN: &str = "<!--TWYLA-SC-OPEN:";
 const MARKER_CLOSE: &str = "<!--TWYLA-SC-CLOSE-->";
 const MARKER_INLINE: &str = "<!--TWYLA-SC-INLINE:";
 const MARKER_END: &str = "-->";
+
+const HUGO_MARKER: &str = "<!--TWYLA-HUGO:";
+const HUGO_BLOCK_MARKER: &str = "<!--TWYLA-HUGO-BLOCK:";
+const HUGO_END_MARKER: &str = "<!--TWYLA-HUGO-END-->";
 
 fn preprocess_shortcodes(body: &str) -> String {
     let mut out = String::new();
@@ -271,6 +455,55 @@ fn preprocess_shortcodes(body: &str) -> String {
     }
 }
 
+fn preprocess_hugo_shortcodes(body: &str) -> String {
+    let mut out = String::new();
+    let mut s = Scanner::new(body);
+    loop {
+        if s.eat_if("````") {
+            out += "````";
+            out += s.eat_until("````");
+            if s.eat_if("```") {
+                out += "````";
+            }
+        } else if s.eat_if('`') {
+            out += "`";
+            out += s.eat_until('`');
+            if s.eat_if('`') {
+                out += "`";
+            }
+        } else if s.eat_if("{{<") {
+            let inner = s.eat_until(">}}");
+            if s.eat_if(">}}") {
+                // Encode `"` as `&quot;` so the marker doesn't break HTML
+                // attribute values when the shortcode appears inside `href="..."`.
+                let safe = inner.trim().replace('"', "&quot;");
+                write!(out, "{HUGO_MARKER}{safe}{MARKER_END}").unwrap();
+            } else {
+                out += "{{<";
+                out += inner;
+            }
+        } else if s.eat_if("{{%") {
+            let inner = s.eat_until("%}}");
+            if s.eat_if("%}}") {
+                let inner = inner.trim().replace('"', "&quot;");
+                if inner.starts_with('/') {
+                    out.push_str(HUGO_END_MARKER);
+                } else {
+                    write!(out, "{HUGO_BLOCK_MARKER}{inner}{MARKER_END}").unwrap();
+                }
+            } else {
+                out += "{{%";
+                out += inner;
+            }
+        } else {
+            match s.eat() {
+                Some(c) => out.push(c),
+                None => return out,
+            }
+        }
+    }
+}
+
 // ---- markdown events → IR ------------------------------------------------
 
 /// Parse preprocessed markdown into the IR block tree.
@@ -278,6 +511,7 @@ fn parse_blocks(md: &str) -> Vec<Block> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
     let mut builder = Builder::new();
     for ev in Parser::new_ext(md, opts) {
         builder.event(ev);
@@ -312,6 +546,7 @@ enum Frame {
     Para(Content),
     Heading {
         level: u8,
+        id: Option<String>,
         content: Content,
     },
     Emph(Content),
@@ -386,7 +621,9 @@ impl<'a> Builder<'a> {
         match self.stack.pop().unwrap() {
             Frame::Root(_) => return false,
             Frame::Para(c) => self.push_block(Block::Para(c)),
-            Frame::Heading { level, content } => self.push_block(Block::Heading { level, content }),
+            Frame::Heading { level, id, content } => {
+                self.push_block(Block::Heading { level, id, content })
+            }
             Frame::Quote(b) => self.push_block(Block::Quote(b)),
             Frame::Item(b) => {
                 if let Some(Frame::List { items, .. }) = self.stack.last_mut() {
@@ -472,8 +709,9 @@ impl<'a> Builder<'a> {
     fn start(&mut self, tag: Tag<'a>) {
         match tag {
             Tag::Paragraph => self.stack.push(Frame::Para(Vec::new())),
-            Tag::Heading { level, .. } => self.stack.push(Frame::Heading {
+            Tag::Heading { level, id, .. } => self.stack.push(Frame::Heading {
                 level: level as u8,
+                id: id.map(|s| s.to_string()),
                 content: Vec::new(),
             }),
             Tag::BlockQuote(_) => self.stack.push(Frame::Quote(Vec::new())),
@@ -522,8 +760,8 @@ impl<'a> Builder<'a> {
                 }
             }
             TagEnd::Heading(_) => {
-                if let Some(Frame::Heading { level, content }) = self.stack.pop() {
-                    self.push_block(Block::Heading { level, content });
+                if let Some(Frame::Heading { level, id, content }) = self.stack.pop() {
+                    self.push_block(Block::Heading { level, id, content });
                 }
             }
             TagEnd::BlockQuote(_) => {
@@ -737,6 +975,28 @@ impl<'a> Builder<'a> {
                 }
                 None => self.push_block(Block::Raw(format!("review inline shortcode {inner}"))),
             }
+            return true;
+        }
+        if let Some(inner) = s
+            .strip_prefix(HUGO_MARKER)
+            .and_then(|x| x.strip_suffix(MARKER_END))
+        {
+            let msg = format!("hugo shortcode: {inner}");
+            if inline {
+                self.push_inline(Inline::Raw(msg));
+            } else {
+                self.push_block(Block::Raw(msg));
+            }
+            return true;
+        }
+        if let Some(inner) = s
+            .strip_prefix(HUGO_BLOCK_MARKER)
+            .and_then(|x| x.strip_suffix(MARKER_END))
+        {
+            self.push_block(Block::Raw(format!("hugo block shortcode: {inner}")));
+            return true;
+        }
+        if s == HUGO_END_MARKER {
             return true;
         }
         false
@@ -1020,9 +1280,7 @@ fn assemble(
         writeln!(out, "  output: \"{}\",", esc(output)).unwrap();
     }
     if let Some(extra) = &meta.extra {
-        // Carry the frontmatter `[extra]` table onto the document verbatim.
-        let dict = toml_to_typst(&toml::Value::Table(extra.clone()), 1);
-        writeln!(out, "  extra: {dict},").unwrap();
+        writeln!(out, "  extra: {extra},").unwrap();
     }
     writeln!(out, ")").unwrap();
     writeln!(out, "#show: {kind}-template").unwrap();

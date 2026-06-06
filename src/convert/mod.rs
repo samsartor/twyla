@@ -7,6 +7,7 @@
 
 pub mod audit;
 pub mod draft;
+pub mod hugo;
 pub mod ir;
 pub mod manifest;
 pub mod report;
@@ -22,6 +23,13 @@ use crate::render::render_site;
 
 use report::Finding;
 
+/// Which SSG the source content comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceFormat {
+    Zola,
+    Hugo,
+}
+
 /// How `convert` treats existing/missing `.typ` drafts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertMode {
@@ -36,6 +44,7 @@ pub enum ConvertMode {
 /// Everything a convert run needs.
 pub struct ConvertOptions {
     pub ctx: TwylaContext,
+    pub source: SourceFormat,
     pub mode: ConvertMode,
     /// Zola's built output to diff against (defaults to `public/`).
     pub ground_truth: PathBuf,
@@ -66,21 +75,26 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
         return Err(ConvertError {
             findings,
             message: format!(
-                "ground truth {} is not a directory — run zola build first, or pass --ground-truth",
+                "ground truth {} is not a directory — run your site generator's build first, or pass --ground-truth",
                 opts.ground_truth.display()
             ),
         });
     }
 
     // 1. Discover + map markdown, then ensure drafts per mode.
-    let pages = zola::discover(ctx).map_err(|message| ConvertError {
+    let pages = match opts.source {
+        SourceFormat::Zola => zola::discover(ctx),
+        SourceFormat::Hugo => hugo::discover(ctx),
+    }
+    .map_err(|message| ConvertError {
         findings: Vec::new(),
         message,
     })?;
-    let draft_findings = draft::ensure_drafts(ctx, &pages, opts.mode).map_err(|e| ConvertError {
-        findings: Vec::new(),
-        message: format!("writing drafts: {e}"),
-    })?;
+    let draft_findings =
+        draft::ensure_drafts(ctx, &pages, opts.mode, opts.source).map_err(|e| ConvertError {
+            findings: Vec::new(),
+            message: format!("writing drafts: {e}"),
+        })?;
     findings.extend(draft_findings);
 
     // 2. Compile the whole site in memory.
