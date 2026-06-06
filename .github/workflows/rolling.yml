@@ -1,0 +1,28 @@
+name: rolling
+on:
+  push:
+    branches: [main]
+concurrency:
+  group: rolling-release
+  cancel-in-progress: true
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - run: tar czf twyla-x86_64-unknown-linux-gnu.tar.gz -C target/release twyla
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Latest (main)" \
+            --notes "Rolling build from $GITHUB_SHA" \
+            twyla-x86_64-unknown-linux-gnu.tar.gz
