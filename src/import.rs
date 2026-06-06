@@ -47,9 +47,35 @@ use crate::html;
 pub fn import_md(input: &str, kind: &str, output: Option<&str>) -> Result<String, String> {
     let (fm_text, body) = split_frontmatter(input)?;
     let meta = parse_frontmatter(fm_text)?;
-    let preprocessed = preprocess_shortcodes(body);
-    let blocks = parse_blocks(&preprocessed);
-    Ok(assemble(&meta, &ir::render(&blocks), kind, output))
+    // Zola's `<!-- more -->` marks the end of the summary: render the markdown
+    // above it as the document description. The marker is dropped; the content
+    // above it stays in the body (the full article still shows it).
+    let (summary_md, body) = split_summary(body);
+    let summary = summary_md.map(|md| ir::render(&parse_blocks(&preprocess_shortcodes(md))));
+    let blocks = parse_blocks(&preprocess_shortcodes(&body));
+    Ok(assemble(&meta, &ir::render(&blocks), summary.as_deref(), kind, output))
+}
+
+/// Split a body at zola's first `<!-- more -->` delimiter. Returns the summary
+/// markdown above it (when non-empty) and the body with the marker removed.
+/// Tolerates inner-whitespace variants (`<!--more-->`, `<!-- more -->`).
+fn split_summary(body: &str) -> (Option<&str>, String) {
+    let mut from = 0;
+    while let Some(rel) = body[from..].find("<!--") {
+        let start = from + rel;
+        let Some(end_rel) = body[start..].find("-->") else {
+            break;
+        };
+        let end = start + end_rel + "-->".len();
+        if body[start + "<!--".len()..end - "-->".len()].trim() == "more" {
+            let above = &body[..start];
+            let rest = format!("{above}{}", &body[end..]);
+            let summary = (!above.trim().is_empty()).then_some(above);
+            return (summary, rest);
+        }
+        from = end;
+    }
+    (None, body.to_string())
 }
 
 // ---- frontmatter ---------------------------------------------------------
@@ -893,7 +919,13 @@ fn parse_html_tag(raw: &str) -> HtmlTag {
 
 // ---- assembly ------------------------------------------------------------
 
-fn assemble(meta: &Meta, body: &str, kind: &str, output: Option<&str>) -> String {
+fn assemble(
+    meta: &Meta,
+    body: &str,
+    summary: Option<&str>,
+    kind: &str,
+    output: Option<&str>,
+) -> String {
     let esc = ir::escape_typst_string;
     let mut out = String::new();
     writeln!(out, "// twyla-convert draft. Manual cleanup expected!").unwrap();
@@ -906,8 +938,25 @@ fn assemble(meta: &Meta, body: &str, kind: &str, output: Option<&str>) -> String
     // listings/feeds and the template reads it via `#context document.*`.
     writeln!(out, "#set document(").unwrap();
     writeln!(out, "  title: \"{}\",", esc(&meta.title)).unwrap();
-    if !meta.description.is_empty() {
-        writeln!(out, "  description: \"{}\",", esc(&meta.description)).unwrap();
+    // A `<!-- more -->` summary (rendered typst content) wins over a frontmatter
+    // `description` string; either lands on `document.description`.
+    match summary {
+        Some(s) => {
+            let s = s.trim();
+            if s.contains('\n') {
+                writeln!(out, "  description: [").unwrap();
+                for line in s.lines() {
+                    writeln!(out, "    {line}").unwrap();
+                }
+                writeln!(out, "  ],").unwrap();
+            } else {
+                writeln!(out, "  description: [{s}],").unwrap();
+            }
+        }
+        None if !meta.description.is_empty() => {
+            writeln!(out, "  description: \"{}\",", esc(&meta.description)).unwrap();
+        }
+        None => {}
     }
     if let Some((y, m, d)) = meta.date {
         writeln!(out, "  date: datetime(year: {y}, month: {m}, day: {d}),").unwrap();
@@ -964,6 +1013,26 @@ mod tests {
         assert!(out.contains("weight: 2"), "got: {out}");
         assert!(out.contains("\"odd key\": \"v\""), "got: {out}");
         assert!(out.contains("nested: (") && out.contains("x: 1"), "got: {out}");
+    }
+
+    #[test]
+    fn more_marker_sets_description_from_summary() {
+        let src = "+++\ntitle = \"T\"\ndescription = \"fm\"\n+++\n\
+                   The **lead** paragraph.\n\n<!-- more -->\n\nRest of the body.\n";
+        let out = import_md(src, "page", None).unwrap();
+        // Summary above `<!-- more -->` becomes a rich description, overriding fm.
+        assert!(out.contains("description: [The *lead* paragraph.],"), "got:\n{out}");
+        assert!(!out.contains("description: \"fm\""), "fm desc should be overridden:\n{out}");
+        // Marker is gone; the lead still appears in the body.
+        assert!(!out.contains("<!-- more -->"), "marker should be stripped:\n{out}");
+        assert!(out.contains("Rest of the body."), "got:\n{out}");
+    }
+
+    #[test]
+    fn no_more_marker_keeps_frontmatter_description() {
+        let src = "+++\ntitle = \"T\"\ndescription = \"fm\"\n+++\nBody only.\n";
+        let out = import_md(src, "page", None).unwrap();
+        assert!(out.contains("description: \"fm\""), "got:\n{out}");
     }
 
     #[test]
