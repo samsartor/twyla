@@ -125,15 +125,12 @@ enum Cmd {
         /// Scope diff + audit + completeness to a single route slug.
         #[arg(long)]
         only: Option<String>,
-        /// Sibling nodes of context to show above a divergence in the diff.
+        /// Lines of context to show above a change in a page diff.
         #[arg(short = 'A', long, default_value_t = 1)]
         above: usize,
-        /// Sibling nodes of context to show below a divergence in the diff.
+        /// Lines of context to show below a change in a page diff.
         #[arg(short = 'B', long, default_value_t = 1)]
         below: usize,
-        /// Show every difference per page, not just the first.
-        #[arg(long)]
-        all_diffs: bool,
     },
     /// Convert a zola markdown post to a typst draft on stdout.
     Import {
@@ -163,7 +160,6 @@ fn main() -> ExitCode {
             only,
             above,
             below,
-            all_diffs,
         } => cmd_convert(
             ctx,
             from,
@@ -174,7 +170,6 @@ fn main() -> ExitCode {
             only,
             above,
             below,
-            all_diffs,
         ),
         Cmd::Import { input } => cmd_import(&input),
     }
@@ -273,7 +268,6 @@ fn cmd_convert(
     only: Option<String>,
     above: usize,
     below: usize,
-    all_diffs: bool,
 ) -> ExitCode {
     let FromFormat::Zola = from; // only zola today
     let ctx = match resolve_ctx(args) {
@@ -306,7 +300,6 @@ fn cmd_convert(
         only,
         above,
         below,
-        all_diffs,
     };
     match convert::run(opts) {
         Ok(findings) => {

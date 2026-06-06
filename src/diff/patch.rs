@@ -1,26 +1,26 @@
-//! Unified-diff rendering of a [`Divergence`].
+//! Unified-diff rendering of a page comparison.
 //!
-//! The comparator reports *where* (a path) and *what kind* (a reason) of the
-//! first divergence, but a path + message alone forces you to cross-read both
-//! HTML files to see the cause. This module renders the divergent node — framed
-//! by its parent and a window of sibling context — as indented lines from each
-//! tree and runs a line-based LCS diff, producing a familiar `-`/`+` patch hunk.
+//! A [`Divergence`] tells the caller a page differs (and carries a textual
+//! reason); this renders the actual difference as a familiar `-`/`+` patch.
+//! Both normalized trees are rendered to indented lines and run through a
+//! line-based LCS diff, so every change on the page shows in one hunk with
+//! `-A`/`-B` lines of context. Identical regions collapse to `⋮`.
 //!
 //! Rendered at the diff site (where both trees are in hand) since a
 //! [`Divergence`] doesn't retain them.
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use owo_colors::{OwoColorize, Stream};
 
-use crate::diff::compare::{Divergence, DivergenceReason, PathStep};
+use crate::diff::compare::Divergence;
 use crate::html::{Element, Node};
 
 /// `convert`'s report prints to stdout; color follows that stream's tty.
 const OUT: Stream = Stream::Stdout;
-/// Unchanged lines of context kept around each change.
-const CONTEXT: usize = 3;
+/// Lines kept at each end when collapsing the interior of a long run of
+/// same-kind changes (a wholesale added/removed subtree).
+const CHANGE_KEEP: usize = 3;
 /// Truncate any single rendered line past this many chars.
 const MAX_LINE: usize = 200;
 /// Cost ceiling for the (quadratic) line LCS: `expected.len() * actual.len()`.
@@ -29,13 +29,14 @@ const MAX_LINE: usize = 200;
 const MAX_DIFF_CELLS: usize = 16_000_000;
 
 impl Divergence {
-    /// A `-`/`+` unified-diff hunk of the divergence (`-` expected, `+`
+    /// A `-`/`+` unified-diff patch of the whole page (`-` expected, `+`
     /// actual) — far more legible than the path + reason that
-    /// [`Display`](std::fmt::Display) gives.
+    /// [`Display`](std::fmt::Display) gives. `above`/`below` are the lines of
+    /// unchanged context kept before/after each change.
     ///
-    /// `above`/`below` are how many sibling nodes of context to show before and
-    /// after the divergent node (the parent frame is always shown, which also
-    /// covers the "no sibling on that side" case).
+    /// Falls back to the textual reason when the page is too large to diff or
+    /// when the normalized trees render identically (the pretty-printer drops
+    /// some differences, e.g. whitespace-only text).
     pub fn render_patch(
         &self,
         expected_root: &Node,
@@ -43,68 +44,27 @@ impl Divergence {
         above: usize,
         below: usize,
     ) -> String {
-        self.try_render(expected_root, actual_root, above, below)
-            // Navigation shouldn't fail, but never hide a divergence if it
-            // does — fall back to the bare path + reason.
-            .unwrap_or_else(|| self.to_string())
-    }
-
-    /// Like [`render_patch`](Self::render_patch) but diffs the *whole* page —
-    /// every difference, not just the hunk around the first divergence — which
-    /// is what `--all-diffs` selects. Falls back to the focused single-
-    /// divergence view if the page is too large to diff whole.
-    pub fn render_patch_all(
-        &self,
-        expected_root: &Node,
-        actual_root: &Node,
-        above: usize,
-        below: usize,
-    ) -> String {
-        render_hunk(&render_side(expected_root), &render_side(actual_root))
-            .unwrap_or_else(|| self.render_patch(expected_root, actual_root, above, below))
-    }
-
-    fn try_render(
-        &self,
-        expected_root: &Node,
-        actual_root: &Node,
-        above: usize,
-        below: usize,
-    ) -> Option<String> {
-        // Recover the raw child indices from the expected tree (the path's
-        // per-tag/per-kind steps were assigned against it), then apply the same
-        // indices to actual — valid because every level above the first
-        // divergence matched.
-        let raw = path_to_raw(expected_root, &self.path)?;
-
-        // Sibling-window mode: the divergence is a specific child of a parent
-        // (not a whole-children count mismatch, which has no single culprit).
-        // Diff the parent's open tag + a window of siblings around the culprit.
-        if let Some((&idx, parent_raw)) = raw.split_last() {
-            if !matches!(self.reason, DivergenceReason::ChildCountMismatch { .. }) {
-                let exp = node_at(expected_root, parent_raw)?;
-                let act = node_at(actual_root, parent_raw)?;
-                return render_hunk(
-                    &window_lines(exp, idx, above, below),
-                    &window_lines(act, idx, above, below),
-                );
-            }
-        }
-
-        // Fallback: diff the whole subtree at the path (document root, or a
-        // child-count mismatch).
-        let exp = node_at(expected_root, &raw)?;
-        let act = node_at(actual_root, &raw)?;
-        render_hunk(&render_side(exp), &render_side(act))
+        render_hunk(
+            &render_side(expected_root),
+            &render_side(actual_root),
+            above,
+            below,
+        )
+        .unwrap_or_else(|| self.to_string())
     }
 }
 
 /// Diff two rendered sides into a trimmed `-`/`+` hunk. Returns `None` (so the
-/// caller falls back to the textual reason) when either the renderings are
-/// identical — the pretty-printer normalizes some differences away (whitespace
-/// text, comments, count mismatches on those), and an empty hunk would print as
-/// a bare route line — or the inputs are too large to diff affordably.
-fn render_hunk(expected: &[String], actual: &[String]) -> Option<String> {
+/// caller falls back to the textual reason) when the renderings are identical —
+/// the pretty-printer normalizes some differences away (whitespace text,
+/// comments) and an empty hunk would print as a bare route line — or the inputs
+/// are too large to diff affordably.
+fn render_hunk(
+    expected: &[String],
+    actual: &[String],
+    above: usize,
+    below: usize,
+) -> Option<String> {
     if expected.len().saturating_mul(actual.len()) > MAX_DIFF_CELLS {
         return None;
     }
@@ -112,117 +72,7 @@ fn render_hunk(expected: &[String], actual: &[String]) -> Option<String> {
     if !ops.iter().any(|o| !matches!(o, Op::Eq(_))) {
         return None;
     }
-    Some(format_ops(&ops, CONTEXT).join("\n"))
-}
-
-/// Render a parent's open tag, the children in `[idx-above ..= idx+below]`
-/// (clamped to the child list), and its close tag. The parent frame orients
-/// the hunk and stands in as context when the culprit has no sibling on a side.
-/// Elided siblings outside the window are marked with `⋮`.
-fn window_lines(parent: &Node, idx: usize, above: usize, below: usize) -> Vec<String> {
-    let children = children_of(parent).unwrap_or(&[]);
-    let mut out = Vec::new();
-
-    if let Node::Element(el) = parent {
-        out.push(open_tag(el));
-    }
-    if children.is_empty() {
-        if let Node::Element(el) = parent {
-            out.push(format!("</{}>", el.name));
-        }
-        return out;
-    }
-
-    let lo = idx.saturating_sub(above);
-    let hi = (idx + below).min(children.len() - 1);
-    if lo > 0 {
-        out.push("  ⋮".to_string());
-    }
-    for child in &children[lo..=hi] {
-        push_node(child, 1, &mut out);
-    }
-    if hi + 1 < children.len() {
-        out.push("  ⋮".to_string());
-    }
-    if let Node::Element(el) = parent {
-        out.push(format!("</{}>", el.name));
-    }
-    out
-}
-
-// ---- tree navigation -----------------------------------------------------
-
-fn children_of(node: &Node) -> Option<&[Node]> {
-    match node {
-        Node::Document(c) => Some(c),
-        Node::Element(e) => Some(&e.children),
-        _ => None,
-    }
-}
-
-/// Counters mirroring `compare::compare_children`'s step assignment, so a
-/// [`PathStep`] resolves to the raw child index it was minted from.
-#[derive(Default)]
-struct Counters {
-    tags: HashMap<String, usize>,
-    text: usize,
-    comment: usize,
-    doctype: usize,
-}
-
-impl Counters {
-    fn matches(&self, step: &PathStep, child: &Node) -> bool {
-        match (step, child) {
-            (PathStep::Child { tag, index }, Node::Element(el)) => {
-                el.name == *tag && self.tags.get(&el.name).copied().unwrap_or(0) == *index
-            }
-            (PathStep::Text(i), Node::Text(_)) => self.text == *i,
-            (PathStep::Comment(i), Node::Comment(_)) => self.comment == *i,
-            (PathStep::Doctype(i), Node::Doctype(_)) => self.doctype == *i,
-            _ => false,
-        }
-    }
-
-    fn advance(&mut self, child: &Node) {
-        match child {
-            Node::Element(el) => *self.tags.entry(el.name.clone()).or_insert(0) += 1,
-            Node::Text(_) => self.text += 1,
-            Node::Comment(_) => self.comment += 1,
-            Node::Doctype(_) => self.doctype += 1,
-            Node::Document(_) => {}
-        }
-    }
-}
-
-/// Convert a path of [`PathStep`]s into raw child indices, navigating `root`.
-fn path_to_raw(root: &Node, path: &[PathStep]) -> Option<Vec<usize>> {
-    let mut raw = Vec::with_capacity(path.len());
-    let mut node = root;
-    for step in path {
-        let children = children_of(node)?;
-        let mut counters = Counters::default();
-        let mut found = None;
-        for (i, child) in children.iter().enumerate() {
-            if counters.matches(step, child) {
-                found = Some(i);
-                break;
-            }
-            counters.advance(child);
-        }
-        let i = found?;
-        raw.push(i);
-        node = &children[i];
-    }
-    Some(raw)
-}
-
-/// Follow raw child indices to a node.
-fn node_at<'a>(root: &'a Node, raw: &[usize]) -> Option<&'a Node> {
-    let mut node = root;
-    for &i in raw {
-        node = children_of(node)?.get(i)?;
-    }
-    Some(node)
+    Some(format_ops(&ops, above, below).join("\n"))
 }
 
 // ---- pretty printing -----------------------------------------------------
@@ -369,24 +219,28 @@ fn diff_ops<'a>(a: &'a [String], b: &'a [String]) -> Vec<Op<'a>> {
 }
 
 /// Format the ops as a colored unified hunk, keeping only the load-bearing
-/// lines: changes, plus `ctx` lines of context around each. Unchanged runs
-/// beyond that — and the interior of long same-kind change runs (a wholesale
-/// added/removed subtree) — collapse to a `⋮ (n lines)` marker.
-fn format_ops(ops: &[Op], ctx: usize) -> Vec<String> {
+/// lines: changes, plus `above` unchanged lines before each change and `below`
+/// after. Unchanged runs beyond that — and the interior of long same-kind
+/// change runs (a wholesale added/removed subtree) — collapse to a
+/// `⋮ (n lines)` marker.
+fn format_ops(ops: &[Op], above: usize, below: usize) -> Vec<String> {
     let n = ops.len();
     let mut keep = vec![true; n];
 
-    // Drop unchanged lines that aren't within `ctx` of a change.
+    // Keep an unchanged line when a change is near: within `above` lines after
+    // it (this line is context *above* that change) or `below` lines before it
+    // (context *below* a change) — i.e. any change in `[i - below, i + above]`.
     for i in 0..n {
         if matches!(ops[i], Op::Eq(_)) {
-            let lo = i.saturating_sub(ctx);
-            let hi = (i + ctx + 1).min(n);
+            let lo = i.saturating_sub(below);
+            let hi = (i + above + 1).min(n);
             keep[i] = ops[lo..hi].iter().any(|o| !matches!(o, Op::Eq(_)));
         }
     }
 
-    // Collapse the middle of long runs of same-kind changes, keeping `ctx` at
-    // each end — e.g. a 500-line removed SVG shows its first and last few lines.
+    // Collapse the middle of long runs of same-kind changes, keeping
+    // `CHANGE_KEEP` at each end — e.g. a 500-line removed SVG shows its first
+    // and last few lines.
     let mut i = 0;
     while i < n {
         if matches!(ops[i], Op::Eq(_)) {
@@ -398,8 +252,8 @@ fn format_ops(ops: &[Op], ctx: usize) -> Vec<String> {
         while i < n && !matches!(ops[i], Op::Eq(_)) && matches!(ops[i], Op::Del(_)) == del {
             i += 1;
         }
-        if i - start > 2 * ctx + 1 {
-            for k in &mut keep[start + ctx..i - ctx] {
+        if i - start > 2 * CHANGE_KEEP + 1 {
+            for k in &mut keep[start + CHANGE_KEEP..i - CHANGE_KEEP] {
                 *k = false;
             }
         }
@@ -439,7 +293,7 @@ mod tests {
     use crate::diff::diff;
     use crate::html::parse_html;
 
-    /// Diff two fragments and render the patch (default 1 sibling of context).
+    /// Diff two fragments and render the patch (default 1 line of context).
     /// Stdout is captured in tests, so owo emits no color — assertions match
     /// plain `-`/`+` lines.
     fn patch(expected: &str, actual: &str) -> String {
@@ -453,66 +307,72 @@ mod tests {
         d.render_patch(&e, &a, above, below)
     }
 
+    /// Is there a `-`/`+`/context line (whole-document render is deeply indented,
+    /// so match on the prefix + content, not exact columns)?
+    fn has(patch: &str, prefix: &str, needle: &str) -> bool {
+        patch.lines().any(|l| l.starts_with(prefix) && l.contains(needle))
+    }
+
     #[test]
     fn attr_change_is_a_minus_plus_pair() {
         let p = patch(
             "<div><p class=\"foo\">hi</p></div>",
             "<div><p class=\"bar\">hi</p></div>",
         );
-        assert!(p.contains("<div>"), "parent frame missing, got:\n{p}");
-        assert!(p.contains("-   <p class=\"foo\">hi</p>"), "got:\n{p}");
-        assert!(p.contains("+   <p class=\"bar\">hi</p>"), "got:\n{p}");
+        assert!(has(&p, "- ", "<p class=\"foo\">hi</p>"), "got:\n{p}");
+        assert!(has(&p, "+ ", "<p class=\"bar\">hi</p>"), "got:\n{p}");
     }
 
     #[test]
     fn tag_change_shows_both_tags() {
         let p = patch("<div><span>x</span></div>", "<div><b>x</b></div>");
-        assert!(p.contains("-   <span>x</span>"), "got:\n{p}");
-        assert!(p.contains("+   <b>x</b>"), "got:\n{p}");
+        assert!(has(&p, "- ", "<span>x</span>"), "got:\n{p}");
+        assert!(has(&p, "+ ", "<b>x</b>"), "got:\n{p}");
     }
 
     #[test]
-    fn extra_child_shows_added_line_with_context() {
+    fn extra_child_shows_added_line() {
         let p = patch("<ul><li>a</li></ul>", "<ul><li>a</li><li>b</li></ul>");
-        assert!(p.contains("  <ul>"), "context tag missing, got:\n{p}");
-        assert!(p.contains("+   <li>b</li>"), "got:\n{p}");
+        assert!(has(&p, "+ ", "<li>b</li>"), "got:\n{p}");
     }
 
     #[test]
     fn text_change_diffs_the_text_line() {
         let p = patch("<p>hello</p>", "<p>world</p>");
-        assert!(p.contains("-   hello"), "got:\n{p}");
-        assert!(p.contains("+   world"), "got:\n{p}");
+        assert!(has(&p, "- ", "hello"), "got:\n{p}");
+        assert!(has(&p, "+ ", "world"), "got:\n{p}");
     }
 
     #[test]
-    fn sibling_context_shows_neighbors() {
-        let exp = "<ul><li>a</li><li class=\"x\">b</li><li>c</li></ul>";
-        let act = "<ul><li>a</li><li class=\"y\">b</li><li>c</li></ul>";
-        // Default 1/1: the preceding and following <li> show as context.
-        let p = patch(exp, act);
-        assert!(p.contains("<li>a</li>"), "above sibling missing, got:\n{p}");
-        assert!(p.contains("<li>c</li>"), "below sibling missing, got:\n{p}");
-        assert!(p.contains("-   <li class=\"x\">b</li>"), "got:\n{p}");
-        assert!(p.contains("+   <li class=\"y\">b</li>"), "got:\n{p}");
+    fn whole_page_shows_every_change() {
+        // Both paragraphs differ; one patch covers them all (no per-file cap).
+        let p = patch("<div><p>aaa</p><p>bbb</p></div>", "<div><p>XXX</p><p>YYY</p></div>");
+        assert!(has(&p, "- ", "aaa") && has(&p, "+ ", "XXX"), "got:\n{p}");
+        assert!(has(&p, "- ", "bbb") && has(&p, "+ ", "YYY"), "got:\n{p}");
     }
 
     #[test]
-    fn all_diffs_shows_every_change() {
-        let e = parse_html("<div><p>aaa</p><p>bbb</p></div>");
-        let a = parse_html("<div><p>XXX</p><p>YYY</p></div>");
-        let d = diff(&e, &a).expect_err("expected a divergence");
+    fn context_keeps_above_and_below_lines() {
+        let exp = "<ul><li>a</li><li>b</li><li>c</li><li>d</li><li>e</li></ul>";
+        let act = "<ul><li>a</li><li>b</li><li>Z</li><li>d</li><li>e</li></ul>";
+        // 1 line of context each side of the changed <li>c → <li>Z.
+        let p = patch_ctx(exp, act, 1, 1);
+        assert!(has(&p, "- ", "<li>c</li>") && has(&p, "+ ", "<li>Z</li>"), "got:\n{p}");
+        assert!(p.contains("<li>b</li>"), "1 line above should show:\n{p}");
+        assert!(p.contains("<li>d</li>"), "1 line below should show:\n{p}");
+        assert!(!p.contains("<li>a</li>"), "2 above should collapse:\n{p}");
+        assert!(!p.contains("<li>e</li>"), "2 below should collapse:\n{p}");
+    }
 
-        // The focused view stops at the first divergence (the first <p>).
-        let single = d.render_patch(&e, &a, 1, 1);
-        assert!(single.contains("aaa"), "single:\n{single}");
-        assert!(!single.contains("bbb"), "single should be focused:\n{single}");
-
-        // --all-diffs shows both paragraphs' changes.
-        let all = d.render_patch_all(&e, &a, 1, 1);
-        for needle in ["aaa", "XXX", "bbb", "YYY"] {
-            assert!(all.contains(needle), "all-diffs missing {needle}:\n{all}");
-        }
+    #[test]
+    fn above_and_below_are_independent() {
+        let exp = "<ul><li>a</li><li>b</li><li>c</li><li>d</li><li>e</li></ul>";
+        let act = "<ul><li>a</li><li>b</li><li>Z</li><li>d</li><li>e</li></ul>";
+        // 2 lines above, 0 below.
+        let p = patch_ctx(exp, act, 2, 0);
+        assert!(p.contains("<li>a</li>"), "2 above should show:\n{p}");
+        assert!(p.contains("<li>b</li>"), "1 above should show:\n{p}");
+        assert!(!p.contains("<li>d</li>"), "below=0 should hide the next line:\n{p}");
     }
 
     #[test]
@@ -538,15 +398,17 @@ mod tests {
     }
 
     #[test]
-    fn zero_context_hides_siblings_but_keeps_frame() {
-        let exp = "<ul><li>a</li><li class=\"x\">b</li><li>c</li></ul>";
-        let act = "<ul><li>a</li><li class=\"y\">b</li><li>c</li></ul>";
+    fn zero_context_shows_only_the_change() {
+        let exp = "<ul><li>a</li><li>b</li><li>c</li></ul>";
+        let act = "<ul><li>a</li><li>Z</li><li>c</li></ul>";
+        // 0/0: the change shows, no surrounding context, elided lines marked.
         let p = patch_ctx(exp, act, 0, 0);
-        assert!(p.contains("<ul>"), "parent frame missing, got:\n{p}");
-        assert!(!p.contains("<li>a</li>"), "should hide siblings, got:\n{p}");
-        assert!(!p.contains("<li>c</li>"), "should hide siblings, got:\n{p}");
+        assert!(has(&p, "- ", "<li>b</li>") && has(&p, "+ ", "<li>Z</li>"), "got:\n{p}");
+        assert!(!p.contains("<li>a</li>"), "no context expected, got:\n{p}");
+        assert!(!p.contains("<li>c</li>"), "no context expected, got:\n{p}");
         assert!(p.contains("⋮"), "elision marker missing, got:\n{p}");
     }
 }
+
 
 

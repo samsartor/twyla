@@ -43,11 +43,9 @@ pub struct ConvertOptions {
     pub output_dir: Option<PathBuf>,
     /// When set, scope diff + audit + completeness to a single route slug.
     pub only: Option<String>,
-    /// Sibling nodes of context to show above/below a divergence in the diff.
+    /// Lines of context to show above/below each change in a page diff.
     pub above: usize,
     pub below: usize,
-    /// Show every difference per page rather than just the first.
-    pub all_diffs: bool,
 }
 
 /// A setup/IO failure (exit code 2). Carries any findings already collected
@@ -143,17 +141,10 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
                     Ok(()) => findings.push(Finding::PagePass {
                         route: route.clone(),
                     }),
-                    Err(d) => {
-                        let divergence = if opts.all_diffs {
-                            d.render_patch_all(&expected, &actual_norm, opts.above, opts.below)
-                        } else {
-                            d.render_patch(&expected, &actual_norm, opts.above, opts.below)
-                        };
-                        findings.push(Finding::PageDiff {
-                            route: route.clone(),
-                            divergence,
-                        });
-                    }
+                    Err(d) => findings.push(Finding::PageDiff {
+                        route: route.clone(),
+                        divergence: d.render_patch(&expected, &actual_norm, opts.above, opts.below),
+                    }),
                 }
             }
             // No ground-truth peer — a completeness concern, reported below.
