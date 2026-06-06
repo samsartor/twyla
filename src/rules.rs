@@ -44,6 +44,13 @@ pub fn install(rules: &mut NativeRuleMap) {
     rules.replace(Target::Html, HEADING_RULE);
     rules.replace(Target::Html, LINK_RULE);
     rules.replace(Target::Html, IMAGE_RULE);
+
+    // An inline `#document(..)[body]` vanishes where it sits (its body is
+    // hoisted to its own bundle output). `register` (not `replace`) — twyla owns
+    // this element, so there is no upstream rule. Bundle target is intentionally
+    // left rule-less so the element survives realization for discovery.
+    rules.register(Target::Html, crate::document::RENDER_NOTHING);
+    rules.register(Target::Paged, crate::document::RENDER_NOTHING);
 }
 
 /// Heading id: an explicit label wins (so `#link(<slug>)` → `#slug`

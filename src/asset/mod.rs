@@ -42,7 +42,7 @@ mod file;
 mod raw;
 mod sass;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::io::Read;
@@ -61,10 +61,11 @@ use typst::foundations::{
     func, scope, ty,
 };
 use typst::loading::{Encoding, Readable};
-use typst::syntax::{FileId, Spanned};
+use typst::syntax::{FileId, Spanned, VirtualRoot};
 use typst::utils::LazyHash;
 use typst_utils::hash128;
 
+use crate::document::{DiscoveredDoc, DocumentSink, TwylaDocumentSink};
 use crate::render::Emit;
 use crate::project::TwylaContext;
 
@@ -518,19 +519,39 @@ pub struct AssetResolver {
     tx: Sender<AssetRequest>,
     rx: Receiver<AssetRequest>,
     resolved: HashMap<AssetSpec, ResolvedAsset>,
+    /// Document discovery shares the resolver's epoch and lifecycle: an inline
+    /// `#document(..)` is reported here through the same kind of sink an asset
+    /// is, in the same realization pass. Keyed by `output` (dedup) and ordered
+    /// (a `BTreeMap`) so the `documents()` listing is deterministic.
+    doc_tx: Sender<DiscoveredDoc>,
+    doc_rx: Receiver<DiscoveredDoc>,
+    documents: BTreeMap<String, StoredDoc>,
+}
+
+/// A collected document plus what's needed to invalidate it: the on-disk path
+/// of its source file and that file's mtime at discovery. Mirrors how an
+/// asset's [`Upstream`] drives [`AssetResolver::revalidate`].
+struct StoredDoc {
+    doc: DiscoveredDoc,
+    source: Option<PathBuf>,
+    mtime: Option<SystemTime>,
 }
 
 impl AssetResolver {
-    /// A fresh, empty resolver. The store fills as assets are discovered and
-    /// persists for the resolver's lifetime.
+    /// A fresh, empty resolver. The asset and document stores fill as they're
+    /// discovered and persist for the resolver's lifetime.
     pub fn new(ctx: &TwylaContext) -> Self {
         let (tx, rx) = unbounded();
+        let (doc_tx, doc_rx) = unbounded();
         Self {
             epoch: EPOCH.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),
             tx,
             rx,
             resolved: HashMap::new(),
+            doc_tx,
+            doc_rx,
+            documents: BTreeMap::new(),
         }
     }
 
@@ -541,6 +562,14 @@ impl AssetResolver {
             tx: self.tx.clone(),
         };
         TwylaAssetSink::sink.set(Value::dynamic(sink)).wrap()
+    }
+
+    /// The document discovery sink style — chained every iteration, like
+    /// [`sink_style`](Self::sink_style). Shares the asset epoch so both sinks
+    /// belong to one comemo discovery generation (bumping it re-discovers both).
+    pub fn doc_sink_style(&self) -> LazyHash<Style> {
+        let sink = DocumentSink::new(self.epoch, self.doc_tx.clone());
+        TwylaDocumentSink::sink.set(Value::dynamic(sink)).wrap()
     }
 
     /// The resolved-map style for the current store — rebuilt each iteration as
@@ -569,6 +598,48 @@ impl AssetResolver {
         Ok(settled)
     }
 
+    /// Drain the document discovery channel, collecting each newly-seen inline
+    /// document (deduped by `output`). Returns `true` if nothing new was
+    /// collected (documents are *settled*) — the document half of the relayout
+    /// loop's convergence check, exactly parallel to
+    /// [`drain_and_process`](Self::drain_and_process) for assets.
+    pub fn drain_documents(&mut self) -> bool {
+        let mut settled = true;
+        let docs: Vec<DiscoveredDoc> = self.doc_rx.try_iter().collect();
+        for doc in docs {
+            if self.documents.contains_key(&doc.output) {
+                continue;
+            }
+            let (source, mtime) = self.doc_source(&doc);
+            self.documents
+                .insert(doc.output.clone(), StoredDoc { doc, source, mtime });
+            settled = false;
+        }
+        settled
+    }
+
+    /// Resolve a discovered document's source file to an on-disk path + mtime
+    /// for invalidation. Only project files have a watched path; package files
+    /// are immutable, so they need none (`None`).
+    fn doc_source(&self, doc: &DiscoveredDoc) -> (Option<PathBuf>, Option<SystemTime>) {
+        let Some(id) = doc.source else {
+            return (None, None);
+        };
+        match id.root() {
+            VirtualRoot::Project => {
+                let path = self.ctx.root.join(id.vpath().get_without_slash());
+                let mtime = mtime(&path).ok();
+                (Some(path), mtime)
+            }
+            VirtualRoot::Package(_) => (None, None),
+        }
+    }
+
+    /// Every collected document, in deterministic (`output`-keyed) order.
+    pub fn documents(&self) -> impl Iterator<Item = &DiscoveredDoc> {
+        self.documents.values().map(|stored| &stored.doc)
+    }
+
     /// Process one spec into a [`ResolvedAsset`]: dispatch to the per-type
     /// build, then add the shared fingerprinted name / output path / URL.
     fn process(
@@ -595,35 +666,53 @@ impl AssetResolver {
         })
     }
 
-    /// Evict every resolved asset matching `pred`. Bumps the discovery epoch if
-    /// anything was removed, so the next compile re-discovers the evicted specs
-    /// cleanly (see [`AssetSink`]). The single eviction core behind both
-    /// [`revalidate`](Self::revalidate) and a future path-aware `invalidate`.
-    fn evict_where(&mut self, mut pred: impl FnMut(&ResolvedAsset) -> bool) -> bool {
-        let before = self.resolved.len();
-        self.resolved.retain(|_, asset| !pred(asset));
-        let evicted = self.resolved.len() != before;
-        if evicted {
-            self.epoch = EPOCH.fetch_add(1, Ordering::Relaxed);
-        }
-        evicted
+    /// Bump the discovery epoch, invalidating the comemo discovery generation so
+    /// the next compile re-discovers (re-sends on) both sinks cleanly. One epoch
+    /// covers assets and documents, so a change to either re-discovers both (see
+    /// [`AssetSink`] / [`DocumentSink`](crate::document::DocumentSink)).
+    fn bump_epoch(&mut self) {
+        self.epoch = EPOCH.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Evict assets whose on-disk sources changed since they were resolved
-    /// (mtime check). Called at the top of each compile; a no-op on the first
-    /// compile (empty store). Returns whether anything was evicted.
-    ///
-    /// The path-free invalidation seam: when a path-aware watcher lands, add an
-    /// `invalidate(&changed_paths)` that calls [`evict_where`](Self::evict_where)
-    /// with an intersection predicate instead of stat'ing every upstream.
+    /// Evict every resolved asset matching `pred`. Returns whether anything was
+    /// removed (the caller bumps the epoch). The path-free invalidation seam:
+    /// when a path-aware watcher lands, add an `invalidate(&changed_paths)` that
+    /// calls this with an intersection predicate instead of stat'ing every
+    /// upstream.
+    fn evict_assets_where(&mut self, mut pred: impl FnMut(&ResolvedAsset) -> bool) -> bool {
+        let before = self.resolved.len();
+        self.resolved.retain(|_, asset| !pred(asset));
+        self.resolved.len() != before
+    }
+
+    /// Evict every collected document matching `pred`. Returns whether anything
+    /// was removed (the caller bumps the epoch).
+    fn evict_docs_where(&mut self, mut pred: impl FnMut(&StoredDoc) -> bool) -> bool {
+        let before = self.documents.len();
+        self.documents.retain(|_, stored| !pred(stored));
+        self.documents.len() != before
+    }
+
+    /// Evict assets *and* documents whose on-disk sources changed since they
+    /// were resolved (mtime check), bumping the discovery epoch once if anything
+    /// went. Called at the top of each compile; a no-op on the first compile
+    /// (empty stores). Returns whether anything was evicted.
     pub fn revalidate(&mut self) -> bool {
-        self.evict_where(|asset| {
+        let assets = self.evict_assets_where(|asset| {
             asset
                 .built
                 .upstream
                 .iter()
                 .any(|u| mtime(&u.path).ok() != u.mtime)
-        })
+        });
+        let docs = self.evict_docs_where(|stored| match &stored.source {
+            Some(path) => mtime(path).ok() != stored.mtime,
+            None => false,
+        });
+        if assets || docs {
+            self.bump_epoch();
+        }
+        assets || docs
     }
 
     /// A snapshot of every currently-resolved asset (for emission).

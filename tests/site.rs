@@ -205,9 +205,10 @@ fn build_emits_pages_and_static() {
     })
     .expect("build test_site");
 
-    // 3 original fixtures + 2 spike-doc pages (spike fixtures; fold/revert
-    // this count when the overloaded-document work is productionized).
-    assert_eq!(summary.pages, 5, "expected 5 routed pages");
+    // 3 base fixtures + 2 spike-doc pages + inline-document page & its hoisted
+    // child + context-documents page & one generated page per post (hello +
+    // diagram-demo) = 10.
+    assert_eq!(summary.pages, 10, "expected 10 routed pages");
 
     let exists = |rel: &str| out.path().join(rel).is_file();
     assert!(exists("index.html"), "home not written");
@@ -401,6 +402,80 @@ fn spike_overloaded_document_contextual_read() {
     assert!(
         html.contains("draft=false"),
         "contextual draft default not read: {html}"
+    );
+}
+
+/// An inline `#document(output:)[body]` constructor. The body is hoisted into
+/// its own bundle output and the surrounding prose renders without it
+/// (`before ... after`, not the child text). Metadata passed to the call is
+/// plumbed onto the child so `#context document.*` resolves there.
+#[test]
+fn inline_document_hoists_to_own_output() {
+    let docs = render();
+
+    // Parent page: prose survives, child content gone (rendered to nothing).
+    let parent = page(&docs, "inline-document/index.html");
+    assert!(parent.contains("before"), "parent prose missing: {parent}");
+    assert!(parent.contains("after"), "parent prose missing: {parent}");
+    assert!(
+        !parent.contains("child-body-text"),
+        "inline document body leaked into the parent page: {parent}"
+    );
+    assert!(
+        !parent.contains("Child Heading"),
+        "inline document heading leaked into the parent page: {parent}"
+    );
+
+    // Child page: emitted as its own output, carrying the hoisted body and the
+    // metadata plumbed through the call (contextual `document.extra`).
+    let child = page(&docs, "inline-child/index.html");
+    assert!(
+        child.contains("child-body-text"),
+        "hoisted child body missing: {child}"
+    );
+    assert!(
+        child.contains("<h2 id=\"child-heading\">"),
+        "hoisted child heading missing/not realized as a real document: {child}"
+    );
+    assert!(
+        child.contains("child-extra=hoisted"),
+        "metadata not plumbed onto hoisted child (contextual extra): {child}"
+    );
+}
+
+/// `#context`-generated documents: a page paginating over `documents()` emits
+/// extra bundle outputs that don't exist at eval time. Twyla's discovery loop
+/// must surface them, route each to its own output, and converge.
+#[test]
+fn context_generated_documents_are_discovered_and_routed() {
+    let docs = render();
+
+    // hello.typ is the one `kind: "post"` fixture → one generated page, keyed
+    // by the post's url: `ctx` + `/hello/` + `index.html`.
+    let generated = page(&docs, "ctx/hello/index.html");
+    assert!(
+        generated.contains("ctx-summary-for"),
+        "context-generated document body missing: {generated}"
+    );
+    assert!(
+        generated.contains("Hello, twyla"),
+        "generated doc did not receive the post title via documents(): {generated}"
+    );
+    assert!(
+        generated.contains("<h2 id=\"context-summary\">"),
+        "generated doc not realized as a real document (no heading slug): {generated}"
+    );
+
+    // The generator page itself still renders (its `#context` block lays out as
+    // nothing, since each `document(..)` is hoisted away).
+    let generator = page(&docs, "context-documents/index.html");
+    assert!(
+        generator.contains("Context Documents"),
+        "generator page prose missing: {generator}"
+    );
+    assert!(
+        !generator.contains("ctx-summary-for"),
+        "generated child leaked into the generator page: {generator}"
     );
 }
 

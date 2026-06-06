@@ -8,11 +8,10 @@ use ecow::{EcoString, EcoVec, eco_vec};
 use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult, Warned};
 use typst::foundations::{
-    Array, BundlePath, Content, Datetime, Dict, IntoValue, NativeElement, Output, Style,
+    Array, BundlePath, Content, Datetime, Dict, IntoValue, NativeElement, Output, Smart,
     StyleChain, Styles, Target, TargetElem, Value,
 };
 use typst::syntax::{FileId, Span, VirtualPath};
-use typst::utils::LazyHash;
 use typst_bundle::Bundle;
 use typst_library::engine::{Engine, Route, Sink, Traced};
 use typst_library::introspection::{EmptyIntrospector, Introspector, Locator, MAX_ITERS, analyze};
@@ -21,7 +20,7 @@ use typst_library::routines::{Arenas, RealizationKind};
 use typst_utils::Protected;
 
 use crate::asset::{AssetResolver, ResolvedAsset};
-use crate::document::{TwylaDocument, TwylaDocumentList};
+use crate::document::{DiscoveredDoc, TwylaDocument, TwylaDocumentList};
 use crate::project::TwylaContext;
 
 /// One page's harvested twyla metadata — the row that becomes one
@@ -109,32 +108,30 @@ fn compile_bundle_impl(
         route: Route::default(),
     };
 
-    // Evaluate each content file once into its body content.
+    // Evaluate each file once and harvest its (documents-independent) `#set
+    // document` metadata. Eval is fixed for the whole compile — the relayout
+    // loop below only re-*realizes*. Inline / `#context` `document(..)` calls
+    // inside these bodies are discovered later, via the sink, during that render
+    // — not here (so they ride the same pass as asset resolution).
     let evaled = engine.parallelize(sources, |engine, id| {
         let body = eval_file(engine, *id)?;
         let meta = harvest_metadata(ctx, engine, *id, &body)?;
         SourceResult::Ok((body, meta))
     });
-
-    let mut bodies = Vec::new();
-    let mut harvested = Vec::new();
-    let mut documents = Array::new();
+    let mut files: Vec<(Content, HarvestedDoc)> = Vec::new();
     for res in evaled {
-        let (body, meta) = res?;
-        let path = BundlePath::new(VirtualPath::new(&meta.output).unwrap()).unwrap();
-        bodies.push(DocumentElem::new(path, body).pack());
-        documents.push(meta.to_dict().into_value());
-        harvested.push(meta);
+        files.push(res?);
     }
 
-    // Inject the page list onto the style chain so `documents()` resolves it during the render pass.
-    let docs_style = TwylaDocumentList::all.set(documents).wrap();
+    // One fixed point: typst introspection, asset resolution, and document
+    // discovery all converge together (see [`compile_bundle_loop`]).
+    let bundle = compile_bundle_loop(ctx, world, traced, sink, &files, resolver)?;
 
-    // The (caller-owned, persistent) resolver drains discovered assets between
-    // relayout iterations and processes them; its store survives across compiles.
-    let content = Content::sequence(bodies);
-    let injected = [docs_style];
-    let bundle = relayout::<Bundle>(world, traced, sink, &content, &injected, resolver)?;
+    // Final metadata: each file page, then every discovered document.
+    let mut harvested: Vec<HarvestedDoc> = files.into_iter().map(|(_, meta)| meta).collect();
+    for doc in resolver.documents() {
+        harvested.push(harvested_from_discovered(ctx, doc));
+    }
     Ok((bundle, harvested, resolver.resolved_assets()))
 }
 
@@ -158,46 +155,59 @@ fn eval_file(engine: &mut Engine, id: FileId) -> SourceResult<Content> {
     .content())
 }
 
-/// The fixed-point relayout loop, operating on already-evaluated `content`.
-/// Mirrors the loop in `typst::compile_impl`, with twyla's asset resolution
-/// folded into the *same* loop (no nesting). `injected` is extra styles chained
-/// on top of the base (the `documents()` page list). `assets`, when present,
-/// drives asset-URL convergence: its resolved-map is re-injected every
-/// iteration as it drains, and the loop won't break until assets are *settled*
-/// as well as typst's own introspection — otherwise typst could declare
-/// convergence on a round where a freshly-discovered asset still shows its
-/// placeholder.
-fn relayout<T: Output>(
+/// The single fixed-point loop: typst's introspection convergence, asset URL
+/// resolution, and document discovery all settle here together. Mirrors the
+/// loop in `typst::compile_impl`, but each iteration rebuilds the bundle content
+/// and `documents()` listing from the file pages *plus every document discovered
+/// so far*, then drains both discovery sinks.
+///
+/// Why all three share one loop: a `#document(..)` (inline or `#context`-
+/// generated) reports itself on the doc sink during the very same Html
+/// realization that resolves assets, so there's no reason to separate them — and
+/// doing so would waste iterations rendering with placeholder assets. Document
+/// discovery needs its *own* settle flag (not just typst's introspection check):
+/// a freshly discovered doc isn't in the content that was just realized, and the
+/// `documents()` list is a style-chain read introspection doesn't track, so
+/// neither registers in `constraint`. Convergence therefore requires all of
+/// introspection-stable **and** assets-settled **and** documents-settled.
+fn compile_bundle_loop(
+    ctx: &TwylaContext,
     world: Tracked<dyn World + '_>,
     traced: Tracked<Traced>,
     sink: &mut Sink,
-    content: &Content,
-    injected: &[LazyHash<Style>],
-    assets: &mut AssetResolver,
-) -> SourceResult<T> {
+    files: &[(Content, HarvestedDoc)],
+    resolver: &mut AssetResolver,
+) -> SourceResult<Bundle> {
     let library = world.library();
     let base = StyleChain::new(&library.styles);
-    let target = TargetElem::target.set(T::target()).wrap();
+    let target = TargetElem::target.set(Bundle::target()).wrap();
     // Constant across iterations within one discovery generation — build once.
-    let sink_style = assets.sink_style();
+    let asset_sink = resolver.sink_style();
+    let doc_sink = resolver.doc_sink_style();
     let empty_introspector = EmptyIntrospector;
 
-    let mut history: Vec<T> = Vec::new();
-    let mut document: T;
+    let mut history: Vec<Bundle> = Vec::new();
+    let mut document: Bundle;
 
-    // Relayout until all introspections stabilize.
-    // If that doesn't happen within five attempts, we give up.
     loop {
-        // Build this iteration's style chain. Variable-length chaining can't be
-        // done link-by-link (each link must outlive the chain), so fold target
-        // + injected + resolved-map + sink into one `Styles` and chain it once.
-        // The resolved-map is rebuilt each iteration as the resolver drains.
-        let mut links: Vec<LazyHash<Style>> = Vec::with_capacity(injected.len() + 2);
-        links.push(target.clone());
-        links.extend(injected.iter().cloned());
-        links.push(assets.map_style());
-        links.push(sink_style.clone());
-        let combined: Styles = links.into_iter().collect();
+        // Rebuild content + the `documents()` listing from the file pages plus
+        // every document discovered so far; both grow as discovery proceeds.
+        let documents = build_documents_array(ctx, files, resolver);
+        let docs_list = TwylaDocumentList::all.set(documents).wrap();
+        let content = build_content(files, resolver);
+
+        // Fold target + documents list + asset map + both discovery sinks into
+        // one `Styles` and chain it once (variable-length chaining can't be done
+        // link-by-link). The asset map is rebuilt each iteration as it drains.
+        let combined: Styles = [
+            target.clone(),
+            docs_list,
+            resolver.map_style(),
+            asset_sink.clone(),
+            doc_sink.clone(),
+        ]
+        .into_iter()
+        .collect();
         let styles = base.chain(&combined);
 
         let introspector = history
@@ -216,18 +226,32 @@ fn relayout<T: Output>(
             route: Route::default(),
         };
 
-        document = T::create(&mut engine, content, styles)?;
+        document = Bundle::create(&mut engine, &content, styles)?;
 
-        // Drain discovered assets and process them off to the side; `settled`
-        // is true when nothing new was resolved this round.
-        let assets_settled = assets.drain_and_process(world)?;
+        // Drain both discovery channels (assets process eagerly; documents are
+        // just collected). Each returns whether it's *settled* this round.
+        let assets_settled = resolver.drain_and_process(world)?;
+        let docs_settled = resolver.drain_documents();
 
-        if constraint.validate(document.introspector()) && assets_settled {
+        if constraint.validate(document.introspector()) && assets_settled && docs_settled {
             sink.extend_from_sink(subsink);
             break;
         }
 
         if history.len() >= MAX_ITERS - 1 {
+            // Distinguish *our* non-convergence (an unstable document set) from
+            // typst's own (introspection), which it just warns about and accepts.
+            if !docs_settled {
+                return Err(eco_vec![SourceDiagnostic::error(
+                    Span::detached(),
+                    EcoString::from(
+                        "the set of `#context`-generated documents did not stabilize; a \
+                         generator is likely emitting a new `document(..)` every pass (e.g. \
+                         deriving its `output` from `documents()` itself)"
+                    ),
+                )]);
+            }
+
             let mut introspectors = [&empty_introspector as &dyn Introspector; MAX_ITERS + 1];
             for i in 1..MAX_ITERS {
                 introspectors[i] = history[i - 1].introspector();
@@ -333,6 +357,77 @@ fn harvest_metadata(
         kind,
         extra,
     })
+}
+
+/// The `documents()` array for the current loop iteration: every file page,
+/// then every document discovered so far (in the resolver's deterministic
+/// order).
+fn build_documents_array(
+    ctx: &TwylaContext,
+    files: &[(Content, HarvestedDoc)],
+    resolver: &AssetResolver,
+) -> Array {
+    let mut documents = Array::new();
+    for (_, meta) in files {
+        documents.push(meta.to_dict().into_value());
+    }
+    for doc in resolver.documents() {
+        documents.push(harvested_from_discovered(ctx, doc).to_dict().into_value());
+    }
+    documents
+}
+
+/// The bundle content for the current loop iteration: each file body wrapped as
+/// its own routed document, plus each discovered document as a sibling.
+fn build_content(files: &[(Content, HarvestedDoc)], resolver: &AssetResolver) -> Content {
+    let mut bodies = Vec::new();
+    for (body, meta) in files {
+        bodies.push(wrap_document(&meta.output, body.clone()));
+    }
+    for doc in resolver.documents() {
+        bodies.push(discovered_sibling(doc));
+    }
+    Content::sequence(bodies)
+}
+
+/// Wrap a discovered document as a routed sibling, re-applying its metadata to
+/// the body as a style map so `#context document.*` resolves inside it exactly
+/// as on a full-file page.
+fn discovered_sibling(doc: &DiscoveredDoc) -> Content {
+    let mut styles = Styles::new();
+    styles.set(
+        TwylaDocument::output,
+        Smart::Custom(doc.output.as_str().into()),
+    );
+    styles.set(TwylaDocument::title, doc.title.clone());
+    styles.set(TwylaDocument::date, doc.date);
+    styles.set(TwylaDocument::description, doc.description.clone());
+    styles.set(TwylaDocument::kind, Smart::Custom(doc.kind.clone()));
+    styles.set(TwylaDocument::extra, doc.extra.clone());
+    styles.set(TwylaDocument::draft, doc.draft);
+    wrap_document(&doc.output, doc.body.clone().styled_with_map(styles))
+}
+
+/// Build a [`HarvestedDoc`] (a `documents()` row + output meta) from a
+/// discovered document, deriving its URL from the configured base.
+fn harvested_from_discovered(ctx: &TwylaContext, doc: &DiscoveredDoc) -> HarvestedDoc {
+    HarvestedDoc {
+        url: ctx.document_url(&doc.output),
+        output: doc.output.clone(),
+        title: doc.title.clone(),
+        date: doc.date,
+        description: doc.description.clone(),
+        draft: doc.draft,
+        kind: doc.kind.clone(),
+        extra: doc.extra.clone(),
+    }
+}
+
+/// Wrap one page body in the native [`DocumentElem`] that typst-bundle routes to
+/// its own output file (keyed by `output`).
+fn wrap_document(output: &str, body: Content) -> Content {
+    let path = BundlePath::new(VirtualPath::new(output).unwrap()).unwrap();
+    DocumentElem::new(path, body).pack()
 }
 
 /// Deduplicate diagnostics. Mirrors `typst::deduplicate`.

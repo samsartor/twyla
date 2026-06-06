@@ -237,6 +237,57 @@ fn editing_source_revalidates_to_new_fingerprint() {
     );
 }
 
+/// The document half of the warm path: an inline `#document(..)` discovered via
+/// the sink persists across rebuilds, and is re-collected with a *fresh body*
+/// when its source file changes (resolver reused; FileStore reset + comemo aged,
+/// exactly as `serve` does). Guards the per-source document eviction in
+/// `revalidate`.
+#[test]
+fn editing_source_revalidates_inline_document() {
+    let (ctx, dir) = site(&[(
+        "content/main.typ",
+        "before #document(output: \"child/index.html\")[v1-body] after",
+    )]);
+    let mut world = RenderWorld::new(&ctx).unwrap();
+    // One resolver across both compiles — the persistent document-store path.
+    let mut resolver = AssetResolver::new(&ctx);
+
+    let outputs1 = world.compile_bundle(&mut resolver).unwrap();
+    let child1 = outputs1
+        .docs()
+        .find(|d| d.output_path == "child/index.html")
+        .expect("inline child emitted on first compile")
+        .html
+        .clone();
+    assert!(child1.contains("v1-body"), "first child body missing:\n{child1}");
+
+    // Edit the source (distinct mtime), then recompile the same world like serve.
+    std::thread::sleep(Duration::from_millis(10));
+    std::fs::write(
+        dir.path().join("content/main.typ"),
+        "before #document(output: \"child/index.html\")[v2-body] after",
+    )
+    .unwrap();
+    comemo::evict(0);
+    world.files.reset();
+
+    let outputs2 = world.compile_bundle(&mut resolver).unwrap();
+    let child2 = outputs2
+        .docs()
+        .find(|d| d.output_path == "child/index.html")
+        .expect("inline child still emitted after edit")
+        .html
+        .clone();
+    assert!(
+        child2.contains("v2-body"),
+        "inline document body did not update on warm rebuild:\n{child2}"
+    );
+    assert!(
+        !child2.contains("v1-body"),
+        "stale inline document body survived warm rebuild:\n{child2}"
+    );
+}
+
 /// Hash discipline (the comemo split): the resolved-map hashes by *content* and
 /// is order-independent; the sink hashes on *epoch* (constant within a
 /// generation, distinct across them).
