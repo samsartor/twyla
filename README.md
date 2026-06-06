@@ -47,7 +47,7 @@ For a blog you will probably want to list your other pages on your home page. To
 = My Blog
 
 #context for doc in documents() {
-  if !doc.draft and doc.kind == "post" [
+  if not doc.draft and doc.kind == "page" [
     == #link(doc.url, doc.title)
     #doc.date.display()
     
