@@ -1036,6 +1036,16 @@ mod tests {
     }
 
     #[test]
+    fn list_item_continuation_is_indented() {
+        // A list item with a second paragraph: the continuation must be indented
+        // under the marker, or typst splits the <li> out of the list.
+        let out = body("- first para\n\n  second para\n");
+        assert!(out.contains("- first para"), "got:\n{out}");
+        assert!(out.contains("\n  second para"), "continuation not indented:\n{out}");
+        assert!(!out.contains("\nsecond para"), "continuation at column 0:\n{out}");
+    }
+
+    #[test]
     fn no_extra_field_when_absent_or_empty() {
         let absent = import_md("+++\ntitle = \"T\"\n+++\nbody\n", "page", None).unwrap();
         assert!(!absent.contains("extra:"), "got: {absent}");

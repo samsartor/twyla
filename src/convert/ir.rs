@@ -143,9 +143,15 @@ fn render_block(b: &Block, out: &mut String) {
             out.push_str("]\n\n");
         }
         Block::List { ordered, items } => {
+            let marker = if *ordered { "+ " } else { "- " };
             for item in items {
-                out.push_str(if *ordered { "+ " } else { "- " });
-                render_item(item, out);
+                let mut buf = String::new();
+                render_item(item, &mut buf);
+                // Indent continuation lines under the marker (width of `- `):
+                // an unindented line ends the item, so typst would split it out
+                // of the list (`</ul><p>…</p><ul>`).
+                out.push_str(marker);
+                indent_continuation(&buf, "  ", out);
             }
             out.push('\n');
         }
@@ -183,6 +189,18 @@ fn render_item(blocks: &[Block], out: &mut String) {
         for b in blocks {
             render_block(b, out);
         }
+    }
+}
+
+/// Append `text`, indenting every line after the first by `pad` (empty lines
+/// stay empty). Used to keep a list item's continuation content — extra
+/// paragraphs, hard breaks, nested lists — under its marker.
+fn indent_continuation(text: &str, pad: &str, out: &mut String) {
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        if i > 0 && !line.trim_start().is_empty() {
+            out.push_str(pad);
+        }
+        out.push_str(line);
     }
 }
 
