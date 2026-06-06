@@ -105,6 +105,9 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
     let produced: HashSet<&str> = site.docs.iter().filter_map(|d| d.path.to_str()).collect();
 
     let mut twyla_pages = Vec::new();
+    // Dedup identical text-only attr drift across pages (e.g. the same `<pre>`
+    // background on every code page) so it reports once.
+    let mut seen_attr_drift = HashSet::new();
     for doc in &site.docs {
         let route = doc.path.to_string_lossy().to_string();
         if !route_matches(&route, &opts.only) {
@@ -118,8 +121,18 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
                 // Undo zola's anchor-only-link absolutization for this page.
                 let prefix = format!("{}#", ctx.document_url(&route));
                 rewrite_own_page_anchor_hrefs(&mut expected, &prefix);
-                // Bake the relaxations into both trees up front, so the diff is
-                // a pure structural comparison and the rendered patch shows only
+                // Surface attribute drift on text-only-relaxed elements (e.g.
+                // `<pre>`) as warnings — the structural diff drops those attrs.
+                // Runs on the un-normalized trees, before they're collapsed.
+                findings.extend(audit::text_only_attr_drift(
+                    &preset,
+                    &route,
+                    &expected,
+                    &actual,
+                    &mut seen_attr_drift,
+                ));
+                // Bake the relaxations into both trees, so the diff is a pure
+                // structural comparison and the rendered patch shows only
                 // non-relaxed differences. (`actual` is kept un-normalized for
                 // the link audit below.)
                 let expected = preset.normalize(&expected);

@@ -20,11 +20,12 @@
 //! Findings are deduplicated by resolved key so chrome links repeated across
 //! every page (a footer `resume.pdf`) report once.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::convert::manifest::Manifest;
 use crate::convert::report::Finding;
-use crate::html::{self, LinkClass, Node};
+use crate::diff::{RelaxConfig, RelaxationRule};
+use crate::html::{self, Element, LinkClass, Node};
 use crate::project::TwylaContext;
 
 /// A page to audit: its manifest key (the base for relative-URL resolution)
@@ -135,6 +136,93 @@ fn move_hint(ctx: &TwylaContext, key: &str) -> String {
         format!("content/{key} exists — move it to static/{key} to preserve the URL")
     } else {
         format!("expected {key}, not produced by twyla")
+    }
+}
+
+/// Warn when a text-only-relaxed element (e.g. `<pre>`) has attributes that
+/// differ from the ground truth. Its content is deliberately text-diffed (so a
+/// different syntax-highlight theme doesn't fail the page), which also drops its
+/// attrs from the structural diff — this surfaces that drift as a warning.
+///
+/// Elements are paired by document order; if the two trees don't have the same
+/// number of text-only elements the structure already diverged (the main diff
+/// reports it) and we skip. `seen` deduplicates identical drift across pages
+/// (the same `<pre>` background on every code page reports once).
+pub fn text_only_attr_drift(
+    cfg: &RelaxConfig,
+    page_key: &str,
+    expected: &Node,
+    actual: &Node,
+    seen: &mut HashSet<String>,
+) -> Vec<Finding> {
+    let exp = collect_text_only(cfg, expected);
+    let act = collect_text_only(cfg, actual);
+    if exp.len() != act.len() {
+        return Vec::new();
+    }
+    let mut findings = Vec::new();
+    for (e, a) in exp.iter().zip(act.iter()) {
+        if e.attrs == a.attrs {
+            continue;
+        }
+        let detail = attr_diff_detail(&e.attrs, &a.attrs);
+        if seen.insert(format!("{}\n{detail}", e.name)) {
+            findings.push(Finding::TextOnlyAttrDrift {
+                page: page_key.to_string(),
+                tag: e.name.clone(),
+                detail,
+            });
+        }
+    }
+    findings
+}
+
+/// Collect, in document order, every element a `TextOnly` rule matches.
+fn collect_text_only<'a>(cfg: &RelaxConfig, node: &'a Node) -> Vec<&'a Element> {
+    let mut out = Vec::new();
+    walk_text_only(cfg, node, &mut out);
+    out
+}
+
+fn walk_text_only<'a>(cfg: &RelaxConfig, node: &'a Node, out: &mut Vec<&'a Element>) {
+    match node {
+        Node::Document(children) => {
+            for c in children {
+                walk_text_only(cfg, c, out);
+            }
+        }
+        Node::Element(el) => {
+            if cfg
+                .find_rules(el)
+                .iter()
+                .any(|r| matches!(r, RelaxationRule::TextOnly))
+            {
+                out.push(el);
+            }
+            for c in &el.children {
+                walk_text_only(cfg, c, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One line per differing attribute: `name: "gt" vs "twyla"` (or `(absent)`).
+fn attr_diff_detail(exp: &BTreeMap<String, String>, act: &BTreeMap<String, String>) -> String {
+    let mut keys: Vec<&String> = exp.keys().chain(act.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .filter(|k| exp.get(*k) != act.get(*k))
+        .map(|k| format!("{k}: {} vs {}", show_attr(exp.get(k)), show_attr(act.get(k))))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn show_attr(v: Option<&String>) -> String {
+    match v {
+        Some(s) => format!("{s:?}"),
+        None => "(absent)".to_string(),
     }
 }
 
@@ -265,5 +353,33 @@ mod tests {
             !findings.iter().any(|f| f.severity() == Severity::Fail),
             "a missing feed must not fail the run, got: {findings:?}"
         );
+    }
+
+    #[test]
+    fn pre_attr_drift_warns_once() {
+        use crate::convert::report::Severity;
+        use crate::diff::Matcher;
+
+        let cfg = RelaxConfig::new().relax(Matcher::Tag("pre".into()), RelaxationRule::TextOnly);
+        // Zola's <pre> carries a theme background/color; twyla's doesn't (fixed
+        // in CSS). Content is highlighted differently too — but text-only.
+        let exp = parse_html(r#"<pre style="background:#2b303b;color:#c0c5ce">let x = 1;</pre>"#);
+        let act = parse_html(r#"<pre><span class="k">let</span> x = 1;</pre>"#);
+
+        let mut seen = HashSet::new();
+        let f = text_only_attr_drift(&cfg, "code/index.html", &exp, &act, &mut seen);
+        assert_eq!(f.len(), 1, "got: {f:?}");
+        match &f[0] {
+            Finding::TextOnlyAttrDrift { tag, detail, .. } => {
+                assert_eq!(tag, "pre");
+                assert!(detail.contains("style"), "detail: {detail}");
+                assert_eq!(f[0].severity(), Severity::Warn);
+            }
+            other => panic!("wrong finding: {other:?}"),
+        }
+
+        // The same drift on another page is deduped away.
+        let again = text_only_attr_drift(&cfg, "other/index.html", &exp, &act, &mut seen);
+        assert!(again.is_empty(), "should dedup, got: {again:?}");
     }
 }

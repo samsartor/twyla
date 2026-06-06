@@ -49,6 +49,15 @@ pub enum Finding {
     /// A feed (`atom.xml`) the ground truth produces but twyla doesn't — feeds
     /// aren't implemented yet. A warning, not a failure (planned work).
     FeedNotImplemented { url: String },
+    /// A text-only-compared element (e.g. `<pre>`) whose wrapper attributes
+    /// differ from the ground truth. The content is deliberately text-diffed
+    /// (syntax-highlight theme ignored), but attr drift — e.g. typst's `<pre>`
+    /// background/color — is surfaced as a warning so it isn't lost silently.
+    TextOnlyAttrDrift {
+        page: String,
+        tag: String,
+        detail: String,
+    },
     /// An expected route wasn't produced by twyla.
     RouteMissing { route: String },
     /// Twyla produced a route with no ground-truth counterpart.
@@ -61,7 +70,8 @@ impl Finding {
             Finding::DraftWritten { .. } | Finding::PagePass { .. } => Severity::Info,
             Finding::Note { .. }
             | Finding::RouteExtra { .. }
-            | Finding::FeedNotImplemented { .. } => Severity::Warn,
+            | Finding::FeedNotImplemented { .. }
+            | Finding::TextOnlyAttrDrift { .. } => Severity::Warn,
             Finding::DraftMissing { .. }
             | Finding::PageDiff { .. }
             | Finding::Unreachable { .. }
@@ -92,6 +102,7 @@ impl Finding {
             // A navigable URL the ground truth served that twyla dropped.
             Finding::NavigableDropped { .. } => "dropped-url",
             Finding::FeedNotImplemented { .. } => "feed-todo",
+            Finding::TextOnlyAttrDrift { .. } => "attr-drift",
             Finding::RouteMissing { .. } => "missing-route",
             Finding::RouteExtra { .. } => "extra-route",
         }
@@ -115,6 +126,9 @@ impl Finding {
             }
             Finding::FeedNotImplemented { url } => {
                 format!("{url} — atom feeds aren't implemented yet (planned)")
+            }
+            Finding::TextOnlyAttrDrift { page, tag, detail } => {
+                format!("{page} <{tag}> attrs differ (content text-diffed)\n{detail}")
             }
             Finding::RouteMissing { route } => format!("{route} (not produced by twyla)"),
             Finding::RouteExtra { route } => format!("{route} (not in the ground-truth dir)"),
