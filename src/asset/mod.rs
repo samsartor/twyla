@@ -60,7 +60,7 @@ use typst::syntax::{FileId, Spanned};
 use typst::utils::LazyHash;
 use typst_utils::hash128;
 
-use crate::build::Emit;
+use crate::render::Emit;
 use crate::project::TwylaContext;
 
 // ---------------------------------------------------------------------------

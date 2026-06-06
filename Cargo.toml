@@ -65,6 +65,7 @@ ansi-to-html = "0.2"
 # under NO_COLOR. (Diagnostics use typst-kit/termcolor; this is everything we
 # print ourselves.)
 owo-colors = { version = "4", features = ["supports-colors"] }
+iddqd = "0.4.2"
 
 [dev-dependencies]
 # Scratch output dir for the `twyla build` integration test (tests/site.rs).

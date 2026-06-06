@@ -22,7 +22,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use crate::convert::manifest::Manifest;
 use crate::convert::report::Finding;
 use crate::diff::{RelaxConfig, RelaxationRule};
 use crate::html::{self, Element, LinkClass, Node};
@@ -40,8 +39,8 @@ pub fn run(
     ctx: &TwylaContext,
     twyla_pages: &[Page],
     gt_pages: &[Page],
-    twyla_manifest: &Manifest,
-    gt_manifest: &Manifest,
+    twyla_manifest: &HashSet<String>,
+    gt_manifest: &HashSet<String>,
     base_url: Option<&str>,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -231,7 +230,7 @@ mod tests {
     use super::*;
     use crate::html::parse_html;
 
-    fn manifest(keys: &[&str]) -> Manifest {
+    fn manifest(keys: &[&str]) -> HashSet<String> {
         keys.iter().map(|s| s.to_string()).collect()
     }
 

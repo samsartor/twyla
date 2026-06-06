@@ -8,12 +8,12 @@
 //! still renders to a complete HTML document (typst-html's default shell —
 //! which a twyla default template will later replace with something nicer).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use twyla::project::TwylaContext;
-use twyla::render::render_site;
+use twyla::render::{Outputs, render_site};
 
-fn render_plain() -> Vec<twyla::render::OutputDoc> {
+fn render_plain() -> Outputs {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_site_plain");
     // No base_url: asset URLs come out root-relative (`/assets/..`), which the
     // native link rule treats as internal (no rel/target).
@@ -23,10 +23,10 @@ fn render_plain() -> Vec<twyla::render::OutputDoc> {
 
 #[test]
 fn native_asset_builtin_resolves_with_zero_imports() {
-    let docs = render_plain();
-    let page = &docs
-        .iter()
-        .find(|d| d.path == PathBuf::from("index/index.html"))
+    let outputs = render_plain();
+    let page = &outputs
+        .docs()
+        .find(|d| d.output_path == "index/index.html")
         .expect("index page rendered")
         .html;
 
@@ -45,10 +45,10 @@ fn native_asset_builtin_resolves_with_zero_imports() {
 
 #[test]
 fn native_html_rules_apply_without_show_rules() {
-    let docs = render_plain();
-    let page = &docs
-        .iter()
-        .find(|d| d.path == PathBuf::from("index/index.html"))
+    let outputs = render_plain();
+    let page = &outputs
+        .docs()
+        .find(|d| d.output_path == "index/index.html")
         .expect("index page rendered")
         .html;
 

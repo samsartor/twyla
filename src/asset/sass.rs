@@ -20,7 +20,7 @@ use typst::syntax::{FileId, Span, Spanned};
 use typst_utils::hash128;
 
 use super::{Asset, AssetSpec, Built, Upstream, resolve_path};
-use crate::build::Emit;
+use crate::render::Emit;
 use crate::project::TwylaContext;
 
 /// Compile a Sass/SCSS file to a fingerprinted CSS asset.
@@ -81,7 +81,7 @@ pub(crate) fn build(
     let css = Bytes::new(css.into_bytes());
     Ok(Built {
         content_hash: hash128(&css),
-        emit: Emit::AssetBytes(css),
+        emit: Emit::Bytes(css),
         upstream,
         ext: Some("css".to_string()),
         stem,

@@ -23,6 +23,6 @@ pub(crate) fn build(bytes: Bytes, ext: Option<EcoString>) -> Built {
         ext: ext.map(|e| e.to_string()),
         stem: None,
         upstream: Vec::new(),
-        emit: crate::build::Emit::AssetBytes(bytes),
+        emit: crate::render::Emit::Bytes(bytes),
     }
 }

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use crate::diff::{Matcher, RelaxConfig, RelaxationRule, diff};
 use crate::html::{parse_html, rewrite_own_page_anchor_hrefs};
 use crate::project::TwylaContext;
-use crate::render::render_site_with_assets;
+use crate::render::render_site;
 
 use report::Finding;
 
@@ -84,17 +84,14 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
     findings.extend(draft_findings);
 
     // 2. Compile the whole site in memory.
-    let site = render_site_with_assets(ctx).map_err(|e| ConvertError {
+    let outputs = render_site(ctx).map_err(|e| ConvertError {
         findings: std::mem::take(&mut findings),
         message: format!("compile failed:\n{e}"),
     })?;
 
-    // 3. Manifests — twyla's own (self-contained) and the ground truth (used to
-    // excuse links broken in both builds).
-    let twyla_manifest = manifest::twyla(ctx, &site).map_err(|e| ConvertError {
-        findings: std::mem::take(&mut findings),
-        message: format!("building twyla manifest: {e}"),
-    })?;
+    // 3. Manifests — twyla's own (the compiled outputs) and the ground truth
+    // (used to excuse links broken in both builds).
+    let twyla_manifest = manifest::twyla(&outputs);
     let gt_manifest = manifest::ground_truth(ctx, &opts.ground_truth).map_err(|e| ConvertError {
         findings: std::mem::take(&mut findings),
         message: format!("building ground-truth manifest: {e}"),
@@ -102,19 +99,19 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
 
     // 4. Per-page diff against the ground truth.
     let preset = convert_preset();
-    let produced: HashSet<&str> = site.docs.iter().filter_map(|d| d.path.to_str()).collect();
+    let produced: HashSet<&str> = outputs.docs().map(|d| d.output_path.as_str()).collect();
 
     let mut twyla_pages = Vec::new();
     // Dedup identical text-only attr drift across pages (e.g. the same `<pre>`
     // background on every code page) so it reports once.
     let mut seen_attr_drift = HashSet::new();
-    for doc in &site.docs {
-        let route = doc.path.to_string_lossy().to_string();
+    for doc in outputs.docs() {
+        let route = doc.output_path.clone();
         if !route_matches(&route, &opts.only) {
             continue;
         }
         let actual = parse_html(&doc.html);
-        let gt_path = opts.ground_truth.join(&doc.path);
+        let gt_path = opts.ground_truth.join(&doc.output_path);
         match std::fs::read_to_string(&gt_path) {
             Ok(gt_html) => {
                 let mut expected = parse_html(&gt_html);
@@ -186,8 +183,8 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
 
     // 8. Optionally write the compiled HTML for inspection.
     if let Some(out) = &opts.output_dir {
-        for doc in &site.docs {
-            let dest = out.join(&doc.path);
+        for doc in outputs.docs() {
+            let dest = out.join(&doc.output_path);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| ConvertError {
                     findings: std::mem::take(&mut findings),

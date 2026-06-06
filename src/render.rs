@@ -7,8 +7,10 @@
 //! callers (`build`, `check`, `render`) just construct a fresh world,
 //! compile once, and drop it.
 
-use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::{fmt, fs, io};
+
+use iddqd::{IdHashItem, IdHashMap, id_upcast};
 
 use typst::diag::{FileError, FileResult, SourceDiagnostic, Warned};
 use typst::foundations::{Bytes, Datetime, Dict, Duration, IntoValue};
@@ -84,39 +86,136 @@ impl std::error::Error for RenderError {}
 /// One routed page emerging from the bundle compile.
 #[derive(Debug, Clone)]
 pub struct OutputDoc {
-    /// The bundle-relative output path, e.g., `guis-2/index.html`.
-    pub path: PathBuf,
-    /// Fully resolved HTML (placeholders already substituted).
+    pub output_path: String,
     pub html: String,
+    /// The metadata harvested from inside the document.
+    /// This only None if the user created a raw Typst document
+    /// without going through Twyla somehow.
+    pub meta: Option<HarvestedDoc>,
 }
 
-/// A full compile: the routed pages plus every processed asset. `build` writes
-/// both to disk; `serve` serves both from the latest compile.
-#[derive(Debug, Clone)]
-pub struct SiteOutput {
-    pub docs: Vec<OutputDoc>,
-    pub assets: Vec<ResolvedAsset>,
+/// Some data which can be emitted to the output directory.
+#[derive(Clone, Debug)]
+pub enum Emit {
+    Bytes(Bytes),
+    Copy(PathBuf),
 }
 
-/// The full output of one compile: rendered pages, harvested per-page metadata,
-/// and processed assets — all from the single eval.
-type CompiledPages = (Vec<OutputDoc>, Vec<HarvestedDoc>, Vec<ResolvedAsset>);
+impl Emit {
+    /// Write this output to `dest` — `fs::write` for in-memory bytes, a
+    /// stream `fs::copy` for the path-backed variants.
+    pub(crate) fn write_to(&self, dest: &Path) -> io::Result<()> {
+        match self {
+            Emit::Bytes(bytes) => fs::write(dest, bytes),
+            Emit::Copy(src) => fs::copy(src, dest).map(drop),
+        }
+    }
+}
 
-/// Compile every page under `<root>/content/` as a single bundle.
+#[derive(Debug)]
+pub enum Output {
+    Doc(OutputDoc),
+    Asset(ResolvedAsset),
+    Static(String, PathBuf),
+}
+
+impl Output {
+    /// The root-relative `/`-separated output path — this output's key in
+    /// [`Outputs`] and its destination under the build dir.
+    pub fn key(&self) -> &str {
+        match self {
+            Output::Doc(d) => d.output_path.as_str(),
+            Output::Asset(a) => &a.output_path,
+            Output::Static(f, _) => f,
+        }
+    }
+
+    /// Write this output to `dest`: page HTML and transformed asset bytes go
+    /// through `fs::write`; path-backed assets and static files stream-copy.
+    pub fn write_to(&self, dest: &Path) -> io::Result<()> {
+        match self {
+            Output::Doc(d) => fs::write(dest, &d.html),
+            Output::Asset(a) => a.built.emit.write_to(dest),
+            Output::Static(_, src) => fs::copy(src, dest).map(drop),
+        }
+    }
+}
+
+impl IdHashItem for Output {
+    type Key<'a> = &'a str;
+
+    fn key(&self) -> &str {
+        Output::key(self)
+    }
+
+    id_upcast!();
+}
+
+/// Everything one compile produces, keyed by output path: compiled pages
+/// (with their harvested metadata), processed assets, and static files. The
+/// single object `build` writes, the manifest enumerates, and `serve` answers
+/// requests from — so they can't disagree about what the site contains.
+pub struct Outputs {
+    pub all: IdHashMap<Output>,
+}
+
+impl Outputs {
+    /// Look up an output by its root-relative key (e.g. `guis-1/index.html`).
+    pub fn get(&self, key: &str) -> Option<&Output> {
+        self.all.get(key)
+    }
+
+    /// Every output, in unspecified order.
+    pub fn iter(&self) -> impl Iterator<Item = &Output> {
+        self.all.iter()
+    }
+
+    /// Just the compiled pages (with their harvested metadata).
+    pub fn docs(&self) -> impl Iterator<Item = &OutputDoc> {
+        self.all.iter().filter_map(|o| match o {
+            Output::Doc(d) => Some(d),
+            _ => None,
+        })
+    }
+
+    /// Just the processed assets.
+    pub fn assets(&self) -> impl Iterator<Item = &ResolvedAsset> {
+        self.all.iter().filter_map(|o| match o {
+            Output::Asset(a) => Some(a),
+            _ => None,
+        })
+    }
+
+    /// Write every output under `dir`, creating `dir` and each parent directory
+    /// as needed. IO errors are annotated with the offending path. This is the
+    /// whole of `twyla build`'s disk work.
+    pub fn emit_to_fs(&self, dir: &Path) -> io::Result<()> {
+        fs::create_dir_all(dir)
+            .map_err(|e| io::Error::new(e.kind(), format!("creating {}: {e}", dir.display())))?;
+        for output in self.iter() {
+            let dest = dir.join(output.key());
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    io::Error::new(e.kind(), format!("creating {}: {e}", parent.display()))
+                })?;
+            }
+            output
+                .write_to(&dest)
+                .map_err(|e| io::Error::new(e.kind(), format!("writing {}: {e}", dest.display())))?;
+        }
+        Ok(())
+    }
+}
+
+/// Compile every page under `<root>/content/` into the full set of
+/// [`Outputs`] (pages, assets, static files).
 ///
 /// One-shot wrapper: builds a fresh [`RenderWorld`], compiles, drops.
 /// `twyla serve` skips this and reuses a long-lived world directly so
 /// the comemo cache survives between requests.
-pub fn render_site(ctx: &TwylaContext) -> Result<Vec<OutputDoc>, RenderError> {
+pub fn render_site(ctx: &TwylaContext) -> Result<Outputs, RenderError> {
     let world = RenderWorld::new(ctx)?;
     world.compile_bundle(&mut AssetResolver::new(ctx))
-}
-
-/// Like [`render_site`] but also returns the processed assets — what `build`
-/// needs to emit `<dir>/assets/...` alongside the pages.
-pub fn render_site_with_assets(ctx: &TwylaContext) -> Result<SiteOutput, RenderError> {
-    let world = RenderWorld::new(ctx)?;
-    world.compile_site(&mut AssetResolver::new(ctx))
 }
 
 /// Replace every `<script type="x-twyla-raw-html">..</script>` with its
@@ -169,12 +268,12 @@ fn terminal_color() -> bool {
 /// Render diagnostics to a string via typst-kit's emitter. With `color`, the
 /// string carries ANSI escapes; otherwise it's plain text. Emitting into an
 /// in-memory buffer only fails on encoding errors, which we don't expect.
-fn emit_to_string(
-    world: &dyn DiagnosticWorld,
-    diags: &[SourceDiagnostic],
-    color: bool,
-) -> String {
-    let mut buf = if color { Buffer::ansi() } else { Buffer::no_color() };
+fn emit_to_string(world: &dyn DiagnosticWorld, diags: &[SourceDiagnostic], color: bool) -> String {
+    let mut buf = if color {
+        Buffer::ansi()
+    } else {
+        Buffer::no_color()
+    };
     let _ = diagnostics::emit(&mut buf, world, diags, DiagnosticFormat::Human);
     String::from_utf8_lossy(&buf.into_inner()).into_owned()
 }
@@ -297,38 +396,17 @@ impl RenderWorld {
 
     /// Compile every routed page in the bundle.
     ///
-    /// Reads through `FileStore`, so repeated calls hit the comemo
-    /// cache. Between compiles, call [`reset`](Self::reset) and
-    /// `comemo::evict(..)` to invalidate; for content/ shape changes,
-    /// also call [`refresh_main`](Self::refresh_main).
-    pub fn compile_bundle(
-        &self,
-        resolver: &mut AssetResolver,
-    ) -> Result<Vec<OutputDoc>, RenderError> {
-        Ok(self.compile_bundle_with_meta(resolver)?.0)
-    }
-
-    /// Compile both pages and assets — what `build`/`serve` emit. The assets
-    /// come from the same single eval as the pages.
-    pub fn compile_site(&self, resolver: &mut AssetResolver) -> Result<SiteOutput, RenderError> {
-        let (docs, _harvested, assets) = self.compile_bundle_with_meta(resolver)?;
-        Ok(SiteOutput { docs, assets })
-    }
-
-    /// Like [`compile_bundle`](Self::compile_bundle) but also returns the
-    /// per-page twyla `document` metadata and the processed [`ResolvedAsset`]s
-    /// harvested/resolved during the *same* compile (one eval). Both come out
-    /// of [`crate::compile::compile_bundle`].
-    ///
     /// The `resolver` is caller-owned (not stored in the world): a one-shot
     /// caller passes a fresh one; `serve` reuses one across recompiles so its
     /// store persists. Passing it in keeps these methods `&self` — a field
     /// would force interior mutability, since `self` is also handed to typst as
     /// `&dyn World` for the duration of the compile.
-    pub fn compile_bundle_with_meta(
-        &self,
-        resolver: &mut AssetResolver,
-    ) -> Result<CompiledPages, RenderError> {
+    pub fn compile_bundle(&self, resolver: &mut AssetResolver) -> Result<Outputs, RenderError> {
+        // Reads through `FileStore`, so repeated calls hit the comemo
+        // cache. Between compiles, call [`reset`](Self::reset) and
+        // `comemo::evict(..)` to invalidate; for content/ shape changes,
+        // also call [`refresh_main`](Self::refresh_main).
+
         let sources = self.ctx.scan_pages().map_err(setup_err)?;
         let fileids: Vec<_> = sources
             .into_iter()
@@ -344,32 +422,79 @@ impl RenderWorld {
             crate::compile::compile_bundle(&self.ctx, self, &fileids, resolver);
         emit_warnings(self, &warnings);
 
-        let (bundle, harvested, assets) =
-            output.map_err(|errors| compile_err(self, &errors))?;
+        let (bundle, harvested, assets) = output.map_err(|errors| compile_err(self, &errors))?;
 
-        let mut docs = Vec::new();
+        let mut all = IdHashMap::new();
         for (path, file) in bundle.files.iter() {
             let doc = match file {
                 BundleFile::Document(BundleDocument::Html(doc)) => doc,
                 _ => continue,
             };
             let raw = typst_html::html(doc).map_err(|errors| compile_err(self, &errors))?;
-            docs.push(OutputDoc {
-                path: PathBuf::from(path.get_without_slash()),
+            if let Err(err) = all.insert_unique(Output::Doc(OutputDoc {
                 html: resolve_raw_html_placeholders(&raw),
-            });
+                output_path: path.get_without_slash().to_owned(),
+                meta: None,
+            })) {
+                return Err(duplication_error(err).0);
+            }
         }
 
-        if docs.is_empty() {
+        for doc in harvested {
+            let mut out = all.get_mut(doc.output.as_str());
+            let Some(Output::Doc(out)) = out.as_deref_mut() else {
+                panic!("missing document in bundle with path {}", &doc.output);
+            };
+            out.meta = Some(doc);
+        }
+
+        for asset in assets {
+            if let Err(err) = all.insert_unique(Output::Asset(asset)) {
+                return Err(duplication_error(err).0);
+            }
+        }
+
+        let static_outputs = match self.ctx.static_outputs() {
+            Ok(s) => s,
+            Err(err) => return Err(plain_err(err, RenderErrorKind::Bundle)),
+        };
+        for out in static_outputs {
+            if let Err(err) = all.insert_unique(out) {
+                return Err(duplication_error(err).0);
+            }
+        }
+
+        if all.is_empty() {
             return Err(plain_err(
-                "bundle produced no HTML documents",
+                "bundle produced no outputs",
                 RenderErrorKind::Bundle,
             ));
         }
 
-        docs.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok((docs, harvested, assets))
+        Ok(Outputs { all })
     }
+}
+
+/// The error shown when two outputs conflict
+fn duplication_error(err: iddqd::errors::DuplicateItem<Output, &Output>) -> (RenderError, Output) {
+    let (new, duplicates) = err.into_parts();
+    let new_text = match &new {
+        Output::Doc(_d) => format_args!("document"), // TODO: source location?
+        Output::Asset(a) => format_args!("asset {:?}", a.spec),
+        Output::Static(_, p) => format_args!("static file \"{}\"", p.display()),
+    };
+    let dup_text = match &duplicates[0] {
+        Output::Doc(_d) => format_args!("a document"), // TODO: source location?
+        Output::Asset(a) => format_args!("an asset {:?}", a.spec),
+        Output::Static(_, p) => format_args!("static file \"{}\"", p.display()),
+    };
+    (
+        plain_err(
+            format!("{new_text} conflicts with {dup_text}"),
+            RenderErrorKind::Bundle,
+        ),
+        new,
+    )
 }
 
 /// Install twyla's native customizations into a freshly built library.
@@ -516,18 +641,18 @@ mod tests {
             })
             .expect("TWYLA_ROOT, SITE_ROOT, or HOME");
         let ctx = TwylaContext::new(&site, None).expect("TwylaContext");
-        let docs = render_site(&ctx).expect("render_site");
-        let paths: Vec<_> = docs.iter().map(|d| d.path.clone()).collect();
+        let outputs = render_site(&ctx).expect("render_site");
+        let paths: Vec<String> = outputs.docs().map(|d| d.output_path.clone()).collect();
         assert!(
-            paths.contains(&PathBuf::from("guis-1/index.html")),
+            paths.iter().any(|p| p == "guis-1/index.html"),
             "missing guis-1 in {paths:?}",
         );
         assert!(
-            paths.contains(&PathBuf::from("guis-2/index.html")),
+            paths.iter().any(|p| p == "guis-2/index.html"),
             "missing guis-2 in {paths:?}",
         );
         assert!(
-            paths.contains(&PathBuf::from("guis-3/index.html")),
+            paths.iter().any(|p| p == "guis-3/index.html"),
             "missing guis-3 in {paths:?}",
         );
         // Per-doc anchor links: guis-1 has an intra-doc link to
@@ -545,9 +670,9 @@ mod tests {
             ),
         ];
         for (path, expected_anchors) in intra_doc_expectations {
-            let doc = docs
-                .iter()
-                .find(|d| d.path == PathBuf::from(path))
+            let doc = outputs
+                .docs()
+                .find(|d| d.output_path == *path)
                 .unwrap_or_else(|| panic!("missing {path}"));
             for anchor in *expected_anchors {
                 assert!(

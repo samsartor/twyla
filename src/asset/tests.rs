@@ -29,8 +29,9 @@ fn site(files: &[(&str, &str)]) -> (TwylaContext, tempfile::TempDir) {
 /// resolver — for tests that don't exercise cross-compile persistence).
 fn compile(world: &RenderWorld) -> (String, Vec<ResolvedAsset>) {
     let mut resolver = AssetResolver::new(&world.ctx);
-    let (docs, _harvested, assets) = world.compile_bundle_with_meta(&mut resolver).unwrap();
-    (docs[0].html.clone(), assets)
+    let outputs = world.compile_bundle(&mut resolver).unwrap();
+    let html = outputs.docs().next().unwrap().html.clone();
+    (html, outputs.assets().cloned().collect())
 }
 
 fn fid(path: &str) -> FileId {
@@ -149,8 +150,8 @@ fn editing_source_revalidates_to_new_fingerprint() {
     // One resolver reused across both compiles — the persistent-store path.
     let mut resolver = AssetResolver::new(&ctx);
 
-    let (_docs1, _h1, assets1) = world.compile_bundle_with_meta(&mut resolver).unwrap();
-    let url1 = assets1[0].output_path.clone();
+    let outputs1 = world.compile_bundle(&mut resolver).unwrap();
+    let url1 = outputs1.assets().next().unwrap().output_path.clone();
 
     // Edit the source (distinct mtime), then recompile the same world the way
     // `serve` does: reset the FileStore + age comemo.
@@ -159,9 +160,9 @@ fn editing_source_revalidates_to_new_fingerprint() {
     comemo::evict(0);
     world.files.reset();
 
-    let (docs2, _h2, assets2) = world.compile_bundle_with_meta(&mut resolver).unwrap();
-    let html2 = docs2[0].html.clone();
-    let url2 = assets2[0].output_path.clone();
+    let outputs2 = world.compile_bundle(&mut resolver).unwrap();
+    let html2 = outputs2.docs().next().unwrap().html.clone();
+    let url2 = outputs2.assets().next().unwrap().output_path.clone();
 
     assert_ne!(
         url1, url2,

@@ -21,7 +21,7 @@ use twyla::build::{Build, BuildSummary, run as build_run};
 use twyla::diff::{Matcher, RelaxConfig, RelaxationRule, diff};
 use twyla::html::parse_html;
 use twyla::project::TwylaContext;
-use twyla::render::{OutputDoc, render_site};
+use twyla::render::{Outputs, render_site};
 
 const BASE_URL: &str = "https://example.com";
 
@@ -34,17 +34,18 @@ fn ctx() -> TwylaContext {
         .expect("construct TwylaContext for test_site")
 }
 
-fn render() -> Vec<OutputDoc> {
+fn render() -> Outputs {
     render_site(&ctx()).expect("render test_site")
 }
 
-/// HTML of the doc routed to `bundle_path` (e.g. `hello/index.html`).
-fn page<'a>(docs: &'a [OutputDoc], bundle_path: &str) -> &'a str {
-    docs.iter()
-        .find(|d| d.path == Path::new(bundle_path))
+/// HTML of the doc routed to `key` (e.g. `hello/index.html`).
+fn page<'a>(outputs: &'a Outputs, key: &str) -> &'a str {
+    outputs
+        .docs()
+        .find(|d| d.output_path == key)
         .unwrap_or_else(|| {
-            let have: Vec<_> = docs.iter().map(|d| d.path.display().to_string()).collect();
-            panic!("no doc at {bundle_path:?}; have {have:?}")
+            let have: Vec<_> = outputs.docs().map(|d| d.output_path.clone()).collect();
+            panic!("no doc at {key:?}; have {have:?}")
         })
         .html
         .as_str()
@@ -54,12 +55,12 @@ fn page<'a>(docs: &'a [OutputDoc], bundle_path: &str) -> &'a str {
 
 #[test]
 fn routes_every_content_page_and_skips_underscores() {
-    let docs = render();
-    let paths: Vec<_> = docs.iter().map(|d| d.path.clone()).collect();
+    let outputs = render();
+    let paths: Vec<String> = outputs.docs().map(|d| d.output_path.clone()).collect();
 
     for expected in ["index.html", "hello/index.html", "diagram-demo/index.html"] {
         assert!(
-            paths.contains(&PathBuf::from(expected)),
+            paths.iter().any(|p| p == expected),
             "missing route {expected:?}; have {paths:?}",
         );
     }
@@ -196,7 +197,7 @@ fn hello_matches_golden() {
 // --- build to disk -------------------------------------------------------
 
 #[test]
-fn build_emits_pages_static_and_colocated_assets() {
+fn build_emits_pages_and_static() {
     let out = tempfile::tempdir().expect("tempdir");
     let summary: BuildSummary = build_run(Build {
         ctx: ctx(),
@@ -217,32 +218,14 @@ fn build_emits_pages_static_and_colocated_assets() {
     );
     // static/ copied verbatim.
     assert!(exists("style.css"), "static/style.css not copied");
-    // Colocated content (non-source under content/) is opt-in: off by default,
-    // so the svg is *not* emitted at root.
+    // Colocated content (non-source under content/) is not shipped — files
+    // belong in static/. The svg under content/ is *not* emitted at root.
     assert!(
         !exists("diagram-demo.svg"),
-        "colocated svg copied despite emit_content_assets off"
+        "colocated content svg should not be emitted"
     );
     // underscore-prefixed draft never compiled → no route written.
     assert!(!exists("draft/index.html"), "draft page was written");
-}
-
-#[test]
-fn build_emits_colocated_content_when_enabled() {
-    let out = tempfile::tempdir().expect("tempdir");
-    let mut ctx = ctx();
-    ctx.emit_content_assets = true;
-    build_run(Build {
-        ctx,
-        output_dir: out.path().to_path_buf(),
-    })
-    .expect("build test_site");
-
-    let exists = |rel: &str| out.path().join(rel).is_file();
-    // With the flag on, content/ becomes a copy root: the colocated svg lands
-    // at its root path, while page sources stay out of the output.
-    assert!(exists("diagram-demo.svg"), "colocated svg not copied");
-    assert!(!exists("diagram-demo.typ"), "page source leaked into output");
 }
 
 /// End-to-end asset pipeline: `asset.sass` compiles SCSS → CSS via grass,
@@ -313,10 +296,10 @@ fn build_emits_fingerprinted_sass_and_file_assets() {
 #[test]
 #[ignore = "nested-section routing not implemented (scan_pages is top-level only)"]
 fn nested_section_routes_under_subdir() {
-    let docs = render();
-    let paths: Vec<_> = docs.iter().map(|d| d.path.clone()).collect();
+    let outputs = render();
+    let paths: Vec<String> = outputs.docs().map(|d| d.output_path.clone()).collect();
     assert!(
-        paths.contains(&PathBuf::from("notes/first/index.html")),
+        paths.iter().any(|p| p == "notes/first/index.html"),
         "nested section not routed; have {paths:?}",
     );
 }
@@ -429,14 +412,17 @@ fn spike_overloaded_document_contextual_read() {
 #[test]
 fn spike_harvest_reads_per_doc_extra() {
     use twyla::asset::AssetResolver;
+    use twyla::compile::HarvestedDoc;
     use twyla::render::RenderWorld;
 
     let ctx = ctx();
     let world = RenderWorld::new(&ctx).expect("world");
-    // Harvest shares the single eval/compile with the rendered HTML.
-    let (_rendered, docs, _assets) = world
-        .compile_bundle_with_meta(&mut AssetResolver::new(&ctx))
+    // Harvest shares the single eval/compile with the rendered HTML; the
+    // metadata now rides on each `OutputDoc.meta`.
+    let outputs = world
+        .compile_bundle(&mut AssetResolver::new(&ctx))
         .expect("compile+harvest");
+    let docs: Vec<&HarvestedDoc> = outputs.docs().filter_map(|d| d.meta.as_ref()).collect();
     let spike = docs
         .iter()
         .find(|d| d.url == "https://example.com/spike-doc/")

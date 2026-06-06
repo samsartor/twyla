@@ -199,10 +199,10 @@ fn cmd_build(args: ContextArgs, output_dir: Option<PathBuf>) -> ExitCode {
     }) {
         Ok(summary) => {
             eprintln!(
-                "twyla build: {} pages, {} assets, {} copied  → {} ({:.1?})",
+                "twyla build: {} pages, {} assets, {} static  → {} ({:.1?})",
                 summary.pages,
                 summary.assets,
-                summary.copied,
+                summary.static_files,
                 output_dir.display(),
                 start.elapsed(),
             );

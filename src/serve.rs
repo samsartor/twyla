@@ -33,10 +33,9 @@ use typst_kit::watcher::Watcher;
 
 use owo_colors::{AnsiColors, OwoColorize, Stream, Style};
 
-use crate::asset::AssetResolver;
-use crate::build::Emit;
+use crate::asset::{AssetResolver, ResolvedAsset};
 use crate::project::TwylaContext;
-use crate::render::{OutputDoc, RenderError, RenderWorld, SiteOutput};
+use crate::render::{Emit, Output, Outputs, RenderError, RenderWorld};
 
 /// All of serve's own logging goes to stderr; color follows that stream's tty.
 const OUT: Stream = Stream::Stderr;
@@ -58,7 +57,8 @@ fn log_request(status: u16, method: &str, path: &str, detail: &str) {
     let req = format!("{method} {path}");
     eprintln!(
         "  {}  {req:<34}{}",
-        code.if_supports_color(OUT, |s| s.style(Style::new().color(status_color(status)).bold())),
+        code.if_supports_color(OUT, |s| s
+            .style(Style::new().color(status_color(status)).bold())),
         detail.if_supports_color(OUT, |s| s.dimmed()),
     );
 }
@@ -70,7 +70,7 @@ pub struct Serve {
 
 /// Result of the most recent bundle compile (pages + processed assets).
 /// Published by the watcher thread, read by request handlers.
-type LastOutput = Mutex<Result<SiteOutput, RenderError>>;
+type LastOutput = Mutex<Result<Outputs, RenderError>>;
 
 /// Live Server-Sent-Events connections subscribed to `/__twyla/reload`.
 /// Request handlers push new ones; the watcher threads write reload
@@ -87,7 +87,7 @@ struct ServeState {
 fn print_banner(
     local: SocketAddr,
     root: &Path,
-    initial: &Result<SiteOutput, RenderError>,
+    initial: &Result<Outputs, RenderError>,
     elapsed: Duration,
 ) {
     // Show the root relative to the cwd when possible — `test_site/` reads
@@ -109,7 +109,10 @@ fn print_banner(
         .to_string();
 
     eprintln!();
-    eprintln!("  {mark} {}", "twyla serve".if_supports_color(OUT, |s| s.bold()));
+    eprintln!(
+        "  {mark} {}",
+        "twyla serve".if_supports_color(OUT, |s| s.bold())
+    );
     eprintln!();
     eprintln!("  {arrow}  Local:  {url}");
     eprintln!("  {arrow}  Root:   {root}");
@@ -117,8 +120,8 @@ fn print_banner(
         Ok(site) => eprintln!(
             "  {}  ready in {elapsed:.1?} ({} pages, {} assets)",
             "✓".if_supports_color(OUT, |s| s.style(Style::new().green().bold())),
-            site.docs.len(),
-            site.assets.len(),
+            site.docs().count(),
+            site.assets().count(),
         ),
         Err(e) => {
             eprintln!(
@@ -160,7 +163,7 @@ pub fn run(serve: Serve) -> io::Result<()> {
     let mut resolver = AssetResolver::new(&serve.ctx);
 
     let warm_start = Instant::now();
-    let initial = world.lock().unwrap().compile_site(&mut resolver);
+    let initial = world.lock().unwrap().compile_bundle(&mut resolver);
     print_banner(local, &serve.ctx.root, &initial, warm_start.elapsed());
 
     let last_output: Arc<LastOutput> = Arc::new(Mutex::new(initial));
@@ -202,12 +205,18 @@ pub fn run(serve: Serve) -> io::Result<()> {
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("  {}", format!("accept error: {e}").if_supports_color(OUT, |s| s.red()));
+                eprintln!(
+                    "  {}",
+                    format!("accept error: {e}").if_supports_color(OUT, |s| s.red())
+                );
                 continue;
             }
         };
         if let Err(e) = handle(&state, stream) {
-            eprintln!("  {}", format!("connection error: {e}").if_supports_color(OUT, |s| s.red()));
+            eprintln!(
+                "  {}",
+                format!("connection error: {e}").if_supports_color(OUT, |s| s.red())
+            );
         }
     }
     Ok(())
@@ -249,16 +258,22 @@ fn run_watcher(
         // own pass, not typst, so they're not in `world.dependencies()` — add
         // them explicitly or an edit to a partial wouldn't trigger a recompile.
         if let Ok(site) = &*last_output.lock().unwrap() {
-            for asset in &site.assets {
+            for asset in site.assets() {
                 paths.extend(asset.upstream_paths().map(Path::to_path_buf));
             }
         }
         if let Err(e) = watcher.update(paths) {
-            eprintln!("  {}", format!("watcher update failed: {e}").if_supports_color(OUT, |s| s.red()));
+            eprintln!(
+                "  {}",
+                format!("watcher update failed: {e}").if_supports_color(OUT, |s| s.red())
+            );
             return;
         }
         if let Err(e) = watcher.wait() {
-            eprintln!("  {}", format!("watcher wait failed: {e}").if_supports_color(OUT, |s| s.red()));
+            eprintln!(
+                "  {}",
+                format!("watcher wait failed: {e}").if_supports_color(OUT, |s| s.red())
+            );
             return;
         }
 
@@ -270,15 +285,15 @@ fn run_watcher(
             comemo::evict(10);
             let mut w = world.lock().unwrap();
             w.files.reset();
-            w.compile_site(&mut resolver)
+            w.compile_bundle(&mut resolver)
         };
         let elapsed = start.elapsed();
         match &result {
             Ok(site) => eprintln!(
                 "  {}  rebuilt in {elapsed:.1?} ({} pages, {} assets)",
                 "✓".if_supports_color(OUT, |s| s.style(Style::new().green().bold())),
-                site.docs.len(),
-                site.assets.len(),
+                site.docs().count(),
+                site.assets().count(),
             ),
             Err(e) => eprintln!(
                 "  {}  rebuild failed in {elapsed:.1?}\n{e}",
@@ -308,9 +323,8 @@ fn run_static_watcher(static_dir: PathBuf, reload_clients: Arc<ReloadClients>) {
     let mut watcher = match notify::recommended_watcher(tx) {
         Ok(w) => w,
         Err(e) => {
-            let msg = format!(
-                "static watcher unavailable ({e}); static asset edits won't hot-reload."
-            );
+            let msg =
+                format!("static watcher unavailable ({e}); static asset edits won't hot-reload.");
             eprintln!("  {}", msg.if_supports_color(OUT, |s| s.yellow()));
             return;
         }
@@ -329,7 +343,10 @@ fn run_static_watcher(static_dir: PathBuf, reload_clients: Arc<ReloadClients>) {
         let event = match res {
             Ok(ev) => ev,
             Err(e) => {
-                eprintln!("  {}", format!("static watch error: {e}").if_supports_color(OUT, |s| s.red()));
+                eprintln!(
+                    "  {}",
+                    format!("static watch error: {e}").if_supports_color(OUT, |s| s.red())
+                );
                 continue;
             }
         };
@@ -545,66 +562,48 @@ fn dispatch(state: &ServeState, path: &str) -> Response {
         .next()
         .unwrap_or(path)
         .trim_start_matches('/');
-    if path.is_empty() {
-        serve_doc(state, Path::new("index.html"))
-    } else if path.ends_with('/') {
-        serve_doc(state, &Path::new(path).join("index.html"))
+
+    let guard = state.last_output.lock().unwrap();
+    let site = match &*guard {
+        Ok(site) => site,
+        Err(e) => return Response::html(500, error_page(e.html())),
+    };
+
+    // Resolve against the compiled outputs: the path as-is (an asset, or a page
+    // given with its full `…/index.html`), then the directory-index form
+    // (`/`, `foo`, `foo/` → `…/index.html`). Pages and assets share one map, so
+    // there's no doc-then-asset fallback to chain.
+    let index_key = if path.is_empty() || path.ends_with('/') {
+        format!("{path}index.html")
     } else {
-        let res = serve_doc(state, Path::new(path));
-        if res.status == 200 {
-            return res;
-        }
-        let res = serve_doc(state, &Path::new(path).join("index.html"));
-        if res.status == 200 {
-            return res;
-        }
-        if let Some(res) = serve_asset(state, path) {
-            return res;
-        }
-        serve_static(&state.ctx, path)
+        format!("{path}/index.html")
+    };
+    match site.get(path).or_else(|| site.get(&index_key)) {
+        Some(Output::Doc(d)) => return Response::html(200, d.html.clone()),
+        Some(Output::Asset(a)) => return serve_asset(a),
+        // `Output::Static` falls through to the live-disk read below, so a
+        // freshly-added file (not yet in the recompiled map) still resolves.
+        _ => {}
     }
+
+    // The placeholder home when there's no `content/main.typ`; otherwise a
+    // static file, read live from disk.
+    if path.is_empty() {
+        return placeholder_main(site, &state.ctx);
+    }
+    drop(guard);
+    serve_static(&state.ctx, path)
 }
 
-/// Serve a processed (`asset.*`) asset from the latest compile, matched by its
-/// bundle-relative `output_path` (e.g. `assets/main-<hash>.css`). Returns
-/// `None` if the path isn't a known asset, so the caller falls through to
-/// static serving.
-fn serve_asset(state: &ServeState, path: &str) -> Option<Response> {
-    let guard = state.last_output.lock().unwrap();
-    let site = guard.as_ref().ok()?;
-    let asset = site.assets.iter().find(|a| a.output_path == path)?;
-    let dest = Path::new(path);
+/// Serve a processed (`asset.*`) asset's bytes, by its `assets/…` output key.
+fn serve_asset(asset: &ResolvedAsset) -> Response {
+    let dest = Path::new(&asset.output_path);
     match &asset.built.emit {
-        Emit::AssetCopy(src) => match std::fs::read(src) {
-            Ok(body) => Some(Response::bytes(200, mime_for(dest), body)),
-            Err(_) => Some(Response::text(404, "asset source unreadable")),
+        Emit::Copy(src) => match std::fs::read(src) {
+            Ok(body) => Response::bytes(200, mime_for(dest), body),
+            Err(_) => Response::text(404, "asset source unreadable"),
         },
-        Emit::AssetBytes(bytes) => Some(Response::bytes(
-            200,
-            mime_for(dest),
-            bytes.as_slice().to_vec(),
-        )),
-        // A resolved asset is only ever `Asset*`; the page/copy-root variants
-        // can't occur here, so fall through to static serving if one does.
-        Emit::Doc(_) | Emit::CopyRoot(_) => None,
-    }
-}
-
-/// Serve a compiled doc from the cached `last_output`.
-fn serve_doc(state: &ServeState, bundle_path: &Path) -> Response {
-    let guard = state.last_output.lock().unwrap();
-    match &*guard {
-        Ok(site) => match site.docs.iter().find(|d| d.path == bundle_path) {
-            Some(d) => Response::html(200, d.html.clone()),
-            None => {
-                if bundle_path == Path::new("index.html") {
-                    placeholder_main(&site.docs, &state.ctx)
-                } else {
-                    Response::text(404, "page not found in bundle")
-                }
-            }
-        },
-        Err(e) => Response::html(500, error_page(e.html())),
+        Emit::Bytes(bytes) => Response::bytes(200, mime_for(dest), bytes.as_slice().to_vec()),
     }
 }
 
@@ -632,7 +631,7 @@ fn error_page(diagnostic_html: &str) -> String {
 /// Plain-list index of available slugs, served at `/` when no
 /// `content/main.typ` exists. Stand-in for a real home page during
 /// the early stages of a site.
-fn placeholder_main(docs: &[OutputDoc], _ctx: &TwylaContext) -> Response {
+fn placeholder_main(site: &Outputs, _ctx: &TwylaContext) -> Response {
     let mut out = String::new();
     out.push_str(
         "<!doctype html>\n\
@@ -644,10 +643,10 @@ fn placeholder_main(docs: &[OutputDoc], _ctx: &TwylaContext) -> Response {
     out.push_str("<h1>twyla dev</h1>\n");
     out.push_str("<p>placeholder index — content/main.typ not present.</p>\n");
     out.push_str("<ul>\n");
-    for d in docs {
+    for d in site.docs() {
         out.push_str(&format!(
             "<li><a href=\"/{slug}\">/{slug}</a></li>\n",
-            slug = html_escape(d.path.to_str().unwrap()),
+            slug = html_escape(&d.output_path),
         ));
     }
     out.push_str("</ul>\n</body></html>\n");
@@ -662,15 +661,13 @@ fn serve_static(ctx: &TwylaContext, request_path: &str) -> Response {
         return Response::text(404, "not found");
     }
 
-    // Fall through the same copy roots `build`/`manifest` use (`static/`, plus
-    // colocated `content/` when enabled), live from disk so edits show without
-    // a recompile. Sharing `copy_roots` keeps serve from drifting from build.
-    for root in ctx.copy_roots() {
-        if let Some(src) = root.resolve(rel)
-            && let Ok(body) = std::fs::read(&src)
-        {
-            return Response::bytes(200, mime_for(&src), body);
-        }
+    // Static files are served live from disk so edits show without a recompile.
+    // (They're also in the compiled `Outputs`, which `build`/`manifest` use.)
+    let path = ctx.static_dir().join(rel);
+    if path.is_file()
+        && let Ok(body) = std::fs::read(&path)
+    {
+        return Response::bytes(200, mime_for(&path), body);
     }
 
     Response::text(404, "not found")

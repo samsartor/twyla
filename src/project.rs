@@ -10,9 +10,12 @@
 //! `twyla.toml` slots in without restructuring callers. Today, all
 //! fields come from CLI args ([`ContextArgs`] in `main`).
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-use crate::asset;
+use crate::{asset, render::Output};
 
 /// Everything a twyla command needs to operate on a project. Cheap to
 /// clone — paths are owned `PathBuf`s, no heavy state.
@@ -26,90 +29,6 @@ pub struct TwylaContext {
     /// project hasn't declared one yet — callers that need it must
     /// error rather than guess.
     pub base_url: Option<String>,
-    /// Whether colocated content assets — non-source files under `content/` —
-    /// ship at their root path, zola-style (`content/foo.svg` → `/foo.svg`).
-    /// Off by default: colocated files should live in `static/`. When on,
-    /// `content/` joins the [`copy roots`](Self::copy_roots), so `build`,
-    /// the manifest, and the dev server all emit/serve it identically. A
-    /// future `--serve-content`/`twyla.toml` knob flips this.
-    pub emit_content_assets: bool,
-}
-
-/// A directory whose files ship verbatim at the output root — copied by
-/// [`build`](crate::build), listed in the twyla manifest, and served as a
-/// fallback by the dev server. The single source of truth for "non-compiled
-/// files that ship," handed out by [`TwylaContext::copy_roots`].
-#[derive(Debug, Clone)]
-pub struct CopyRoot {
-    /// The on-disk directory (e.g. `<root>/static/`).
-    pub dir: PathBuf,
-    /// Which files under `dir` ship.
-    pub filter: CopyFilter,
-}
-
-/// Which files a [`CopyRoot`] emits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CopyFilter {
-    /// Every file (the `static/` tree).
-    All,
-    /// Non-source files only — excludes `.typ`/`.md` (colocated content assets,
-    /// keeping page/markdown sources out of the output).
-    NonSource,
-}
-
-impl CopyFilter {
-    /// Whether a file (named by any path whose extension is meaningful) ships.
-    pub fn accepts(&self, path: &Path) -> bool {
-        match self {
-            CopyFilter::All => true,
-            CopyFilter::NonSource => !matches!(
-                path.extension().and_then(|s| s.to_str()),
-                Some("typ") | Some("md")
-            ),
-        }
-    }
-}
-
-impl CopyRoot {
-    /// Every file under `dir` the filter accepts, as `(root-relative `/`-key,
-    /// absolute source path)`. Follows symlinks (we want targets, not links, in
-    /// the output). A missing `dir` yields nothing — `static/`/`content/` need
-    /// not exist.
-    pub fn walk(&self) -> std::io::Result<Vec<(String, PathBuf)>> {
-        let mut out = Vec::new();
-        if self.dir.is_dir() {
-            self.walk_into(&self.dir, &mut out)?;
-        }
-        Ok(out)
-    }
-
-    fn walk_into(&self, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let path = entry?.path();
-            let meta = std::fs::metadata(&path)?; // follows symlinks
-            if meta.is_dir() {
-                self.walk_into(&path, out)?;
-            } else if meta.is_file()
-                && self.filter.accepts(&path)
-                && let Ok(rel) = path.strip_prefix(&self.dir)
-            {
-                out.push((path_key(rel), path.clone()));
-            }
-        }
-        Ok(())
-    }
-
-    /// Resolve a request path (root-relative, `/`-separated, already traversal-
-    /// checked) to an on-disk source under this root — when the filter accepts
-    /// it and the file exists. The dev server's live fallback, sharing the
-    /// filter so serve and build agree on what's reachable.
-    pub fn resolve(&self, rel: &str) -> Option<PathBuf> {
-        if !self.filter.accepts(Path::new(rel)) {
-            return None;
-        }
-        let path = self.dir.join(rel);
-        path.is_file().then_some(path)
-    }
 }
 
 /// Normalize a relative path into a `/`-separated, no-leading-slash manifest
@@ -132,43 +51,19 @@ impl TwylaContext {
             .canonicalize()
             .map_err(|e| format!("cannot canonicalize root {}: {e}", root.display()))?;
         let base_url = base_url.map(|s| s.trim_end_matches('/').to_string());
-        Ok(Self {
-            root,
-            base_url,
-            emit_content_assets: false,
-        })
+        Ok(Self { root, base_url })
     }
 
     /// A bare context for unit tests: fields take their defaults and `root` is
     /// used verbatim (no canonicalization, so it needn't exist on disk). Adding
-    /// a field updates only this — not every test. Set `base_url`/
-    /// `emit_content_assets` on the returned value when a test needs them.
+    /// a field updates only this — not every test. Set `base_url` on the
+    /// returned value when a test needs it.
     #[cfg(test)]
     pub(crate) fn stub(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             base_url: None,
-            emit_content_assets: false,
         }
-    }
-
-    /// The verbatim-copy sources, in fallback order: `static/` always (whole
-    /// tree), then `content/` for colocated assets when
-    /// [`emit_content_assets`](Self::emit_content_assets) is on. The single
-    /// place the static-/content-`/`-content rule is decided — `build`, the
-    /// manifest, and `serve` all consume this so they can't disagree.
-    pub fn copy_roots(&self) -> Vec<CopyRoot> {
-        let mut roots = vec![CopyRoot {
-            dir: self.static_dir(),
-            filter: CopyFilter::All,
-        }];
-        if self.emit_content_assets {
-            roots.push(CopyRoot {
-                dir: self.content_dir(),
-                filter: CopyFilter::NonSource,
-            });
-        }
-        roots
     }
 
     /// `<root>/content/` — typst source files routed into the bundle.
@@ -213,6 +108,21 @@ impl TwylaContext {
         scan_pages_into(&self.content_dir(), &mut paths)?;
         paths.sort();
         Ok(paths)
+    }
+
+    /// Every file under `static/` as an [`Output::Static`], keyed by its
+    /// root-relative `/`-separated path (`static/site.css` → `site.css`).
+    /// A missing `static/` yields nothing.
+    pub fn static_outputs(&self) -> Result<impl Iterator<Item = Output>, String> {
+        let mut paths = Vec::new();
+        let static_dir = self.static_dir();
+        if static_dir.is_dir() {
+            scan_all_into(&static_dir, &mut paths)?;
+        }
+        Ok(paths.into_iter().filter_map(move |path| {
+            let rel = path.strip_prefix(&static_dir).ok()?;
+            Some(Output::Static(path_key(rel), path))
+        }))
     }
 
     /// Bundle-relative directory compiled HTML files are emitted into, e.g.
@@ -323,13 +233,12 @@ impl TwylaContext {
 /// whose stem starts with `_` (private/partial convention); recurses every
 /// subdirectory. Directory traversal order is unspecified — the caller sorts.
 fn scan_pages_into(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    let entries = fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("scan error: {e}"))?;
         let path = entry.path();
-        let meta = std::fs::metadata(&path)
-            .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+        let meta =
+            fs::metadata(&path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
         if meta.is_dir() {
             scan_pages_into(&path, out)?;
             continue;
@@ -341,6 +250,23 @@ fn scan_pages_into(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
             continue;
         };
         if stem.starts_with('_') {
+            continue;
+        }
+        out.push(path);
+    }
+    Ok(())
+}
+
+/// Recursively collect all files into `out`.
+fn scan_all_into(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("scan error: {e}"))?;
+        let path = entry.path();
+        let meta =
+            fs::metadata(&path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+        if meta.is_dir() {
+            scan_all_into(&path, out)?;
             continue;
         }
         out.push(path);
@@ -393,11 +319,21 @@ mod tests {
         let pages = ctx.scan_pages().unwrap();
         let rels: Vec<_> = pages
             .iter()
-            .map(|p| p.strip_prefix(&content).unwrap().to_str().unwrap().to_owned())
+            .map(|p| {
+                p.strip_prefix(&content)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
             .collect();
         assert_eq!(
             rels,
-            vec!["guis-1.typ", "what-is-color/ai_cut.typ", "what-is-color/main.typ"],
+            vec![
+                "guis-1.typ",
+                "what-is-color/ai_cut.typ",
+                "what-is-color/main.typ"
+            ],
         );
     }
 
