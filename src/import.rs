@@ -1118,6 +1118,15 @@ mod tests {
     }
 
     #[test]
+    fn inline_block_tags_are_boxed_phrasing_tags_are_not() {
+        // <span> is phrasing → bare; <div> isn't grouped into paragraphs → boxed
+        // so it stays inline instead of splitting the paragraph.
+        let out = body("a <span>x</span> <div>y</div> b");
+        assert!(out.contains(r#"#html.elem("span")[x]"#), "got: {out}");
+        assert!(out.contains(r#"#box(html.elem("div")[y])"#), "got: {out}");
+    }
+
+    #[test]
     fn inline_paired_shortcode_stays_inline() {
         // Mid-paragraph paired shortcode renders inline (no block break).
         let out = convert("A {% note() %}side{% end %} note.\n");
@@ -1145,8 +1154,10 @@ mod tests {
     #[test]
     fn converts_inline_html_to_html_elem() {
         let out = body("a <col-s space=\"bgr\">[0, 0, 1]</col-s> b");
+        // A custom tag isn't grouped into paragraphs by typst, so it's boxed to
+        // stay inline.
         assert!(
-            out.contains(r#"#html.elem("col-s", attrs: ("space": "bgr"))[\[0, 0, 1\]]"#),
+            out.contains(r#"#box(html.elem("col-s", attrs: ("space": "bgr"))[\[0, 0, 1\]])"#),
             "got: {out}"
         );
     }
@@ -1155,9 +1166,10 @@ mod tests {
     fn converts_empty_inline_html_and_void() {
         let out = body("x <col-s value='656nm'></col-s> y <br> z");
         assert!(
-            out.contains(r#"#html.elem("col-s", attrs: ("value": "656nm"))[]"#),
+            out.contains(r#"#box(html.elem("col-s", attrs: ("value": "656nm"))[])"#),
             "got: {out}"
         );
+        // `<br>` is grouped into paragraphs (phrasing), so it stays bare.
         assert!(out.contains(r#"#html.elem("br")"#), "got: {out}");
         assert!(
             !out.contains(r#"#html.elem("br")["#),

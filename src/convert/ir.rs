@@ -279,13 +279,24 @@ fn render_inline(i: &Inline, out: &mut String) {
             children,
         } => {
             let dict = typst_attrs(attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-            write!(out, "#html.elem(\"{tag}\"{dict})").unwrap();
-            if children.is_empty() && is_void(tag) {
-                return;
+            // Wrap block-ish tags in `box()` so they stay inline: typst splits a
+            // paragraph around an inline element it doesn't group into paragraphs
+            // (`should_group_into_pars == false`, e.g. `<div>`/`<section>`).
+            let boxed = !groups_into_pars(tag);
+            if boxed {
+                out.push_str("#box(");
+                write!(out, "html.elem(\"{tag}\"{dict})").unwrap();
+            } else {
+                write!(out, "#html.elem(\"{tag}\"{dict})").unwrap();
             }
-            out.push('[');
-            render_inlines(children, out);
-            out.push(']');
+            if !(children.is_empty() && is_void(tag)) {
+                out.push('[');
+                render_inlines(children, out);
+                out.push(']');
+            }
+            if boxed {
+                out.push(')');
+            }
         }
         Inline::SoftBreak => out.push('\n'),
         Inline::HardBreak => out.push_str(" \\\n"),
@@ -398,6 +409,17 @@ fn convert_html_node(node: &HtmlNode, out: &mut String) {
             out.push(']');
         }
     }
+}
+
+/// Whether typst keeps `tag` in a paragraph when it appears inline. We mirror
+/// typst's own [`should_group_into_pars`](typst_html::tag::should_group_into_pars)
+/// so an inline `html.elem` gets `box()`-wrapped exactly when typst would
+/// otherwise break the paragraph around it. Unknown tags are assumed to group
+/// (no box).
+fn groups_into_pars(tag: &str) -> bool {
+    typst_html::HtmlTag::intern(tag)
+        .map(typst_html::tag::should_group_into_pars)
+        .unwrap_or(true)
 }
 
 /// HTML5 void elements — emitted without a body. Public because the frontend
