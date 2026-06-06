@@ -39,11 +39,21 @@ editing a partial invalidates the compiled CSS.
 <asset-read>
 
 Where `.url()` links to the emitted file, `.read()` returns its resolved output
-*bytes* — for inlining instead of linking. A file asset reads back its
-contents; a sass asset reads back its *compiled* CSS:
+*contents* — for inlining instead of linking. A file asset reads back its
+bytes; a sass asset reads back its *compiled* CSS.
+
+Like the built-in #link("https://typst.app/docs/reference/data-loading/read/")[`read`],
+it returns a UTF-8 `str` by default and raw `bytes` with `encoding: none`:
 
 ```typ
-#context html.elem("style", str(asset.sass("/sass/critical.sass").read()))
+// compiled CSS, inlined into a <style> (str, no wrapper needed):
+#context html.elem("style", asset.sass("/sass/critical.sass").read())
+
+// an SVG spliced in verbatim — pairs with raw-html:
+#context raw-html(asset.file("/static/icon.svg").read())
+
+// raw bytes, e.g. to hash or re-encode:
+#context asset.file("/static/logo.png").read(encoding: none)
 ```
 
 Path-backed assets are read from disk on demand, so `.read()` never holds the

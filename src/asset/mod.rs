@@ -60,6 +60,7 @@ use typst::foundations::{
     Binding, Bytes, Context, Module, PathOrStr, Repr, Scope, Str, Style, StyleChain, Value, elem,
     func, scope, ty,
 };
+use typst::loading::{Encoding, Readable};
 use typst::syntax::{FileId, Spanned};
 use typst::utils::LazyHash;
 use typst_utils::hash128;
@@ -149,20 +150,31 @@ impl Asset {
         Ok(resolve_or_request(context.styles()?, &self.request.spec))
     }
 
-    /// The asset's resolved output bytes (e.g. compiled CSS, or a file's
-    /// contents) — for inlining instead of linking.
+    /// The asset's resolved output (e.g. compiled CSS, or a file's contents) —
+    /// for inlining instead of linking. Mirrors the native
+    /// [`read`]($read): UTF-8 `str` by default, raw `bytes` with
+    /// `encoding: none`.
     ///
     /// Contextual, like [`url`](Self::url) — call it inside `#context`:
     ///
     /// ```typ
     /// #context html.elem("style", asset.sass("main.scss").read())
+    /// #context raw-html(asset.file("icon.svg").read())
     /// ```
     ///
     /// Reads path-backed assets from disk on demand, so it never holds the
     /// bytes in RAM longer than the call.
     #[func(contextual)]
-    fn read(&self, context: Tracked<Context>) -> HintedStrResult<Bytes> {
-        read_or_request(context.styles()?, &self.request.spec)
+    fn read(
+        &self,
+        context: Tracked<Context>,
+        /// The encoding to read the asset with. If `{none}`, returns raw bytes;
+        /// otherwise the bytes are decoded as UTF-8 into a string.
+        #[named]
+        #[default(Some(Encoding::Utf8))]
+        encoding: Option<Encoding>,
+    ) -> HintedStrResult<Readable> {
+        read_or_request(context.styles()?, &self.request.spec, encoding)
     }
 }
 
@@ -213,23 +225,50 @@ pub(crate) fn resolve_or_request(styles: StyleChain, spec: &AssetSpec) -> Str {
     )
 }
 
-/// Resolve a spec's output *bytes* off the style chain, or request it (returns
-/// empty bytes on a miss — the placeholder, discarded before convergence).
-/// Backs [`Asset::read`]. The bytes come from `built.emit`, so a path-backed
-/// asset is read from disk here rather than held in RAM.
-fn read_or_request(styles: StyleChain, spec: &AssetSpec) -> HintedStrResult<Bytes> {
+/// Resolve a spec's output off the style chain, or request it (returns an empty
+/// value on a miss — the placeholder, discarded before convergence). Backs
+/// [`Asset::read`]; `encoding` selects `str` (UTF-8) vs raw `bytes`, mirroring
+/// the native `read`. The bytes come from `built.emit`, so a path-backed asset
+/// is read from disk here rather than held in RAM.
+fn read_or_request(
+    styles: StyleChain,
+    spec: &AssetSpec,
+    encoding: Option<Encoding>,
+) -> HintedStrResult<Readable> {
     resolve_with(
         styles,
         spec,
         |asset| {
-            asset
+            let bytes = asset
                 .built
                 .emit
                 .read()
-                .map_err(|err| eco_format!("failed to read asset bytes: {err}").into())
+                .map_err(|err| eco_format!("failed to read asset bytes: {err}"))?;
+            decode(bytes, encoding)
         },
-        || Ok(Bytes::new(Vec::<u8>::new())),
+        || Ok(decode_empty(encoding)),
     )
+}
+
+/// Apply `read`'s `encoding` to resolved bytes: `none` → raw bytes, UTF-8 →
+/// decode to a string (erroring on invalid UTF-8, like the native `read`).
+fn decode(bytes: Bytes, encoding: Option<Encoding>) -> HintedStrResult<Readable> {
+    match encoding {
+        None => Ok(Readable::Bytes(bytes)),
+        Some(Encoding::Utf8) => Ok(Readable::Str(
+            bytes
+                .to_str()
+                .map_err(|err| eco_format!("asset is not valid UTF-8: {err}"))?,
+        )),
+    }
+}
+
+/// The empty placeholder returned on a miss, of the type `encoding` selects.
+fn decode_empty(encoding: Option<Encoding>) -> Readable {
+    match encoding {
+        None => Readable::Bytes(Bytes::new(Vec::<u8>::new())),
+        Some(Encoding::Utf8) => Readable::Str(Str::from("")),
+    }
 }
 
 impl Repr for Asset {

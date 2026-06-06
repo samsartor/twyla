@@ -21,7 +21,8 @@ A minimal reference for Twyla's author-facing API. Expect this to grow.
 
 Beyond these, Twyla adds two small content builtins:
 
-- `raw-html(markup)` — splice a string of literal HTML into the output
-  verbatim.
+- `raw-html(markup)` — splice literal HTML into the output verbatim. Accepts a
+  string or bytes (e.g. `asset.file("icon.svg").read(encoding: none)`), decoded
+  as UTF-8.
 - `plain-text(content)` — flatten content to a plain string (for slugs, alt
   text, meta descriptions, …).

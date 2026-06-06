@@ -3,8 +3,11 @@
 //! Registered into the global scope by [`install`], so user typst calls them
 //! bare: `#raw-html("<svg/>")`, `#plain-text(heading)`.
 
-use ecow::EcoString;
+use ecow::{EcoString, eco_format};
+use typst::diag::{At, SourceResult};
 use typst::foundations::{Content, NativeElement, Scope, Str, func};
+use typst::loading::Readable;
+use typst::syntax::Spanned;
 use typst::text::TextElem;
 use typst_html::{HtmlAttr, HtmlElem, HtmlTag};
 
@@ -20,13 +23,22 @@ use crate::render::RAW_HTML_SCRIPT_TYPE;
 /// parse the HTML with html5ever and emit real typst nodes).
 #[func]
 pub fn raw_html(
-    /// The raw HTML markup to emit unescaped.
-    html: EcoString,
-) -> Content {
-    HtmlElem::new(HtmlTag::constant("script"))
+    /// The raw HTML markup to emit unescaped — a string, or bytes (e.g. from
+    /// `asset.file("icon.svg").read(encoding: none)`) decoded as UTF-8.
+    html: Spanned<Readable>,
+) -> SourceResult<Content> {
+    let markup: EcoString = match html.v {
+        Readable::Str(s) => s.into(),
+        Readable::Bytes(b) => b
+            .to_str()
+            .map_err(|err| eco_format!("raw-html bytes are not valid UTF-8: {err}"))
+            .at(html.span)?
+            .into(),
+    };
+    Ok(HtmlElem::new(HtmlTag::constant("script"))
         .with_attr(HtmlAttr::constant("type"), RAW_HTML_SCRIPT_TYPE)
-        .with_body(Some(TextElem::packed(html)))
-        .pack()
+        .with_body(Some(TextElem::packed(markup)))
+        .pack())
 }
 
 /// The plain text of some content — the same flattening typst uses to derive

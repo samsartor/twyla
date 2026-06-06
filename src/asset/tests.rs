@@ -106,17 +106,17 @@ fn multiple_assets_resolve_and_sass_renames_to_css() {
     );
 }
 
-/// `.read()` resolves an asset's *bytes* through the same loop: a file's
-/// contents inline verbatim, and a sass asset inlines its *compiled* CSS (not
-/// the source). The asset is still registered for emission, and no placeholder
-/// (empty-bytes miss) survives to output.
+/// `.read()` resolves an asset's output through the same loop: a file's
+/// contents inline verbatim (default UTF-8 `str`, no wrapper), and a sass asset
+/// inlines its *compiled* CSS as raw `bytes` (`encoding: none`). The asset is
+/// still registered for emission, and no placeholder (empty miss) survives.
 #[test]
-fn read_inlines_asset_bytes_through_the_loop() {
+fn read_inlines_asset_content_through_the_loop() {
     let (ctx, _dir) = site(&[
         (
             "content/main.typ",
-            "#context str(asset.file(\"snippet.txt\").read()) \
-             #context str(asset.sass(\"theme.scss\").read())",
+            "#context asset.file(\"snippet.txt\").read() \
+             #context str(asset.sass(\"theme.scss\").read(encoding: none))",
         ),
         ("content/snippet.txt", "HELLO-INLINE-CONTENT"),
         ("content/theme.scss", "a { b { color: red; } }"),
@@ -125,15 +125,44 @@ fn read_inlines_asset_bytes_through_the_loop() {
 
     assert!(
         html.contains("HELLO-INLINE-CONTENT"),
-        "file bytes not inlined:\n{html}"
+        "default-str read not inlined:\n{html}"
     );
     // grass expands the nested rule into a real selector — proof we inlined the
     // *compiled* CSS, not the raw scss source (which has no `a b` selector).
     assert!(
         html.contains("a b"),
-        "compiled sass bytes not inlined:\n{html}"
+        "encoding:none sass bytes not inlined:\n{html}"
     );
     assert_eq!(assets.len(), 2, "both assets still registered: {assets:?}");
+    assert!(
+        !html.contains("__twyla-asset-pending__"),
+        "placeholder leaked:\n{html}"
+    );
+}
+
+/// The predicted pairing: `raw-html(asset.*.read())` splices an asset's resolved
+/// contents into the page unescaped. The default-`str` read feeds `raw-html`
+/// with no wrapper; the raw-html post-pass strips its placeholder wrapper, so
+/// the `<svg>` lands verbatim (not escaped, not a `<script>`).
+#[test]
+fn raw_html_inlines_a_read_asset() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context raw-html(asset.file(\"icon.svg\").read())",
+        ),
+        ("content/icon.svg", "<svg><circle/></svg>"),
+    ]);
+    let (html, _assets) = compile(&RenderWorld::new(&ctx).unwrap());
+
+    assert!(
+        html.contains("<svg><circle/></svg>"),
+        "svg not spliced verbatim:\n{html}"
+    );
+    assert!(
+        !html.contains("x-twyla-raw-html"),
+        "raw-html wrapper not stripped:\n{html}"
+    );
     assert!(
         !html.contains("__twyla-asset-pending__"),
         "placeholder leaked:\n{html}"
