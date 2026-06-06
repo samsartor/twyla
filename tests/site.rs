@@ -217,10 +217,32 @@ fn build_emits_pages_static_and_colocated_assets() {
     );
     // static/ copied verbatim.
     assert!(exists("style.css"), "static/style.css not copied");
-    // colocated content asset (non-.typ under content/) emitted at root.
-    assert!(exists("diagram-demo.svg"), "colocated svg not copied");
+    // Colocated content (non-source under content/) is opt-in: off by default,
+    // so the svg is *not* emitted at root.
+    assert!(
+        !exists("diagram-demo.svg"),
+        "colocated svg copied despite emit_content_assets off"
+    );
     // underscore-prefixed draft never compiled → no route written.
     assert!(!exists("draft/index.html"), "draft page was written");
+}
+
+#[test]
+fn build_emits_colocated_content_when_enabled() {
+    let out = tempfile::tempdir().expect("tempdir");
+    let mut ctx = ctx();
+    ctx.emit_content_assets = true;
+    build_run(Build {
+        ctx,
+        output_dir: out.path().to_path_buf(),
+    })
+    .expect("build test_site");
+
+    let exists = |rel: &str| out.path().join(rel).is_file();
+    // With the flag on, content/ becomes a copy root: the colocated svg lands
+    // at its root path, while page sources stay out of the output.
+    assert!(exists("diagram-demo.svg"), "colocated svg not copied");
+    assert!(!exists("diagram-demo.typ"), "page source leaked into output");
 }
 
 /// End-to-end asset pipeline: `asset.sass` compiles SCSS → CSS via grass,

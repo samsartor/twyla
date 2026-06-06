@@ -9,7 +9,8 @@ use typst::foundations::{PathOrStr, func};
 use typst::syntax::{FileId, Span, Spanned};
 use typst_utils::hash128;
 
-use super::{Asset, AssetSpec, Built, Emit, Upstream, resolve_path};
+use super::{Asset, AssetSpec, Built, Upstream, resolve_path};
+use crate::build::Emit;
 use crate::project::TwylaContext;
 
 /// Reference a project file as an asset, copied verbatim and fingerprinted.
@@ -40,7 +41,7 @@ pub(crate) fn build(
 
     Ok(Built {
         content_hash: hash128(&bytes),
-        emit: Emit::Copy(on_disk.path.clone()),
+        emit: Emit::AssetCopy(on_disk.path.clone()),
         stem: on_disk
             .path
             .file_stem()

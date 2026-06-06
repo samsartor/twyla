@@ -33,7 +33,8 @@ use typst_kit::watcher::Watcher;
 
 use owo_colors::{AnsiColors, OwoColorize, Stream, Style};
 
-use crate::asset::{AssetResolver, Emit};
+use crate::asset::AssetResolver;
+use crate::build::Emit;
 use crate::project::TwylaContext;
 use crate::render::{OutputDoc, RenderError, RenderWorld, SiteOutput};
 
@@ -574,15 +575,18 @@ fn serve_asset(state: &ServeState, path: &str) -> Option<Response> {
     let asset = site.assets.iter().find(|a| a.output_path == path)?;
     let dest = Path::new(path);
     match &asset.built.emit {
-        Emit::Copy(src) => match std::fs::read(src) {
+        Emit::AssetCopy(src) => match std::fs::read(src) {
             Ok(body) => Some(Response::bytes(200, mime_for(dest), body)),
             Err(_) => Some(Response::text(404, "asset source unreadable")),
         },
-        Emit::Bytes(bytes) => Some(Response::bytes(
+        Emit::AssetBytes(bytes) => Some(Response::bytes(
             200,
             mime_for(dest),
             bytes.as_slice().to_vec(),
         )),
+        // A resolved asset is only ever `Asset*`; the page/copy-root variants
+        // can't occur here, so fall through to static serving if one does.
+        Emit::Doc(_) | Emit::CopyRoot(_) => None,
     }
 }
 
@@ -658,19 +662,14 @@ fn serve_static(ctx: &TwylaContext, request_path: &str) -> Response {
         return Response::text(404, "not found");
     }
 
-    let static_path = ctx.static_dir().join(rel);
-    if let Ok(body) = std::fs::read(&static_path) {
-        return Response::bytes(200, mime_for(&static_path), body);
-    }
-
-    // Zola colocates assets in `content/` (e.g., `content/foo.svg` →
-    // `/foo.svg`). Mirror that for porting; revisit once twyla has a
-    // real asset model.
-    let content_path = ctx.content_dir().join(rel);
-    let is_typ = content_path.extension().and_then(|e| e.to_str()) == Some("typ");
-    if !is_typ {
-        if let Ok(body) = std::fs::read(&content_path) {
-            return Response::bytes(200, mime_for(&content_path), body);
+    // Fall through the same copy roots `build`/`manifest` use (`static/`, plus
+    // colocated `content/` when enabled), live from disk so edits show without
+    // a recompile. Sharing `copy_roots` keeps serve from drifting from build.
+    for root in ctx.copy_roots() {
+        if let Some(src) = root.resolve(rel)
+            && let Ok(body) = std::fs::read(&src)
+        {
+            return Response::bytes(200, mime_for(&src), body);
         }
     }
 

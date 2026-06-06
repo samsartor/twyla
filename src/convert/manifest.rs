@@ -49,31 +49,15 @@ impl FromIterator<String> for Manifest {
     }
 }
 
-/// Twyla's own manifest — built without touching `public/`: the compiled
-/// pages, every processed (`asset.*`) asset, `static/`, and colocated content
-/// assets (non-`.typ`/`.md` under `content/`).
+/// Twyla's own manifest — built without touching `public/`. Exactly the paths
+/// [`crate::build::emit_plan`] writes (compiled pages, processed assets, and
+/// the [`copy roots`](TwylaContext::copy_roots)), so the manifest and the build
+/// can't drift: a file the audit treats as "shipped" is one `build` emits.
 pub fn twyla(ctx: &TwylaContext, site: &SiteOutput) -> io::Result<Manifest> {
-    let mut m = Manifest::default();
-    for doc in &site.docs {
-        m.insert(path_key(&doc.path));
-    }
-    for asset in &site.assets {
-        m.insert(asset.output_path.clone());
-    }
-    let static_dir = ctx.static_dir();
-    if static_dir.is_dir() {
-        collect_files(&static_dir, &static_dir, &mut m, &|_| true)?;
-    }
-    let content_dir = ctx.content_dir();
-    if content_dir.is_dir() {
-        collect_files(&content_dir, &content_dir, &mut m, &|p| {
-            !matches!(
-                p.extension().and_then(|s| s.to_str()),
-                Some("typ") | Some("md")
-            )
-        })?;
-    }
-    Ok(m)
+    Ok(crate::build::emit_plan(ctx, site)?
+        .into_iter()
+        .map(|e| e.path)
+        .collect())
 }
 
 /// The ground-truth manifest — the whole `gt_dir` tree (zola's `public/`) plus
@@ -106,19 +90,11 @@ fn collect_files(
             collect_files(base, &path, out, include)?;
         } else if meta.is_file() && include(&path) {
             if let Ok(rel) = path.strip_prefix(base) {
-                out.insert(path_key(rel));
+                out.insert(crate::project::path_key(rel));
             }
         }
     }
     Ok(())
-}
-
-/// Normalize a relative path into a `/`-separated manifest key.
-fn path_key(p: &Path) -> String {
-    p.components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 #[cfg(test)]
@@ -127,26 +103,17 @@ mod tests {
     use crate::render::OutputDoc;
     use std::path::PathBuf;
 
-    #[test]
-    fn twyla_manifest_collects_pages_static_and_colocated() {
+    fn fixture() -> (tempfile::TempDir, SiteOutput) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let content = root.join("content");
         std::fs::create_dir_all(content.join("sub")).unwrap();
         std::fs::create_dir_all(root.join("static/scripts")).unwrap();
-        for (rel, base) in [
-            ("foo.typ", &content),
-            ("foo.md", &content),
-            ("img.png", &content),
-            ("sub/bar.svg", &content),
-            ("sub/baz.typ", &content),
-        ] {
-            std::fs::write(base.join(rel), "").unwrap();
+        for rel in ["foo.typ", "foo.md", "img.png", "sub/bar.svg", "sub/baz.typ"] {
+            std::fs::write(content.join(rel), "").unwrap();
         }
         std::fs::write(root.join("static/style.css"), "").unwrap();
         std::fs::write(root.join("static/scripts/site.js"), "").unwrap();
-
-        let ctx = TwylaContext::new(root, None).unwrap();
         let site = SiteOutput {
             docs: vec![OutputDoc {
                 path: PathBuf::from("foo/index.html"),
@@ -154,15 +121,39 @@ mod tests {
             }],
             assets: vec![],
         };
+        (dir, site)
+    }
+
+    #[test]
+    fn twyla_manifest_collects_pages_and_static() {
+        let (dir, site) = fixture();
+        let ctx = TwylaContext::new(dir.path(), None).unwrap();
         let m = twyla(&ctx, &site).unwrap();
 
         for present in [
-            "foo/index.html",   // compiled page
-            "img.png",          // colocated content asset
-            "sub/bar.svg",      // nested colocated asset
-            "style.css",        // static at root
-            "scripts/site.js",  // nested static
+            "foo/index.html",  // compiled page
+            "style.css",       // static at root
+            "scripts/site.js", // nested static
         ] {
+            assert!(m.contains(present), "missing {present}");
+        }
+        // Colocated content is *not* shipped by default — `emit_content_assets`
+        // is off, so `content/` isn't a copy root.
+        for absent in ["foo.typ", "foo.md", "sub/baz.typ", "img.png", "sub/bar.svg"] {
+            assert!(!m.contains(absent), "should not contain {absent}");
+        }
+    }
+
+    #[test]
+    fn twyla_manifest_includes_colocated_content_when_enabled() {
+        let (dir, site) = fixture();
+        let mut ctx = TwylaContext::new(dir.path(), None).unwrap();
+        ctx.emit_content_assets = true;
+        let m = twyla(&ctx, &site).unwrap();
+
+        // With the flag on, `content/` joins the copy roots: non-source files
+        // ship, source files (`.typ`/`.md`) still don't.
+        for present in ["img.png", "sub/bar.svg"] {
             assert!(m.contains(present), "missing {present}");
         }
         for absent in ["foo.typ", "foo.md", "sub/baz.typ"] {

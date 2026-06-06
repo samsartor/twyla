@@ -60,6 +60,7 @@ use typst::syntax::{FileId, Spanned};
 use typst::utils::LazyHash;
 use typst_utils::hash128;
 
+use crate::build::Emit;
 use crate::project::TwylaContext;
 
 // ---------------------------------------------------------------------------
@@ -312,17 +313,6 @@ pub struct Built {
     pub ext: Option<String>,
     /// The name of the original asset file, if any.
     pub stem: Option<String>,
-}
-
-/// How a resolved asset's bytes reach the output. `Copy` keeps only the source
-/// path (stream-copied at emit time — never the whole file in memory); `Bytes`
-/// holds small transformed output (e.g. compiled CSS).
-#[derive(Clone, Debug)]
-pub enum Emit {
-    /// Stream-copy from this on-disk source path.
-    Copy(PathBuf),
-    /// Write these transformed bytes.
-    Bytes(Bytes),
 }
 
 /// One on-disk file an asset depends on, with its mtime at resolve time (for

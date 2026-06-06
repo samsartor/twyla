@@ -4,27 +4,95 @@
 //!
 //! - One `<slug>/index.html` per routed page (whatever
 //!   [`render_site`](crate::render::render_site) produces).
-//! - Everything under `<site>/static/` copied verbatim.
-//! - Colocated content assets — non-`.typ` files under `<site>/content/` —
-//!   copied to the output root. Mirrors zola's behavior (and what the
-//!   dev server falls back to). Goes away when twyla has a real asset
-//!   pipeline.
+//! - Every processed (`asset.*`) asset under `assets/`.
+//! - Each [`copy root`](TwylaContext::copy_roots) — `static/` verbatim, plus
+//!   colocated `content/` assets when enabled.
 //!
-//! No cleaning of the output dir, no manifest, no dependency tracking.
-//! Stale files from prior builds remain unless you `rm -rf` first.
-//! Revisit once we're confident about a stable dir layout.
+//! The set of files written is [`emit_plan`] — the single enumeration the
+//! twyla manifest ([`crate::convert::manifest::twyla`]) also consumes, so the
+//! build and the manifest can never disagree about what ships.
+//!
+//! No cleaning of the output dir, no dependency tracking. Stale files from
+//! prior builds remain unless you `rm -rf` first. Revisit once we're confident
+//! about a stable dir layout.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::asset::Emit;
+use typst::foundations::Bytes;
+
 use crate::project::TwylaContext;
-use crate::render::{RenderError, render_site_with_assets};
+use crate::render::{RenderError, SiteOutput, render_site_with_assets};
 
 pub struct Build {
     pub ctx: TwylaContext,
     pub output_dir: PathBuf,
+}
+
+/// One output file's contents and provenance — the currency of the build plan.
+/// One variant per kind of thing the build produces, so consumers (the writer,
+/// the manifest, the summary) can both *emit* it and *classify* it without a
+/// second lookup. `*Copy` variants keep only the source path (stream-copied at
+/// emit time, never the whole file in memory); the rest hold in-memory bytes.
+#[derive(Clone, Debug)]
+pub enum Emit {
+    /// A compiled page's rendered HTML.
+    Doc(Bytes),
+    /// A processed asset's transformed bytes (e.g. compiled CSS).
+    AssetBytes(Bytes),
+    /// A processed asset stream-copied verbatim from its on-disk source.
+    AssetCopy(PathBuf),
+    /// A verbatim file from a [`copy root`](TwylaContext::copy_roots)
+    /// (`static/` or, when enabled, colocated `content/`).
+    CopyRoot(PathBuf),
+}
+
+impl Emit {
+    /// Write this output to `dest` — `fs::write` for in-memory bytes, a
+    /// stream `fs::copy` for the path-backed variants.
+    fn write_to(&self, dest: &Path) -> io::Result<()> {
+        match self {
+            Emit::Doc(bytes) | Emit::AssetBytes(bytes) => fs::write(dest, bytes),
+            Emit::AssetCopy(src) | Emit::CopyRoot(src) => fs::copy(src, dest).map(drop),
+        }
+    }
+}
+
+/// One output file: its root-relative `/`-separated path and how its bytes
+/// reach disk. The unit of [`emit_plan`].
+pub struct EmitEntry {
+    pub path: String,
+    pub emit: Emit,
+}
+
+/// Enumerate every file a `twyla build` emits: compiled pages, processed
+/// assets, then each [`copy root`](TwylaContext::copy_roots). The authority
+/// both [`run`] (which writes the bytes) and [`crate::convert::manifest::twyla`]
+/// (which lists the paths) consume — one source of truth for "what ships."
+pub fn emit_plan(ctx: &TwylaContext, site: &SiteOutput) -> io::Result<Vec<EmitEntry>> {
+    let mut plan = Vec::new();
+    for doc in &site.docs {
+        plan.push(EmitEntry {
+            path: crate::project::path_key(&doc.path),
+            emit: Emit::Doc(Bytes::new(doc.html.clone().into_bytes())),
+        });
+    }
+    for asset in &site.assets {
+        plan.push(EmitEntry {
+            path: asset.output_path.clone(),
+            emit: asset.built.emit.clone(),
+        });
+    }
+    for root in ctx.copy_roots() {
+        for (key, src) in root.walk()? {
+            plan.push(EmitEntry {
+                path: key,
+                emit: Emit::CopyRoot(src),
+            });
+        }
+    }
+    Ok(plan)
 }
 
 #[derive(Debug)]
@@ -52,154 +120,40 @@ pub fn run(build: Build) -> Result<BuildSummary, BuildError> {
         source: e,
     })?;
 
-    for doc in &site.docs {
-        let dest = build.output_dir.join(&doc.path);
+    let plan = emit_plan(&build.ctx, &site).map_err(|e| BuildError::Io {
+        context: "enumerating build outputs".to_string(),
+        source: e,
+    })?;
+
+    let mut summary = BuildSummary::default();
+    for entry in &plan {
+        let dest = build.output_dir.join(&entry.path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| BuildError::Io {
                 context: format!("creating {}", parent.display()),
                 source: e,
             })?;
         }
-        fs::write(&dest, &doc.html).map_err(|e| BuildError::Io {
-            context: format!("writing {}", dest.display()),
+        entry.emit.write_to(&dest).map_err(|e| BuildError::Io {
+            context: format!("emitting {}", dest.display()),
             source: e,
         })?;
-    }
-
-    // Processed assets (fingerprinted): stream-copy verbatim files, write
-    // transformed bytes (e.g. compiled CSS).
-    for asset in &site.assets {
-        let dest = build.output_dir.join(&asset.output_path);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).map_err(|e| BuildError::Io {
-                context: format!("creating {}", parent.display()),
-                source: e,
-            })?;
-        }
-        match &asset.built.emit {
-            Emit::Copy(src) => {
-                fs::copy(src, &dest).map_err(|e| BuildError::Io {
-                    context: format!("copying {} → {}", src.display(), dest.display()),
-                    source: e,
-                })?;
-            }
-            Emit::Bytes(bytes) => {
-                fs::write(&dest, bytes.as_slice()).map_err(|e| BuildError::Io {
-                    context: format!("writing {}", dest.display()),
-                    source: e,
-                })?;
-            }
+        match entry.emit {
+            Emit::Doc(_) => summary.pages += 1,
+            Emit::AssetBytes(_) | Emit::AssetCopy(_) => summary.assets += 1,
+            Emit::CopyRoot(_) => summary.copied += 1,
         }
     }
 
-    let static_dir = build.ctx.static_dir();
-    let static_copied = if static_dir.is_dir() {
-        copy_dir_contents(&static_dir, &build.output_dir)?
-    } else {
-        0
-    };
-
-    // Zola-style colocated content assets: anything under `content/`
-    // that isn't a `.typ` file gets emitted at its root path.
-    let content_dir = build.ctx.content_dir();
-    let content_copied = if content_dir.is_dir() {
-        copy_non_typ_contents(&content_dir, &build.output_dir)?
-    } else {
-        0
-    };
-
-    Ok(BuildSummary {
-        pages: site.docs.len(),
-        assets: site.assets.len(),
-        static_files: static_copied,
-        content_assets: content_copied,
-    })
+    Ok(summary)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BuildSummary {
     pub pages: usize,
     /// Processed (`asset.*`) assets emitted under `assets/`.
     pub assets: usize,
-    pub static_files: usize,
-    pub content_assets: usize,
-}
-
-/// Recursive copy of every file under `src` into `dst`, mirroring the
-/// directory tree. Follows symlinks (we want the symlink *targets*
-/// landing in the output, not the symlinks themselves).
-fn copy_dir_contents(src: &Path, dst: &Path) -> Result<usize, BuildError> {
-    let entries = fs::read_dir(src).map_err(|e| BuildError::Io {
-        context: format!("reading {}", src.display()),
-        source: e,
-    })?;
-    let mut count = 0;
-    for entry in entries {
-        let entry = entry.map_err(|e| BuildError::Io {
-            context: format!("reading entry under {}", src.display()),
-            source: e,
-        })?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        // `metadata()` follows symlinks — we want target type, not link type.
-        let meta = fs::metadata(&from).map_err(|e| BuildError::Io {
-            context: format!("statting {}", from.display()),
-            source: e,
-        })?;
-        if meta.is_dir() {
-            fs::create_dir_all(&to).map_err(|e| BuildError::Io {
-                context: format!("creating {}", to.display()),
-                source: e,
-            })?;
-            count += copy_dir_contents(&from, &to)?;
-        } else if meta.is_file() {
-            fs::copy(&from, &to).map_err(|e| BuildError::Io {
-                context: format!("copying {} → {}", from.display(), to.display()),
-                source: e,
-            })?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-/// Like [`copy_dir_contents`] but skips source-format files — `.typ`
-/// (twyla pages) and `.md` (zola legacy still on disk during porting).
-/// Used for the colocated-asset bridge.
-fn copy_non_typ_contents(src: &Path, dst: &Path) -> Result<usize, BuildError> {
-    let entries = fs::read_dir(src).map_err(|e| BuildError::Io {
-        context: format!("reading {}", src.display()),
-        source: e,
-    })?;
-    let mut count = 0;
-    for entry in entries {
-        let entry = entry.map_err(|e| BuildError::Io {
-            context: format!("reading entry under {}", src.display()),
-            source: e,
-        })?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        let meta = fs::metadata(&from).map_err(|e| BuildError::Io {
-            context: format!("statting {}", from.display()),
-            source: e,
-        })?;
-        if meta.is_dir() {
-            fs::create_dir_all(&to).map_err(|e| BuildError::Io {
-                context: format!("creating {}", to.display()),
-                source: e,
-            })?;
-            count += copy_non_typ_contents(&from, &to)?;
-        } else if meta.is_file() {
-            let ext = from.extension().and_then(|s| s.to_str());
-            if matches!(ext, Some("typ") | Some("md")) {
-                continue;
-            }
-            fs::copy(&from, &to).map_err(|e| BuildError::Io {
-                context: format!("copying {} → {}", from.display(), to.display()),
-                source: e,
-            })?;
-            count += 1;
-        }
-    }
-    Ok(count)
+    /// Verbatim files copied from the [`copy roots`](TwylaContext::copy_roots)
+    /// (`static/` + optional colocated content).
+    pub copied: usize,
 }

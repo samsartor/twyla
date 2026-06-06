@@ -26,6 +26,99 @@ pub struct TwylaContext {
     /// project hasn't declared one yet — callers that need it must
     /// error rather than guess.
     pub base_url: Option<String>,
+    /// Whether colocated content assets — non-source files under `content/` —
+    /// ship at their root path, zola-style (`content/foo.svg` → `/foo.svg`).
+    /// Off by default: colocated files should live in `static/`. When on,
+    /// `content/` joins the [`copy roots`](Self::copy_roots), so `build`,
+    /// the manifest, and the dev server all emit/serve it identically. A
+    /// future `--serve-content`/`twyla.toml` knob flips this.
+    pub emit_content_assets: bool,
+}
+
+/// A directory whose files ship verbatim at the output root — copied by
+/// [`build`](crate::build), listed in the twyla manifest, and served as a
+/// fallback by the dev server. The single source of truth for "non-compiled
+/// files that ship," handed out by [`TwylaContext::copy_roots`].
+#[derive(Debug, Clone)]
+pub struct CopyRoot {
+    /// The on-disk directory (e.g. `<root>/static/`).
+    pub dir: PathBuf,
+    /// Which files under `dir` ship.
+    pub filter: CopyFilter,
+}
+
+/// Which files a [`CopyRoot`] emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFilter {
+    /// Every file (the `static/` tree).
+    All,
+    /// Non-source files only — excludes `.typ`/`.md` (colocated content assets,
+    /// keeping page/markdown sources out of the output).
+    NonSource,
+}
+
+impl CopyFilter {
+    /// Whether a file (named by any path whose extension is meaningful) ships.
+    pub fn accepts(&self, path: &Path) -> bool {
+        match self {
+            CopyFilter::All => true,
+            CopyFilter::NonSource => !matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("typ") | Some("md")
+            ),
+        }
+    }
+}
+
+impl CopyRoot {
+    /// Every file under `dir` the filter accepts, as `(root-relative `/`-key,
+    /// absolute source path)`. Follows symlinks (we want targets, not links, in
+    /// the output). A missing `dir` yields nothing — `static/`/`content/` need
+    /// not exist.
+    pub fn walk(&self) -> std::io::Result<Vec<(String, PathBuf)>> {
+        let mut out = Vec::new();
+        if self.dir.is_dir() {
+            self.walk_into(&self.dir, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn walk_into(&self, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let meta = std::fs::metadata(&path)?; // follows symlinks
+            if meta.is_dir() {
+                self.walk_into(&path, out)?;
+            } else if meta.is_file()
+                && self.filter.accepts(&path)
+                && let Ok(rel) = path.strip_prefix(&self.dir)
+            {
+                out.push((path_key(rel), path.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a request path (root-relative, `/`-separated, already traversal-
+    /// checked) to an on-disk source under this root — when the filter accepts
+    /// it and the file exists. The dev server's live fallback, sharing the
+    /// filter so serve and build agree on what's reachable.
+    pub fn resolve(&self, rel: &str) -> Option<PathBuf> {
+        if !self.filter.accepts(Path::new(rel)) {
+            return None;
+        }
+        let path = self.dir.join(rel);
+        path.is_file().then_some(path)
+    }
+}
+
+/// Normalize a relative path into a `/`-separated, no-leading-slash manifest
+/// key — the form [`crate::html::resolve`] and the output manifests share.
+pub(crate) fn path_key(p: &Path) -> String {
+    p.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 impl TwylaContext {
@@ -39,7 +132,43 @@ impl TwylaContext {
             .canonicalize()
             .map_err(|e| format!("cannot canonicalize root {}: {e}", root.display()))?;
         let base_url = base_url.map(|s| s.trim_end_matches('/').to_string());
-        Ok(Self { root, base_url })
+        Ok(Self {
+            root,
+            base_url,
+            emit_content_assets: false,
+        })
+    }
+
+    /// A bare context for unit tests: fields take their defaults and `root` is
+    /// used verbatim (no canonicalization, so it needn't exist on disk). Adding
+    /// a field updates only this — not every test. Set `base_url`/
+    /// `emit_content_assets` on the returned value when a test needs them.
+    #[cfg(test)]
+    pub(crate) fn stub(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            base_url: None,
+            emit_content_assets: false,
+        }
+    }
+
+    /// The verbatim-copy sources, in fallback order: `static/` always (whole
+    /// tree), then `content/` for colocated assets when
+    /// [`emit_content_assets`](Self::emit_content_assets) is on. The single
+    /// place the static-/content-`/`-content rule is decided — `build`, the
+    /// manifest, and `serve` all consume this so they can't disagree.
+    pub fn copy_roots(&self) -> Vec<CopyRoot> {
+        let mut roots = vec![CopyRoot {
+            dir: self.static_dir(),
+            filter: CopyFilter::All,
+        }];
+        if self.emit_content_assets {
+            roots.push(CopyRoot {
+                dir: self.content_dir(),
+                filter: CopyFilter::NonSource,
+            });
+        }
+        roots
     }
 
     /// `<root>/content/` — typst source files routed into the bundle.
@@ -225,30 +354,21 @@ mod tests {
 
     #[test]
     fn default_output_for_main() {
-        let ctx = TwylaContext {
-            root: PathBuf::from("/tmp"),
-            base_url: None,
-        };
+        let ctx = TwylaContext::stub("/tmp");
         let r = ctx.default_document_output("content/main.typ");
         assert_eq!(r, PathBuf::from("index.html"));
     }
 
     #[test]
     fn default_output_for_nested_main() {
-        let ctx = TwylaContext {
-            root: PathBuf::from("/tmp"),
-            base_url: None,
-        };
+        let ctx = TwylaContext::stub("/tmp");
         let r = ctx.default_document_output("content/foobar/main.typ");
         assert_eq!(r, PathBuf::from("foobar/index.html"));
     }
 
     #[test]
     fn default_output_for_other() {
-        let ctx = TwylaContext {
-            root: PathBuf::from("/tmp"),
-            base_url: None,
-        };
+        let ctx = TwylaContext::stub("/tmp");
         let r = ctx.default_document_output("content/guis-2.typ");
         assert_eq!(r, PathBuf::from("guis-2/index.html"));
     }
@@ -283,10 +403,7 @@ mod tests {
 
     #[test]
     fn default_kind_keys_on_source_filename() {
-        let ctx = TwylaContext {
-            root: PathBuf::from("/tmp"),
-            base_url: None,
-        };
+        let ctx = TwylaContext::stub("/tmp");
         assert_eq!(ctx.default_kind("content/main.typ"), "root");
         assert_eq!(ctx.default_kind("content/what-is-color/main.typ"), "dir");
         assert_eq!(ctx.default_kind("content/guis-1.typ"), "page");
@@ -295,19 +412,14 @@ mod tests {
 
     #[test]
     fn require_base_url_errors_when_unset() {
-        let ctx = TwylaContext {
-            root: PathBuf::from("/tmp"),
-            base_url: None,
-        };
+        let ctx = TwylaContext::stub("/tmp");
         assert!(ctx.require_base_url().is_err());
     }
 
     #[test]
     fn require_base_url_returns_value_when_set() {
-        let ctx = TwylaContext {
-            root: PathBuf::from("/tmp"),
-            base_url: Some("https://example.com".to_string()),
-        };
+        let mut ctx = TwylaContext::stub("/tmp");
+        ctx.base_url = Some("https://example.com".to_string());
         assert_eq!(ctx.require_base_url().unwrap(), "https://example.com");
     }
 }
