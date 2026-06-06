@@ -49,6 +49,21 @@ impl Divergence {
             .unwrap_or_else(|| self.to_string())
     }
 
+    /// Like [`render_patch`](Self::render_patch) but diffs the *whole* page —
+    /// every difference, not just the hunk around the first divergence — which
+    /// is what `--all-diffs` selects. Falls back to the focused single-
+    /// divergence view if the page is too large to diff whole.
+    pub fn render_patch_all(
+        &self,
+        expected_root: &Node,
+        actual_root: &Node,
+        above: usize,
+        below: usize,
+    ) -> String {
+        render_hunk(&render_side(expected_root), &render_side(actual_root))
+            .unwrap_or_else(|| self.render_patch(expected_root, actual_root, above, below))
+    }
+
     fn try_render(
         &self,
         expected_root: &Node,
@@ -480,6 +495,24 @@ mod tests {
         assert!(p.contains("<li>c</li>"), "below sibling missing, got:\n{p}");
         assert!(p.contains("-   <li class=\"x\">b</li>"), "got:\n{p}");
         assert!(p.contains("+   <li class=\"y\">b</li>"), "got:\n{p}");
+    }
+
+    #[test]
+    fn all_diffs_shows_every_change() {
+        let e = parse_html("<div><p>aaa</p><p>bbb</p></div>");
+        let a = parse_html("<div><p>XXX</p><p>YYY</p></div>");
+        let d = diff(&e, &a).expect_err("expected a divergence");
+
+        // The focused view stops at the first divergence (the first <p>).
+        let single = d.render_patch(&e, &a, 1, 1);
+        assert!(single.contains("aaa"), "single:\n{single}");
+        assert!(!single.contains("bbb"), "single should be focused:\n{single}");
+
+        // --all-diffs shows both paragraphs' changes.
+        let all = d.render_patch_all(&e, &a, 1, 1);
+        for needle in ["aaa", "XXX", "bbb", "YYY"] {
+            assert!(all.contains(needle), "all-diffs missing {needle}:\n{all}");
+        }
     }
 
     #[test]

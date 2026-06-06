@@ -46,6 +46,8 @@ pub struct ConvertOptions {
     /// Sibling nodes of context to show above/below a divergence in the diff.
     pub above: usize,
     pub below: usize,
+    /// Show every difference per page rather than just the first.
+    pub all_diffs: bool,
 }
 
 /// A setup/IO failure (exit code 2). Carries any findings already collected
@@ -141,10 +143,17 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
                     Ok(()) => findings.push(Finding::PagePass {
                         route: route.clone(),
                     }),
-                    Err(d) => findings.push(Finding::PageDiff {
-                        route: route.clone(),
-                        divergence: d.render_patch(&expected, &actual_norm, opts.above, opts.below),
-                    }),
+                    Err(d) => {
+                        let divergence = if opts.all_diffs {
+                            d.render_patch_all(&expected, &actual_norm, opts.above, opts.below)
+                        } else {
+                            d.render_patch(&expected, &actual_norm, opts.above, opts.below)
+                        };
+                        findings.push(Finding::PageDiff {
+                            route: route.clone(),
+                            divergence,
+                        });
+                    }
                 }
             }
             // No ground-truth peer — a completeness concern, reported below.
