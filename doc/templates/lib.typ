@@ -8,6 +8,19 @@
 	show quote.where(block: true): it => note(it.body)
 	show: frame-style(styles.hint)
 	show raw.where(lang: "tree"): it => if target() == "html" { it } else { dtree(raw(it.text.replace("├", " ").replace("└", " "))) }
-	body
+	html.elem("html", attrs: (lang: "en"), {
+    html.elem("head", {
+    	html.elem("meta", attrs: (charset: "utf-8"))
+      context html.elem("title", document.title)
+      context if document.description != none {
+        html.elem(
+          "meta",
+          attrs: (name: "description", content: text-of(document.description)),
+        )
+      }
+    })
+    html.elem("body", {
+    	body
+  	})
+	})
 }
-

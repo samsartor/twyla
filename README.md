@@ -15,7 +15,7 @@ For an example, check out my own [personal website](https://samsartor.com) ([Sou
 Your best option (for now) is to compile Twyla from source:
 
 ```
-cargo install https://github.com/samsartor/twyla
+cargo install --git https://github.com/samsartor/twyla
 ```
 
 ## Getting Started

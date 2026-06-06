@@ -17,7 +17,7 @@
 //!   the zola ground truth (`public/`). `--verify` is the read-only gate;
 //!   `--only <slug>` scopes to one page. Requires `--base-url` (or
 //!   `TWYLA_BASE_URL`) for the link audit and anchor-link rewrite.
-//! - `twyla import <md>` — md→typ draft generator (primitive).
+//! - `twyla md2typ <md>` — md→typ draft generator (primitive).
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -133,7 +133,7 @@ enum Cmd {
         below: usize,
     },
     /// Convert a zola markdown post to a typst draft on stdout.
-    Import {
+    Md2Typ {
         /// Path to the source markdown file.
         input: PathBuf,
     },
@@ -171,7 +171,7 @@ fn main() -> ExitCode {
             above,
             below,
         ),
-        Cmd::Import { input } => cmd_import(&input),
+        Cmd::Md2Typ { input } => cmd_md2typ(&input),
     }
 }
 
@@ -233,7 +233,7 @@ fn cmd_serve(args: ContextArgs) -> ExitCode {
     }
 }
 
-fn cmd_import(input: &Path) -> ExitCode {
+fn cmd_md2typ(input: &Path) -> ExitCode {
     let src = match std::fs::read_to_string(input) {
         Ok(s) => s,
         Err(e) => {
