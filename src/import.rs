@@ -931,7 +931,7 @@ fn assemble(
     writeln!(out, "// twyla-convert draft. Manual cleanup expected!").unwrap();
     writeln!(out, "// Inspect any TODO markers below").unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "#import \"/templates/lib.typ\": {kind}-template").unwrap();
+    writeln!(out, "#import \"/templates/lib.typ\": *").unwrap();
     writeln!(out).unwrap();
 
     // Page metadata lives on the document, where twyla harvests it for

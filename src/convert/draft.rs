@@ -168,7 +168,7 @@ mod tests {
         assert!(matches!(findings[0], Finding::DraftWritten { .. }));
         assert!(matches!(findings[1], Finding::Note { .. }));
         let draft = std::fs::read_to_string(&typ).unwrap();
-        assert!(draft.contains(r#"#import "/templates/lib.typ": page-template"#));
+        assert!(draft.contains(r#"#import "/templates/lib.typ": *"#));
         assert!(draft.contains("#show: page-template"));
     }
 
