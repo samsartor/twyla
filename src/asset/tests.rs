@@ -247,6 +247,7 @@ fn map_hashes_by_content_sink_keys_on_epoch() {
     };
     let b = AssetSpec::Sass {
         file: fid("content/b.scss"),
+        minify: false,
     };
 
     // A minimal resolved record; the map's hash only looks at `(spec,

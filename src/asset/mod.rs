@@ -86,8 +86,10 @@ use crate::project::TwylaContext;
 pub enum AssetSpec {
     /// Copy a project file verbatim (fingerprinted). See [`file`].
     File { file: FileId },
-    /// Compile a Sass/SCSS file to CSS. See [`sass`].
-    Sass { file: FileId },
+    /// Compile a Sass/SCSS file to CSS. See [`sass`]. `minify` selects grass's
+    /// compressed output style; it's part of the key so the minified and
+    /// expanded builds of the same file resolve to distinct assets.
+    Sass { file: FileId, minify: bool },
     /// Emit in-memory bytes verbatim (fingerprinted), content-addressed by the
     /// bytes themselves. Used today by the image rule for inline/byte-source
     /// images that have no project `FileId`. See [`raw`].
@@ -576,7 +578,9 @@ impl AssetResolver {
     ) -> SourceResult<ResolvedAsset> {
         let built = match spec {
             AssetSpec::File { file } => file::build(world, *file, &self.ctx)?,
-            AssetSpec::Sass { file } => sass::build(world, *file, &self.ctx)?,
+            AssetSpec::Sass { file, minify } => {
+                sass::build(world, *file, *minify, &self.ctx)?
+            }
             AssetSpec::Raw { bytes, ext } => raw::build(bytes.clone(), ext.clone()),
         };
 

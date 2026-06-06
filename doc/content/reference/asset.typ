@@ -35,6 +35,14 @@ and fingerprints the result. The indented `.sass` syntax and `.scss` are both
 supported, chosen by extension. `@use`/`@import` partials are tracked, so
 editing a partial invalidates the compiled CSS.
 
+Output is minified by default with grass's compressed style (whitespace and
+comments stripped); pass `minify: false` for expanded output. The minified and
+expanded builds are fingerprinted separately:
+
+```typ
+#context asset.sass("/sass/main.sass", minify: false).url()
+```
+
 == .read() for inlining
 <asset-read>
 

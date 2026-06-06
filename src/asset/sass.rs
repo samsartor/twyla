@@ -28,9 +28,15 @@ use crate::project::TwylaContext;
 pub fn sass(
     /// Path to the `.sass`/`.scss` file, relative to the calling file.
     path: Spanned<PathOrStr>,
+    /// Minify the output with grass's compressed style (strips whitespace,
+    /// comments, and other redundant characters).
+    #[named]
+    #[default(true)]
+    minify: bool,
 ) -> SourceResult<Asset> {
     Ok(Asset::new(AssetSpec::Sass {
         file: resolve_path(path)?,
+        minify,
     }))
 }
 
@@ -39,6 +45,7 @@ pub fn sass(
 pub(crate) fn build(
     _world: Tracked<dyn World + '_>,
     file: FileId,
+    minify: bool,
     ctx: &TwylaContext,
 ) -> SourceResult<Built> {
     let on_disk = ctx.root.join(file.vpath().get_without_slash());
@@ -61,8 +68,17 @@ pub(crate) fn build(
         _ => grass::InputSyntax::Scss,
     };
 
+    let style = if minify {
+        grass::OutputStyle::Compressed
+    } else {
+        grass::OutputStyle::Expanded
+    };
+
     let fs = RecordingFs::default();
-    let mut options = grass::Options::default().input_syntax(syntax).fs(&fs);
+    let mut options = grass::Options::default()
+        .input_syntax(syntax)
+        .style(style)
+        .fs(&fs);
     if let Some(parent) = on_disk.path.parent() {
         options = options.load_path(parent);
     }
