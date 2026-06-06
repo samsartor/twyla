@@ -113,13 +113,19 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
                 // Undo zola's anchor-only-link absolutization for this page.
                 let prefix = format!("{}#", ctx.document_url(&route));
                 rewrite_own_page_anchor_hrefs(&mut expected, &prefix);
-                match diff(&expected, &actual, &preset) {
+                // Bake the relaxations into both trees up front, so the diff is
+                // a pure structural comparison and the rendered patch shows only
+                // non-relaxed differences. (`actual` is kept un-normalized for
+                // the link audit below.)
+                let expected = preset.normalize(&expected);
+                let actual_norm = preset.normalize(&actual);
+                match diff(&expected, &actual_norm) {
                     Ok(()) => findings.push(Finding::PagePass {
                         route: route.clone(),
                     }),
                     Err(d) => findings.push(Finding::PageDiff {
                         route: route.clone(),
-                        divergence: d.render_patch(&expected, &actual, opts.above, opts.below),
+                        divergence: d.render_patch(&expected, &actual_norm, opts.above, opts.below),
                     }),
                 }
             }

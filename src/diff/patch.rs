@@ -421,7 +421,7 @@ fn dim(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::diff::{RelaxConfig, diff};
+    use crate::diff::diff;
     use crate::html::parse_html;
 
     /// Diff two fragments and render the patch (default 1 sibling of context).
@@ -434,7 +434,7 @@ mod tests {
     fn patch_ctx(expected: &str, actual: &str, above: usize, below: usize) -> String {
         let e = parse_html(expected);
         let a = parse_html(actual);
-        let d = diff(&e, &a, &RelaxConfig::new()).expect_err("expected a divergence");
+        let d = diff(&e, &a).expect_err("expected a divergence");
         d.render_patch(&e, &a, above, below)
     }
 
@@ -498,7 +498,7 @@ mod tests {
         // pretty-printer drops — so both sides render to identical lines.
         let exp = Node::Document(vec![el("div", vec![p.clone(), Node::Text("  ".into())])]);
         let act = Node::Document(vec![el("div", vec![p])]);
-        let d = diff(&exp, &act, &RelaxConfig::new()).expect_err("expected a divergence");
+        let d = diff(&exp, &act).expect_err("expected a divergence");
         let out = d.render_patch(&exp, &act, 1, 1);
         assert!(!out.trim().is_empty(), "fallback must not be empty");
         assert!(out.contains("child count"), "should show the reason, got:\n{out}");
@@ -515,4 +515,5 @@ mod tests {
         assert!(p.contains("⋮"), "elision marker missing, got:\n{p}");
     }
 }
+
 

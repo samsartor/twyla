@@ -8,7 +8,9 @@
 //! (and ideally discussed before becoming a default) so the porting harness
 //! stays honest about where twyla and zola diverge.
 
-use crate::html::Element;
+use std::collections::BTreeMap;
+
+use crate::html::{Element, Node};
 
 /// A list of relaxation rules. Constructed via the builder methods.
 #[derive(Debug, Clone, Default)]
@@ -36,6 +38,83 @@ impl RelaxConfig {
             .iter()
             .filter_map(|(m, r)| m.matches(el).then_some(r))
             .collect()
+    }
+
+    /// Bake these relaxations into a canonical copy of `node`: drop ignored
+    /// attributes, blank value-ignored ones, reduce text-only elements to their
+    /// text, and replace ignored subtrees with an empty placeholder.
+    ///
+    /// This is the single definition of what each relaxation *means*. The
+    /// comparator and the patch renderer both run on canonical trees, so a
+    /// relaxed difference is gone before either looks: the comparator stays a
+    /// pure structural walk, and the diff never shows a relaxed change.
+    pub fn normalize(&self, node: &Node) -> Node {
+        match node {
+            Node::Document(children) => {
+                Node::Document(children.iter().map(|c| self.normalize(c)).collect())
+            }
+            Node::Element(el) => Node::Element(self.normalize_element(el)),
+            other => other.clone(),
+        }
+    }
+
+    fn normalize_element(&self, el: &Element) -> Element {
+        let rules = self.find_rules(el);
+
+        // IgnoreEntirely: collapse to an empty placeholder (tag kept so a
+        // genuine tag mismatch at this position still shows).
+        if rules.iter().any(|r| matches!(r, RelaxationRule::IgnoreEntirely)) {
+            return Element {
+                name: el.name.clone(),
+                attrs: BTreeMap::new(),
+                children: Vec::new(),
+            };
+        }
+
+        // TextOnly: reduce to the concatenated text; attrs and structure ignored.
+        if rules.iter().any(|r| matches!(r, RelaxationRule::TextOnly)) {
+            let mut text = String::new();
+            collect_text(&el.children, &mut text);
+            return Element {
+                name: el.name.clone(),
+                attrs: BTreeMap::new(),
+                children: vec![Node::Text(text)],
+            };
+        }
+
+        // Per-attribute relaxations, then recurse. `IgnoreAttribute` drops the
+        // attr; `IgnoreAttributeValue` blanks the value but keeps the key, so a
+        // missing-on-one-side attr is still a divergence.
+        let mut attrs = el.attrs.clone();
+        for r in &rules {
+            match r {
+                RelaxationRule::IgnoreAttribute(name) => {
+                    attrs.remove(name);
+                }
+                RelaxationRule::IgnoreAttributeValue(name) => {
+                    if let Some(v) = attrs.get_mut(name) {
+                        v.clear();
+                    }
+                }
+                RelaxationRule::IgnoreEntirely | RelaxationRule::TextOnly => {}
+            }
+        }
+        Element {
+            name: el.name.clone(),
+            attrs,
+            children: el.children.iter().map(|c| self.normalize(c)).collect(),
+        }
+    }
+}
+
+/// Concatenate the text content of a node sequence (recursing into elements).
+fn collect_text(nodes: &[Node], out: &mut String) {
+    for n in nodes {
+        match n {
+            Node::Text(t) => out.push_str(t),
+            Node::Element(e) => collect_text(&e.children, out),
+            _ => {}
+        }
     }
 }
 

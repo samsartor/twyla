@@ -1,9 +1,8 @@
 //! Tree-walking comparator + divergence reporting.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 
-use crate::diff::relax::{RelaxConfig, RelaxationRule};
 use crate::html::{Element, Node};
 
 /// A structural difference between two trees, located by `path`.
@@ -135,31 +134,23 @@ fn format_path(path: &[PathStep]) -> String {
     out
 }
 
-/// Compare two parsed trees. Returns `Ok(())` on AST equivalence (after
-/// normalization and any matching relaxation rules), `Err(Divergence)` on
-/// the first structural difference encountered.
-pub fn diff(
-    expected: &Node,
-    actual: &Node,
-    cfg: &RelaxConfig,
-) -> Result<(), Divergence> {
+/// Compare two parsed trees, returning `Ok(())` on structural equivalence or
+/// `Err(Divergence)` at the first difference. This is a *pure structural* walk:
+/// apply any relaxation rules first via [`RelaxConfig::normalize`](crate::diff::RelaxConfig::normalize),
+/// which erases relaxed differences before the comparison sees them.
+pub fn diff(expected: &Node, actual: &Node) -> Result<(), Divergence> {
     let mut path = Vec::new();
-    compare_nodes(expected, actual, &mut path, cfg)
+    compare_nodes(expected, actual, &mut path)
 }
 
 fn compare_nodes(
     expected: &Node,
     actual: &Node,
     path: &mut Vec<PathStep>,
-    cfg: &RelaxConfig,
 ) -> Result<(), Divergence> {
     match (expected, actual) {
-        (Node::Document(le), Node::Document(ra)) => {
-            compare_children(le, ra, path, cfg)
-        }
-        (Node::Element(le), Node::Element(ra)) => {
-            compare_elements(le, ra, path, cfg)
-        }
+        (Node::Document(le), Node::Document(ra)) => compare_children(le, ra, path),
+        (Node::Element(le), Node::Element(ra)) => compare_elements(le, ra, path),
         (Node::Text(le), Node::Text(ra)) => {
             if le == ra {
                 Ok(())
@@ -203,7 +194,6 @@ fn compare_elements(
     expected: &Element,
     actual: &Element,
     path: &mut Vec<PathStep>,
-    cfg: &RelaxConfig,
 ) -> Result<(), Divergence> {
     if expected.name != actual.name {
         return Err(Divergence {
@@ -215,52 +205,7 @@ fn compare_elements(
         });
     }
 
-    // All matching rules apply: whole-element rules short-circuit; the
-    // per-attribute rules union (so `src` and `srcset` can both relax).
-    let rules = cfg.find_rules(expected);
-
-    // IgnoreEntirely: skip subtree wholesale.
-    if rules.iter().any(|r| matches!(r, RelaxationRule::IgnoreEntirely)) {
-        return Ok(());
-    }
-
-    // TextOnly: only the concatenated text content is compared. Attributes
-    // and child structure are ignored.
-    if rules.iter().any(|r| matches!(r, RelaxationRule::TextOnly)) {
-        let exp_text = collect_text(&expected.children);
-        let act_text = collect_text(&actual.children);
-        if exp_text != act_text {
-            return Err(Divergence {
-                path: path.clone(),
-                reason: DivergenceReason::TextMismatch {
-                    expected: exp_text,
-                    actual: act_text,
-                },
-            });
-        }
-        return Ok(());
-    }
-
-    // `ignore_attr`: skip the attribute entirely. `ignore_value`: require it
-    // present on both sides but don't compare the value.
-    let mut ignore_attr: HashSet<&str> = HashSet::new();
-    let mut ignore_value: HashSet<&str> = HashSet::new();
-    for r in &rules {
-        match r {
-            RelaxationRule::IgnoreAttribute(n) => {
-                ignore_attr.insert(n.as_str());
-            }
-            RelaxationRule::IgnoreAttributeValue(n) => {
-                ignore_value.insert(n.as_str());
-            }
-            _ => {}
-        }
-    }
-
     for (k, v) in &expected.attrs {
-        if ignore_attr.contains(k.as_str()) {
-            continue;
-        }
         match actual.attrs.get(k) {
             None => {
                 return Err(Divergence {
@@ -271,7 +216,7 @@ fn compare_elements(
                     },
                 });
             }
-            Some(av) if av != v && !ignore_value.contains(k.as_str()) => {
+            Some(av) if av != v => {
                 return Err(Divergence {
                     path: path.clone(),
                     reason: DivergenceReason::AttrValueMismatch {
@@ -285,9 +230,6 @@ fn compare_elements(
         }
     }
     for (k, v) in &actual.attrs {
-        if ignore_attr.contains(k.as_str()) {
-            continue;
-        }
         if !expected.attrs.contains_key(k) {
             return Err(Divergence {
                 path: path.clone(),
@@ -299,14 +241,13 @@ fn compare_elements(
         }
     }
 
-    compare_children(&expected.children, &actual.children, path, cfg)
+    compare_children(&expected.children, &actual.children, path)
 }
 
 fn compare_children(
     expected: &[Node],
     actual: &[Node],
     path: &mut Vec<PathStep>,
-    cfg: &RelaxConfig,
 ) -> Result<(), Divergence> {
     if expected.len() != actual.len() {
         return Err(Divergence {
@@ -352,35 +293,23 @@ fn compare_children(
             Node::Document(_) => continue, // shouldn't happen mid-tree
         };
         path.push(step);
-        let res = compare_nodes(e, a, path, cfg);
+        let res = compare_nodes(e, a, path);
         path.pop();
         res?;
     }
     Ok(())
 }
 
-fn collect_text(nodes: &[Node]) -> String {
-    let mut out = String::new();
-    for n in nodes {
-        match n {
-            Node::Text(t) => out.push_str(t),
-            Node::Element(e) => out.push_str(&collect_text(&e.children)),
-            _ => {}
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::relax::{Matcher, RelaxationRule};
+    use crate::diff::relax::{Matcher, RelaxConfig, RelaxationRule};
     use crate::html::parse::parse_html;
 
     fn assert_match(left: &str, right: &str) {
         let l = parse_html(left);
         let r = parse_html(right);
-        match diff(&l, &r, &RelaxConfig::default()) {
+        match diff(&l, &r) {
             Ok(()) => {}
             Err(d) => panic!("expected match, got divergence:\n{}", d),
         }
@@ -389,10 +318,16 @@ mod tests {
     fn assert_diff(left: &str, right: &str) -> Divergence {
         let l = parse_html(left);
         let r = parse_html(right);
-        match diff(&l, &r, &RelaxConfig::default()) {
+        match diff(&l, &r) {
             Ok(()) => panic!("expected divergence, got match"),
             Err(d) => d,
         }
+    }
+
+    /// Apply a relaxation config (normalize both sides) then diff — the path the
+    /// convert harness uses.
+    fn diff_relaxed(left: &str, right: &str, cfg: &RelaxConfig) -> Result<(), Divergence> {
+        diff(&cfg.normalize(&parse_html(left)), &cfg.normalize(&parse_html(right)))
     }
 
     #[test]
@@ -528,61 +463,61 @@ mod tests {
 
     #[test]
     fn relax_ignore_attribute() {
-        let l = parse_html("<a href=\"x\" data-x=\"1\">hi</a>");
-        let r = parse_html("<a href=\"x\" data-x=\"999\">hi</a>");
         let cfg = RelaxConfig::new().relax(
             Matcher::Tag("a".to_string()),
             RelaxationRule::IgnoreAttribute("data-x".to_string()),
         );
-        diff(&l, &r, &cfg).expect("should match with relaxation");
+        diff_relaxed(
+            "<a href=\"x\" data-x=\"1\">hi</a>",
+            "<a href=\"x\" data-x=\"999\">hi</a>",
+            &cfg,
+        )
+        .expect("should match with relaxation");
     }
 
     #[test]
     fn relax_text_only_pre() {
         // syntax-highlighted vs plain — same source text but different structure.
-        let l = parse_html(
+        let cfg =
+            RelaxConfig::new().relax(Matcher::Tag("pre".to_string()), RelaxationRule::TextOnly);
+        diff_relaxed(
             "<pre><span class=\"k\">fn</span> <span class=\"i\">main</span>() {}</pre>",
-        );
-        let r = parse_html("<pre>fn main() {}</pre>");
-        let cfg = RelaxConfig::new()
-            .relax(Matcher::Tag("pre".to_string()), RelaxationRule::TextOnly);
-        diff(&l, &r, &cfg).expect("should match under TextOnly");
+            "<pre>fn main() {}</pre>",
+            &cfg,
+        )
+        .expect("should match under TextOnly");
     }
 
     #[test]
     fn relax_ignore_attribute_value_allows_differing_value() {
         // Hashed asset URL vs plain filename — same element, value ignored.
-        let l = parse_html("<img src=\"/foo.png\">");
-        let r = parse_html("<img src=\"/assets/foo-abc123.png\">");
         let cfg = RelaxConfig::new().relax(
             Matcher::AnyTagAttrExists {
                 attr: "src".to_string(),
             },
             RelaxationRule::IgnoreAttributeValue("src".to_string()),
         );
-        diff(&l, &r, &cfg).expect("differing src value should match under IgnoreAttributeValue");
+        diff_relaxed("<img src=\"/foo.png\">", "<img src=\"/assets/foo-abc123.png\">", &cfg)
+            .expect("differing src value should match under IgnoreAttributeValue");
     }
 
     #[test]
     fn relax_ignore_attribute_value_still_requires_presence() {
         // Value ignored, but a missing attr on the actual side is still a diff.
-        let l = parse_html("<img src=\"/foo.png\">");
-        let r = parse_html("<img alt=\"x\">");
         let cfg = RelaxConfig::new().relax(
             Matcher::AnyTagAttrExists {
                 attr: "src".to_string(),
             },
             RelaxationRule::IgnoreAttributeValue("src".to_string()),
         );
-        let d = diff(&l, &r, &cfg).expect_err("missing src must still diverge");
+        let d = diff_relaxed("<img src=\"/foo.png\">", "<img alt=\"x\">", &cfg)
+            .expect_err("missing src must still diverge");
         assert!(matches!(d.reason, DivergenceReason::AttrMissing { .. }));
     }
 
     #[test]
     fn multiple_rules_union_on_one_element() {
         // src and srcset both relaxed via two AnyTagAttrExists rules.
-        let l = parse_html("<img src=\"/a.png\" srcset=\"/a.png 1x\">");
-        let r = parse_html("<img src=\"/assets/a-h.png\" srcset=\"/assets/a-h.png 1x\">");
         let cfg = RelaxConfig::new()
             .relax(
                 Matcher::AnyTagAttrExists {
@@ -596,16 +531,24 @@ mod tests {
                 },
                 RelaxationRule::IgnoreAttributeValue("srcset".to_string()),
             );
-        diff(&l, &r, &cfg).expect("both src and srcset values should be relaxed");
+        diff_relaxed(
+            "<img src=\"/a.png\" srcset=\"/a.png 1x\">",
+            "<img src=\"/assets/a-h.png\" srcset=\"/assets/a-h.png 1x\">",
+            &cfg,
+        )
+        .expect("both src and srcset values should be relaxed");
     }
 
     #[test]
     fn relax_ignore_entirely() {
         // Differing nav widgets, but we don't care about their contents.
-        let l = parse_html("<nav class=\"x\"><a href=\"/a\">a</a></nav>");
-        let r = parse_html("<nav class=\"y\"><span>completely different</span></nav>");
         let cfg = RelaxConfig::new()
             .relax(Matcher::Tag("nav".to_string()), RelaxationRule::IgnoreEntirely);
-        diff(&l, &r, &cfg).expect("should match under IgnoreEntirely");
+        diff_relaxed(
+            "<nav class=\"x\"><a href=\"/a\">a</a></nav>",
+            "<nav class=\"y\"><span>completely different</span></nav>",
+            &cfg,
+        )
+        .expect("should match under IgnoreEntirely");
     }
 }

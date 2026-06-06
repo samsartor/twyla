@@ -181,9 +181,9 @@ fn hello_matches_golden() {
     // across typst bumps. Everything else compared structurally.
     let cfg = RelaxConfig::new().relax(Matcher::Tag("pre".to_string()), RelaxationRule::TextOnly);
 
-    let expected = parse_html(&golden_html);
-    let actual = parse_html(actual_html);
-    if let Err(d) = diff(&expected, &actual, &cfg) {
+    let expected = cfg.normalize(&parse_html(&golden_html));
+    let actual = cfg.normalize(&parse_html(actual_html));
+    if let Err(d) = diff(&expected, &actual) {
         panic!(
             "hello/index.html diverged from golden:\n{d}\n\n\
              If this is an intentional change, regenerate with:\n  \
