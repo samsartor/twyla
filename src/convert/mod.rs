@@ -89,10 +89,15 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
         message: format!("compile failed:\n{e}"),
     })?;
 
-    // 3. Manifests — twyla's own (self-contained) and the ground truth.
+    // 3. Manifests — twyla's own (self-contained) and the ground truth (used to
+    // excuse links broken in both builds).
     let twyla_manifest = manifest::twyla(ctx, &site).map_err(|e| ConvertError {
         findings: std::mem::take(&mut findings),
         message: format!("building twyla manifest: {e}"),
+    })?;
+    let gt_manifest = manifest::ground_truth(ctx, &opts.ground_truth).map_err(|e| ConvertError {
+        findings: std::mem::take(&mut findings),
+        message: format!("building ground-truth manifest: {e}"),
     })?;
 
     // 4. Per-page diff against the ground truth.
@@ -159,6 +164,7 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
         &twyla_pages,
         &gt_pages,
         &twyla_manifest,
+        &gt_manifest,
         base_url,
     ));
 

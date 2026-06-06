@@ -46,6 +46,9 @@ pub enum Finding {
         url: String,
         hint: String,
     },
+    /// A feed (`atom.xml`) the ground truth produces but twyla doesn't — feeds
+    /// aren't implemented yet. A warning, not a failure (planned work).
+    FeedNotImplemented { url: String },
     /// An expected route wasn't produced by twyla.
     RouteMissing { route: String },
     /// Twyla produced a route with no ground-truth counterpart.
@@ -56,7 +59,9 @@ impl Finding {
     pub fn severity(&self) -> Severity {
         match self {
             Finding::DraftWritten { .. } | Finding::PagePass { .. } => Severity::Info,
-            Finding::Note { .. } | Finding::RouteExtra { .. } => Severity::Warn,
+            Finding::Note { .. }
+            | Finding::RouteExtra { .. }
+            | Finding::FeedNotImplemented { .. } => Severity::Warn,
             Finding::DraftMissing { .. }
             | Finding::PageDiff { .. }
             | Finding::Unreachable { .. }
@@ -75,12 +80,18 @@ impl Finding {
             Finding::PageDiff { .. } => "diff",
             Finding::Unreachable { navigable, .. } => {
                 if *navigable {
+                    // A clickable `<a href>` on a twyla page that twyla's build
+                    // doesn't produce.
                     "broken-link"
                 } else {
-                    "unreachable"
+                    // A resource (`<img>`/`<link>`/`<script>`) referenced by a
+                    // twyla page that twyla's build doesn't produce.
+                    "broken-asset"
                 }
             }
-            Finding::NavigableDropped { .. } => "url-dropped",
+            // A navigable URL the ground truth served that twyla dropped.
+            Finding::NavigableDropped { .. } => "dropped-url",
+            Finding::FeedNotImplemented { .. } => "feed-todo",
             Finding::RouteMissing { .. } => "missing-route",
             Finding::RouteExtra { .. } => "extra-route",
         }
@@ -101,6 +112,9 @@ impl Finding {
             }
             Finding::NavigableDropped { page, url, hint } => {
                 format!("{page} -> {url}\n{hint}")
+            }
+            Finding::FeedNotImplemented { url } => {
+                format!("{url} — atom feeds aren't implemented yet (planned)")
             }
             Finding::RouteMissing { route } => format!("{route} (not produced by twyla)"),
             Finding::RouteExtra { route } => format!("{route} (not in the ground-truth dir)"),
