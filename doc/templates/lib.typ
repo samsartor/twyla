@@ -8,6 +8,8 @@
 	show quote.where(block: true): it => note(it.body)
 	show: frame-style(styles.hint)
 	show raw.where(lang: "tree"): it => if target() == "html" { it } else { dtree(raw(it.text.replace("├", " ").replace("└", " "))) }
+	// `--test-examples`: compile-check each `example` block and highlight it as typst.
+	show raw.where(lang: "example"): twyla-examples.compile-example
 	html.elem("html", attrs: (lang: "en"), {
     html.elem("head", {
     	html.elem("meta", attrs: (charset: "utf-8"))

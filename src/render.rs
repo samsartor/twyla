@@ -390,7 +390,7 @@ impl RenderWorld {
             .with_features([Feature::Html, Feature::Bundle].into_iter().collect())
             .with_inputs(inputs)
             .build();
-        install_stdlib(&mut library, ctx.reflect);
+        install_stdlib(&mut library, ctx.reflect, ctx.test_examples);
 
         Ok(Self {
             ctx,
@@ -438,13 +438,6 @@ impl RenderWorld {
         emit_warnings(self, &warnings);
 
         let (bundle, harvested, assets) = output.map_err(|errors| compile_err(self, &errors))?;
-
-        // `--test-examples`: compile every code block in the realized content as
-        // a throwaway one-page site (in *this* world's context) and fail if any
-        // don't compile. Runs before the bundle is consumed below.
-        if self.ctx.test_examples {
-            crate::examples::validate(self, &bundle)?;
-        }
 
         let mut all = IdHashMap::new();
         for (path, file) in bundle.files.iter() {
@@ -521,10 +514,11 @@ fn duplication_error(err: iddqd::errors::DuplicateItem<Output, &Output>) -> (Ren
 
 /// Install twyla's native customizations into a freshly built library.
 ///
-/// When `reflect` is set (the `--reflect` / `TWYLA_REFLECT` opt-in), also splice
-/// in the `twyla-reflect` module so twyla's own reference site can introspect
-/// the builtins it documents.
-pub fn install_stdlib(library: &mut Library, reflect: bool) {
+/// `reflect` (`--reflect`) splices in the `twyla-reflect` module so twyla's own
+/// reference site can introspect its builtins; `test_examples`
+/// (`--test-examples`) splices in `twyla-examples` so a docs page can compile +
+/// highlight its ` ```example ` blocks. Both are off for normal site builds.
+pub fn install_stdlib(library: &mut Library, reflect: bool, test_examples: bool) {
     crate::rules::install(&mut library.rules);
     let global = library.global.scope_mut();
     crate::document::install(global);
@@ -532,6 +526,9 @@ pub fn install_stdlib(library: &mut Library, reflect: bool) {
     crate::content::install(global);
     if reflect {
         crate::reflect::install(global);
+    }
+    if test_examples {
+        crate::examples::install(global);
     }
 }
 
