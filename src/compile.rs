@@ -382,7 +382,21 @@ fn build_documents_array(
 fn build_content(files: &[(Content, HarvestedDoc)], resolver: &AssetResolver) -> Content {
     let mut bodies = Vec::new();
     for (body, meta) in files {
-        bodies.push(wrap_document(&meta.output, body.clone()));
+        // Re-apply the *derived* output onto the page body so the page can read
+        // it back (`#context document.output`). Without this the page sees only
+        // the `auto` default — the derivation happens Rust-side in `harvest_doc`
+        // and never reaches the chain. (`discovered_sibling` does the same for
+        // inline documents; this keeps full-file pages consistent.) Idempotent
+        // when the user pinned `output` explicitly: `meta.output` already is it.
+        let mut styles = Styles::new();
+        styles.set(
+            TwylaDocument::output,
+            Smart::Custom(meta.output.as_str().into()),
+        );
+        bodies.push(wrap_document(
+            &meta.output,
+            body.clone().styled_with_map(styles),
+        ));
     }
     for doc in resolver.documents() {
         bodies.push(discovered_sibling(doc));
@@ -438,4 +452,38 @@ fn deduplicate(mut diags: EcoVec<SourceDiagnostic>) -> EcoVec<SourceDiagnostic> 
         unique.insert(hash)
     });
     diags
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::asset::AssetResolver;
+    use crate::project::TwylaContext;
+    use crate::render::RenderWorld;
+
+    /// First-page HTML from one compile of a one-file site (tempdir harness,
+    /// mirrors `crate::asset::tests`).
+    fn compile_main(body: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("content")).unwrap();
+        std::fs::write(dir.path().join("content/main.typ"), body).unwrap();
+        let ctx = TwylaContext::new(dir.path(), Some("https://example.com".into())).unwrap();
+        let world = RenderWorld::new(&ctx).unwrap();
+        let mut resolver = AssetResolver::new(&world.ctx);
+        let outputs = world.compile_bundle(&mut resolver).unwrap();
+        outputs.docs().next().unwrap().html.clone()
+    }
+
+    /// A full-file page can read its own *derived* output via `#context
+    /// document.output`. Without `build_content` re-applying the derived value
+    /// onto the page body, this read sees only the `auto` default (the
+    /// derivation lives Rust-side in `harvest_doc`). `content/main.typ` derives
+    /// to `index.html`.
+    #[test]
+    fn page_reads_its_derived_output() {
+        let html = compile_main("#context document.output");
+        assert!(
+            html.contains("index.html"),
+            "page did not see its derived output (regressed to `auto`?):\n{html}"
+        );
+    }
 }
