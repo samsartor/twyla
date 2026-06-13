@@ -1,8 +1,8 @@
-#import "../templates/lib.typ": horizontalrule
+#let horizontalrule = context { if target() == "html" { html.hr() } else { line(length: 100%) } }
 
 <twyla>
-Twyla is a static site generator (SSG) similar to
-#link("https://www.getzola.org")[Zola] but built entirely around the
+Twyla is a static site generator (SSG) similar to #link("https://gohugo.io/")[Hugo] or
+#link("https://www.getzola.org")[Zola], but built entirely around the
 #link("https://typst.app")[Typst] typesetting and scripting language.
 
 Content is written in Typst. Your templates are written in Typst. Your
@@ -76,8 +76,12 @@ page. To do that, use the
 I make bread!
 ```
 
-Your other pages should include basic information like `title`, `date`,
-`kind`, and a `description` as so:
+You can see Twyla's main idea in action: _there is no configuration, only code._
+Typst is a real programming language. If you want to create sidebars, listings,
+tags, "recents", your own personal #strike[Twitter] #strike[X] BlueSky clone ...
+well that is what a for loop is good for!
+
+Before you get carried away, please include basic information like `title` and `date`:
 
 ```example
 #set document(
@@ -178,11 +182,6 @@ Check out this pretty #html.img(src: asset("icon.svg").data-url) icon.
 )
 ```
 
-If you would like to port your existing website over to Twyla, you can
-follow the guide provided by `typst init`, or download the
-#link("https://raw.githubusercontent.com/samsartor/twyla/refs/heads/main/TWYLA_SKILL.md")[`TWYLA_SKILL.md`]
-and throw your agent of choice at the problem.
-
 = Customization
 <customization>
 Twyla customization and theming is mainly accomplished using Typt's
@@ -265,3 +264,22 @@ templates/
 Twyla themes can also be arbitrary typst packages. Conventionally, a Twyla theme
 should expose `KIND-template` functions and/or `KIND-default` constants for each
 supported page `KIND` (eg `"page"`, `"root"`, `"dir"`, `"draft"`).
+
+= Migrating
+
+Twyla provides a pretty capable `twyla convert` utility for existing
+Hugo/Zola sites. It will attempt to parse every `*.md` file in your existing
+website and create a sibling `*.typ` file. Once done, your site gets compiled
+but instead of overwriting `public/` like `twyla build`, the `twyla convert
+--verify` command will #strong[display a diff against the existing HTML there].
+
+You can iterate on the Typst version of your source personally: replacing
+placeholders, writing templates, recreating your theme, etc until the diff
+is small enough that you are satisfied. Or alternatively, you can download
+#link("https://raw.githubusercontent.com/samsartor/twyla/refs/heads/main/TWYLA_S
+KILL.md")[`TWYLA_SKILL.md`] and throw your agent of choice at the problem.
+
+Feel free to simultaneously iterate on the `twyla convert` utility itself too,
+especially if you use a currently-unsupported SSG (or unusual features thereof).
+Each site converted so far has required quite a bit of this (mainly via Claude),
+but we hope there will be less of it each time.

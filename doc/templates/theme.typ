@@ -41,6 +41,7 @@ try {
   html.elem("link", attrs: (rel: "stylesheet", href: "https://bin.samsartor.com/iosevka_27.3.3/iosevka-aile.css"))
   html.elem("link", attrs: (rel: "stylesheet", href: asset.sass("/sass/main.sass").url()))
   html.elem("script", theme-script)
+  html.elem("script", attrs: (data-goatcounter: "https://twyla.goatcounter.com/count", async: "", src: "//gc.zgo.at/count.js"))
 })
 
 #let nav-link(href, label, ..args) = html.a(class: "site-nav-link", href: href, ..args, label)
@@ -65,13 +66,10 @@ try {
   })
 })
 
-#let site-footer = html.elem("footer", attrs: (class: "site-footer"), {
-  [Built with ]
-  html.a(href: "https://github.com/samsartor/twyla")[Twyla]
-  [ — a static site generator powered by ]
-  html.a(href: "https://typst.app")[Typst]
-  [.]
-})
+#let site-footer = html.elem("footer",
+  attrs: (class: "site-footer"),
+  [Built with #html.a(href: "https://github.com/samsartor/twyla")[Twyla]]
+)
 
 // The home-page hero banner.
 #let hero = html.elem("section", attrs: (class: "hero"), {

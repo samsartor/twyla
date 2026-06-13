@@ -1,8 +1,6 @@
-> This README is aspirational, and not all features here are currently implemented. See doc/planning.typ for the current state of the project.
-
 <h1>Twyla</h1>
 
-Twyla is a static site generator (SSG) similar to [Zola](https://www.getzola.org) but built entirely around the [Typst](https://typst.app) typesetting and scripting language.
+Twyla is a static site generator (SSG) similar to [Hugo](https://gohugo.io/) or [Zola](https://www.getzola.org), but built entirely around the [Typst](https://typst.app) typesetting and scripting language.
 
 Content is written in Typst. Your templates are written in Typst. Your themes are written in Typst (and in [SASS](https://sass-lang.com/)). Everything is Typst! Except Twyla itself, which is written in Rust.
 
@@ -15,7 +13,7 @@ For an example, check out my own [personal website](https://samsartor.com) ([Sou
 Your best option (for now) is to compile Twyla from source:
 
 ```
-cargo install --git https://github.com/samsartor/twyla
+cargo install https://github.com/samsartor/twyla
 ```
 
 ## Getting Started
@@ -41,13 +39,13 @@ content/
 └ how-to-bake-bread.typ
 ```
 
-For a blog you will probably want to list your other pages on your home page. To do that, use the [documents()](/reference/document#documents) iterator:
+For a blog you will probably want to list your other pages on your home page. To do that, use the [documents()](https://twyla.dev/reference/#documents) iterator:
 
-```typst
+```example
 = My Blog
 
 #context for doc in documents() {
-  if not doc.draft and doc.kind == "page" [
+  if not doc.draft and doc.kind == "post" [
     == #link(doc.url, doc.title)
     #doc.date.display()
     
@@ -60,9 +58,11 @@ For a blog you will probably want to list your other pages on your home page. To
 I make bread!
 ```
 
-Your other pages should include basic information like `title`, `date`, `kind`, and a `description` as so:
+You can see Twyla’s main idea in action: _there is no configuration, only code._ Typst is a real programming language. If you want to create sidebars, listings, tags, “recents”, your own personal Twitter X BlueSky clone … well that is what a for loop is good for!
 
-```typst
+Before you get carried away, please include basic information like `title` and `date`:
+
+```example
 #set document(
   title: "Rewriting My Blog",
   date: datetime(year: 2026, month: 4, day: 12),
@@ -73,7 +73,7 @@ Your other pages should include basic information like `title`, `date`, `kind`, 
 )
 ```
 
-Twyla’s [document](reference/document) function supports a number of additional features, beyond what are available in normal Typst, including an `extra` field you can fill with whatever data you want.
+Twyla’s [document](https://twyla.dev/reference#document) function supports a number of additional features, beyond what are available in normal Typst, including an `extra` field you can fill with whatever data you want.
 
 For the purpose of theming you can also add a SCSS file and [some HTML](https://typst.app/docs/reference/html):
 
@@ -104,9 +104,9 @@ sass/
 
 <hr />
 
-```typst
+```example
 #context for doc in documents() {
-  if !doc.draft and doc.kind == "post" [
+  if not doc.draft and doc.kind == "post" [
     html.div(
       html.div(
         [#doc.title],
@@ -125,13 +125,15 @@ sass/
 }
 ```
 
-If you would like to include an image, you can use either the built-in image function or handle it explicitly with Twyla’s [asset system](/reference/asset):
+If you would like to include an image, you can use either the built-in image function or handle it explicitly with Twyla’s [asset system](https://twyla.dev/reference/assets):
 
 ```typst
 #image("./pretty.png")
 
-#context html.img(src: asset("./pretty.png", format: "webp", resize: 1024).url)
+#context html.img(src: asset.image("./pretty.png", format: "webp", resize: 1024).url)
 ```
+
+> This is aspirational, and some features documented here, like `asset.image` do not yet exist. If you want to help out, message [Sam](https://samsartor.com/) or [Sumner](https://sumnerevans.com/).
 
 Assets are pretty powerful, you can use them to do all kinds of stuff!
 
@@ -148,8 +150,6 @@ Check out this pretty #html.img(src: asset("icon.svg").data-url) icon.
   caption: [A big cirle],
 )
 ```
-
-If you would like to port your existing website over to Twyla, you can follow the guide provided by `typst init`, or download the [`TWYLA_SKILL.md`](https://raw.githubusercontent.com/samsartor/twyla/refs/heads/main/TWYLA_SKILL.md) and throw your agent of choice at the problem.
 
 ## Customization
 
@@ -177,9 +177,9 @@ Twyla customization and theming is mainly accomplished using Typt’s usual [sho
           else { document.description },
       ))
       html.elem("title", document.title)
-      html.script(src: asset("/scripts/main.ts").url, "")
-      html.link(rel: "stylesheet", href: asset("/sass/main.sass").url)
-      html.link(rel: "icon", href: asset(circle(fill: blue), format: "png").url)
+      html.script(src: asset.rolldown("/scripts/main.ts").url(), "")
+      html.link(rel: "stylesheet", href: asset.sass("/sass/main.sass").url())
+      html.link(rel: "icon", href: asset.image(circle(fill: blue), format: "png").url())
     })
     html.elem("body", body)
   })
@@ -189,7 +189,7 @@ Twyla customization and theming is mainly accomplished using Typt’s usual [sho
 ...
 ```
 
-Notice the uses of `asset(...).url`. Twyla’s [asset system](/reference/asset) can automatically convert assets such as SASS to CSS (using the [grass](https://github.com/connorskees/grass) library), TS to JS (using [rolldown](https://rolldown.rs)), and Typst _content_ into PNG/SVG/PDF (using Typst itself). Such transformations can also be disabled with `asset(transform: none, ...)` or customized in [`Twyla.toml`](/reference/configuration).
+Notice the uses of `asset.url()`. Twyla’s [asset system](/reference/asset) can automatically convert assets such as SASS to CSS (using the [grass](https://github.com/connorskees/grass) library), TS to JS (using [rolldown](https://rolldown.rs)), and Typst _content_ into PNG/SVG/PDF (using Typst itself).
 
 Instead of stylizing every post separately, you probably want to create a common set of templates:
 
@@ -220,10 +220,14 @@ templates/
 ...
 ```
 
-As a shorthand, you can also add the theme to your `Twyla.toml`:
+Twyla themes can also be arbitrary typst packages. Conventionally, a Twyla theme should expose `KIND-template` functions and/or `KIND-default` constants for each supported page `KIND` (eg `"page"`, `"root"`, `"dir"`, `"draft"`).
 
-```toml
-theme = "/templates/theme.typ"
-```
+## Migrating
 
-Twyla themes can also be arbitrary typst packages such as `@samsartor/twyla-pickles` or `@samsartor/twyla-book`. A theme need only expose `KIND-template` functions and/or `KIND-default` constants for each supported page `KIND` (eg `"page"`, `"root"`, `"dir"`, `"draft"`).
+Twyla provides a pretty capable `twyla convert` utility for existing Hugo/Zola sites. It will attempt to parse every `*.md` file in your existing website and create a sibling `*.typ` file. Once done, your site gets compiled but instead of overwriting `public/` like `twyla build`, the `twyla convert
+--verify` command will **display a diff against the existing HTML there**.
+
+You can iterate on the Typst version of your source personally: replacing placeholders, writing templates, recreating your theme, etc until the diff is small enough that you are satisfied. Or alternatively, you can download [`TWYLA_SKILL.md`](https://raw.githubusercontent.com/samsartor/twyla/refs/heads/main/TWYLA_S
+KILL.md) and throw your agent of choice at the problem.
+
+Feel free to simultaneously iterate on the `twyla convert` utility itself too, especially if you use a currently-unsupported SSG (or unusual features thereof). Each site converted so far has required quite a bit of this (mainly via Claude), but we hope there will be less of it each time.
