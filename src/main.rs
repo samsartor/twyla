@@ -6,7 +6,8 @@
 //!
 //! End-user (cwd-driven, no flags required):
 //!
-//! - `twyla serve` — dev server on port 1111.
+//! - `twyla serve` — dev server on `127.0.0.1:1111` (override with
+//!   `--host`/`--port`, or `--bind HOST:PORT`).
 //! - `twyla build [-o <dir>]` — write the static site to `./public/`
 //!   (or wherever `-o` points).
 //!
@@ -20,7 +21,7 @@
 //! - `twyla md2typ <md>` — md→typ draft generator (primitive).
 
 use std::io::IsTerminal;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -93,11 +94,22 @@ impl ContextArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Start the dev server. Zero flags — operates on the current
-    /// working directory (or `--root <PATH>`). Binds to port 1111.
+    /// Start the dev server. Operates on the current working directory
+    /// (or `--root <PATH>`). Binds `127.0.0.1:1111` by default; override
+    /// with `--host`/`--port` (e.g. to run two servers at once) or a full
+    /// `--bind HOST:PORT`.
     Serve {
         #[command(flatten)]
         ctx: ContextArgs,
+        /// Host/IP to bind. Ignored when `--bind` is given.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to bind. Ignored when `--bind` is given.
+        #[arg(long, short = 'p', default_value_t = 1111)]
+        port: u16,
+        /// Full bind address `HOST:PORT`, overriding `--host`/`--port`.
+        #[arg(long, short = 'b', conflicts_with_all = ["host", "port"])]
+        bind: Option<String>,
     },
     /// Compile every page under `content/` and write the static site
     /// to disk. Default output `<root>/public/` (matches zola).
@@ -160,7 +172,7 @@ enum FromFormat {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { ctx } => cmd_serve(ctx),
+        Cmd::Serve { ctx, host, port, bind } => cmd_serve(ctx, host, port, bind),
         Cmd::Build { ctx, output_dir } => cmd_build(ctx, output_dir),
         Cmd::Convert {
             ctx,
@@ -229,12 +241,18 @@ fn cmd_build(args: ContextArgs, output_dir: Option<PathBuf>) -> ExitCode {
     }
 }
 
-fn cmd_serve(args: ContextArgs) -> ExitCode {
+fn cmd_serve(args: ContextArgs, host: String, port: u16, bind: Option<String>) -> ExitCode {
     let ctx = match resolve_ctx(args) {
         Ok(c) => c,
         Err(code) => return code,
     };
-    let addr: SocketAddr = "127.0.0.1:1111".parse().unwrap();
+    let addr = match resolve_bind_addr(bind.as_deref(), &host, port) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("serve error: {e}");
+            return ExitCode::from(1);
+        }
+    };
     match serve_run(Serve { ctx, addr }) {
         Ok(()) => ExitCode::from(0),
         Err(e) => {
@@ -242,6 +260,21 @@ fn cmd_serve(args: ContextArgs) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Resolve the dev server's bind address: a full `--bind HOST:PORT` if given,
+/// else `--host`/`--port`. Goes through [`ToSocketAddrs`] so hostnames
+/// (`localhost`) and `0.0.0.0` work, not just literal IPs.
+fn resolve_bind_addr(bind: Option<&str>, host: &str, port: u16) -> Result<SocketAddr, String> {
+    let target = match bind {
+        Some(b) => b.to_string(),
+        None => format!("{host}:{port}"),
+    };
+    target
+        .to_socket_addrs()
+        .map_err(|e| format!("invalid bind address {target:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("bind address {target:?} resolved to no socket address"))
 }
 
 fn cmd_md2typ(input: &Path) -> ExitCode {
