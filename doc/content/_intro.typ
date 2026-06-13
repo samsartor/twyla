@@ -59,11 +59,11 @@ For a blog you will probably want to list your other pages on your home
 page. To do that, use the
 #link("https://twyla.dev/reference/#documents")[documents()] iterator:
 
-```typst
+```example
 = My Blog
 
 #context for doc in documents() {
-  if !doc.draft and doc.kind == "post" [
+  if not doc.draft and doc.kind == "post" [
     == #link(doc.url, doc.title)
     #doc.date.display()
     
@@ -79,7 +79,7 @@ I make bread!
 Your other pages should include basic information like `title`, `date`,
 `kind`, and a `description` as so:
 
-```typst
+```example
 #set document(
   title: "Rewriting My Blog",
   date: datetime(year: 2026, month: 4, day: 12),
@@ -124,9 +124,9 @@ sass/
 
 #horizontalrule
 
-```typst
+```example
 #context for doc in documents() {
-  if !doc.draft and doc.kind == "post" [
+  if not doc.draft and doc.kind == "post" [
     html.div(
       html.div(
         [#doc.title],

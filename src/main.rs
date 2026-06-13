@@ -61,6 +61,10 @@ struct ContextArgs {
     /// default; the normal site build never sees it.
     #[arg(long, env = "TWYLA_REFLECT", global = true)]
     reflect: bool,
+    /// Compile every `typ`/`example` code block in the site and fail the build
+    /// if any don't compile. Useful for the docs/reference site. Off by default.
+    #[arg(long, env = "TWYLA_TEST_EXAMPLES", global = true)]
+    test_examples: bool,
 }
 
 impl ContextArgs {
@@ -75,6 +79,7 @@ impl ContextArgs {
         };
         let mut ctx = TwylaContext::new(&root, self.base_url)?;
         ctx.reflect = self.reflect;
+        ctx.test_examples = self.test_examples;
         if !ctx.content_dir().is_dir() {
             return Err(format!(
                 "no `content/` directory under {} — run twyla from \

@@ -255,7 +255,7 @@ pub fn resolve_raw_html_placeholders(input: &str) -> String {
 
 /// A render failure with no source span (setup/layout/bundle problems). The
 /// message is shown verbatim — there's no snippet to draw.
-fn plain_err(msg: impl Into<String>, kind: RenderErrorKind) -> RenderError {
+pub(crate) fn plain_err(msg: impl Into<String>, kind: RenderErrorKind) -> RenderError {
     let msg = msg.into();
     let html = to_html(&msg);
     RenderError {
@@ -271,7 +271,7 @@ fn setup_err(msg: impl Into<String>) -> RenderError {
 
 /// Whether to colorize terminal diagnostics: only when stderr is a tty and
 /// `NO_COLOR` is unset (matches `twyla convert`'s color rule).
-fn terminal_color() -> bool {
+pub(crate) fn terminal_color() -> bool {
     use std::io::IsTerminal;
     std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
@@ -279,7 +279,11 @@ fn terminal_color() -> bool {
 /// Render diagnostics to a string via typst-kit's emitter. With `color`, the
 /// string carries ANSI escapes; otherwise it's plain text. Emitting into an
 /// in-memory buffer only fails on encoding errors, which we don't expect.
-fn emit_to_string(world: &dyn DiagnosticWorld, diags: &[SourceDiagnostic], color: bool) -> String {
+pub(crate) fn emit_to_string(
+    world: &dyn DiagnosticWorld,
+    diags: &[SourceDiagnostic],
+    color: bool,
+) -> String {
     let mut buf = if color {
         Buffer::ansi()
     } else {
@@ -434,6 +438,13 @@ impl RenderWorld {
         emit_warnings(self, &warnings);
 
         let (bundle, harvested, assets) = output.map_err(|errors| compile_err(self, &errors))?;
+
+        // `--test-examples`: compile every code block in the realized content as
+        // a throwaway one-page site (in *this* world's context) and fail if any
+        // don't compile. Runs before the bundle is consumed below.
+        if self.ctx.test_examples {
+            crate::examples::validate(self, &bundle)?;
+        }
 
         let mut all = IdHashMap::new();
         for (path, file) in bundle.files.iter() {

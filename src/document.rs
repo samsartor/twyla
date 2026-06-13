@@ -82,7 +82,7 @@ pub struct TwylaDocument {
     #[default(false)]
     pub draft: bool,
 
-    /// The body of an *inline* document. When `document` is called as a
+    /// The body of an _inline_ document. When `document` is called as a
     /// constructor — `#document(output: "x")[stuff]` — this carries `stuff`,
     /// which twyla hoists into its own bundle output (see [`crate::compile`]).
     /// `#set document(..)` never touches this (required positional fields aren't
@@ -95,10 +95,10 @@ pub struct TwylaDocument {
 impl TwylaDocument {
     /// The page's public URL. Two call forms:
     ///
-    /// - `document.url()` (no self) → the **current** page's URL, built from the
+    /// - `document.url()` (no self) → the *current* page's URL, built from the
     ///   output twyla derived for it.
     /// - `document(output: "x")[..].url()` (method, on an instance) → that
-    ///   document's URL, and **discovers it for emission** — so an inline
+    ///   document's URL, and *discovers it for emission* — so an inline
     ///   document consumed only through `.url()` (never shown) is still routed.
     ///   Discovery dedups by `output`, so calling `.url()` repeatedly, or
     ///   `.url()` on a document that is also shown, emits it exactly once.

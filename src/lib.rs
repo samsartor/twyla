@@ -17,6 +17,7 @@ pub mod content;
 pub mod convert;
 pub mod diff;
 pub mod document;
+pub mod examples;
 pub mod html;
 pub mod import;
 pub mod project;

@@ -52,7 +52,7 @@ impl FileAsset {
     }
 
     /// The file's contents — for inlining instead of linking. Mirrors the
-    /// native [`read`]($read): UTF-8 `str` by default, raw `bytes` with
+    /// native `read` function: UTF-8 `str` by default, raw `bytes` with
     /// `encoding: none`. Contextual.
     #[func(contextual)]
     fn read(
@@ -77,8 +77,6 @@ impl FileAsset {
 pub const SHOW_RULE: ShowFn<FileAsset> =
     |elem, _engine, _styles| show_unresolved(elem.span(), "file");
 
-/// Read the file, fingerprint it, and emit a verbatim stream-copy. The source
-/// is its own (only) upstream.
 pub(crate) fn build(
     _world: Tracked<dyn World + '_>,
     file: FileId,

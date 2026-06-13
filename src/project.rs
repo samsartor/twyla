@@ -34,6 +34,10 @@ pub struct TwylaContext {
     /// introspect twyla's native builtins; off for normal site builds. See
     /// [`crate::reflect`].
     pub reflect: bool,
+    /// Compile every `typ`/`example` code block in the site as a throwaway
+    /// one-page site and fail the build if any don't compile (the
+    /// `--test-examples` / `TWYLA_TEST_EXAMPLES` opt-in). See [`crate::examples`].
+    pub test_examples: bool,
 }
 
 /// Build a document's public URL from the site `base_url` and its bundle output
@@ -73,7 +77,7 @@ impl TwylaContext {
             .canonicalize()
             .map_err(|e| format!("cannot canonicalize root {}: {e}", root.display()))?;
         let base_url = base_url.map(|s| s.trim_end_matches('/').to_string());
-        Ok(Self { root, base_url, reflect: false })
+        Ok(Self { root, base_url, reflect: false, test_examples: false })
     }
 
     /// A bare context for unit tests: fields take their defaults and `root` is
@@ -86,6 +90,7 @@ impl TwylaContext {
             root: root.into(),
             base_url: None,
             reflect: false,
+            test_examples: false,
         }
     }
 

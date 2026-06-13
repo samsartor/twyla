@@ -15,9 +15,7 @@ use comemo::Tracked;
 use ecow::{EcoString, eco_format, eco_vec};
 use typst::World;
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
-use typst::foundations::{
-    Bytes, Content, Context, PathOrStr, ShowFn, Str, elem, func, scope,
-};
+use typst::foundations::{Bytes, Content, Context, PathOrStr, ShowFn, Str, elem, func, scope};
 use typst::loading::{Encoding, Readable};
 use typst::syntax::{FileId, Span};
 use typst_utils::hash128;
@@ -54,11 +52,6 @@ pub struct SassAsset {
 
 #[scope]
 impl SassAsset {
-    /// The resolved, fingerprinted URL of the compiled CSS (e.g.
-    /// `/assets/main-<hash>.css`). Contextual — call it inside `#context`.
-    ///
-    /// `context` precedes the `this` self-positional — see [`super::file`] for
-    /// why (the `#[func]` macro's special-param ordering).
     #[func(contextual)]
     fn url(context: Tracked<Context>, this: Content) -> HintedStrResult<Str> {
         let elem = this.into_packed::<SassAsset>().unwrap();
@@ -70,9 +63,6 @@ impl SassAsset {
         Ok(resolve_or_request(styles, &spec))
     }
 
-    /// The compiled CSS — for inlining instead of linking. Mirrors the native
-    /// [`read`]($read): UTF-8 `str` by default, raw `bytes` with
-    /// `encoding: none`. Contextual.
     #[func(contextual)]
     fn read(
         context: Tracked<Context>,
@@ -98,8 +88,6 @@ impl SassAsset {
 pub const SHOW_RULE: ShowFn<SassAsset> =
     |elem, _engine, _styles| show_unresolved(elem.span(), "sass");
 
-/// Read the entry, compile it (recording every imported file), fingerprint the
-/// CSS output, and emit it as bytes.
 pub(crate) fn build(
     _world: Tracked<dyn World + '_>,
     file: FileId,

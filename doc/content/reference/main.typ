@@ -57,7 +57,7 @@
     sig
     if p.docs != none and p.docs != "" {
       parbreak()
-      p.docs
+      eval(p.docs, mode: "markup")
     }
   })
 }
@@ -79,12 +79,13 @@
 
   heading(level: depth, raw(d.name))
 
-  // The baked `///` docs are written in typst-docs reference markup (with
-  // `$func$` cross-refs etc.) that plain markup-eval can't parse, so dump them
-  // verbatim for now — they're hard-wrapped in the Rust source, so the raw
-  // block reads fine.
+  // The baked `///` docs are twyla's own builtin comments — authored as typst
+  // markup, so eval them as markup to render prose, lists, inline code, and
+  // fenced code blocks. (Unlike upstream typst-docs, there are no `$func$`
+  // reference cross-refs to special-case here.) A doc comment that fails to
+  // parse fails the build, which keeps the docs honest.
   if d.docs != none and d.docs != "" {
-    raw(d.docs, block: true)
+    eval(d.docs, mode: "markup")
   }
 
   if d.at("params", default: ()).len() > 0 {
