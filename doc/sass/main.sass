@@ -1,0 +1,385 @@
+// Twyla docs stylesheet. Clean and typst-reference-like: light by default,
+// system dark via `color-scheme`, overridable by the header toggle (which pins
+// `color-scheme` on <html> from JS — see theme.typ). Colors use `light-dark()`
+// so each value is written once.
+
+:root
+  color-scheme: light dark
+  --bg:         light-dark(#ffffff, #1b1b1f)
+  --fg:         light-dark(#1f2328, #e6e6e9)
+  --muted:      light-dark(#656d76, #9aa0a6)
+  --border:     light-dark(#e6e6e9, #2c2c33)
+  --panel:      light-dark(#f5f5f6, #25252b)
+  --accent:     light-dark(#0a7ea4, #5cc6e8)
+  --code-bg:    #282a36
+  --code-fg:    #f8f8f2
+  // Type-pill palette (pale fill + dark text, theme-independent so it reads on
+  // both the page body and the dark code panels).
+  --type-neutral-bg: #e8e8ea
+  --type-neutral-fg: #45474f
+  --type-bool-bg:    #fbe2cc
+  --type-bool-fg:    #8a4a00
+  --type-num-bg:     #e7e0fb
+  --type-num-fg:     #5634c0
+  --type-str-bg:     #fbeec2
+  --type-str-fg:     #7a5e00
+  --type-content-bg: #d6f0df
+  --type-content-fg: #1c7a44
+  --type-coll-bg:    #d4ebfb
+  --type-coll-fg:    #155f9c
+  --type-func-bg:    #fbd9eb
+  --type-func-fg:    #9c286c
+  --type-color-bg:   #cdeeee
+  --type-color-fg:   #0c6c6c
+  --type-date-bg:    #dfe8ff
+  --type-date-fg:    #2a4fa0
+  --type-other-bg:   #d4ebfb
+  --type-other-fg:   #155f9c
+
+*
+  box-sizing: border-box
+
+html, body
+  margin: 0
+
+body
+  background: var(--bg)
+  color: var(--fg)
+  font-family: 'Iosevka Aile Web', system-ui, sans-serif
+  line-height: 1.65
+  font-size: 17px
+
+code, pre, .type, .signature, .param-name, .param-default
+  font-family: 'Iosevka Web', ui-monospace, monospace
+
+// ── Header ────────────────────────────────────────────────────────────────
+
+.site-header
+  position: sticky
+  top: 0
+  z-index: 10
+  display: flex
+  align-items: center
+  gap: 1.5rem
+  padding: 0.7rem 1.5rem
+  border-bottom: 1px solid var(--border)
+  background: var(--bg)
+
+.site-brand
+  font-family: 'Iosevka Web', monospace
+  font-weight: 700
+  font-size: 1.3rem
+  color: var(--fg)
+  text-decoration: none
+
+.site-nav
+  margin-left: auto
+  display: flex
+  align-items: center
+  gap: 1.25rem
+
+.site-nav-link
+  color: var(--muted)
+  text-decoration: none
+  &:hover
+    color: var(--accent)
+
+.theme-toggle
+  background: none
+  border: 1px solid var(--border)
+  border-radius: 0.4rem
+  color: var(--fg)
+  cursor: pointer
+  padding: 0.2rem 0.55rem
+  font-size: 1.05rem
+  line-height: 1
+  &:hover
+    border-color: var(--accent)
+    color: var(--accent)
+
+// ── Layout ──────────────────────────────────────────────────────────────
+
+.content
+  max-width: 52rem
+  margin: 0 auto
+  padding: 2rem 1.5rem 4rem
+
+.content.with-sidebar
+  max-width: 74rem
+  display: grid
+  grid-template-columns: 15rem minmax(0, 1fr)
+  gap: 3rem
+  align-items: start
+
+.toc
+  position: sticky
+  top: 4.5rem
+  max-height: calc(100vh - 6rem)
+  overflow-y: auto
+  font-size: 0.92rem
+
+.toc-title
+  font-weight: 700
+  margin-bottom: 0.6rem
+
+.toc ul
+  list-style: none
+  margin: 0
+  padding: 0
+
+.toc ul ul
+  padding-left: 0.9rem
+  border-left: 1px solid var(--border)
+  margin-left: 0.2rem
+
+.toc li
+  margin: 0.18rem 0
+
+.toc a
+  color: var(--muted)
+  text-decoration: none
+  &:hover
+    color: var(--accent)
+
+.toc code
+  background: none
+  padding: 0
+  font-size: 0.9em
+
+@media (max-width: 60rem)
+  .content.with-sidebar
+    grid-template-columns: 1fr
+    gap: 1rem
+  .toc
+    position: static
+    max-height: none
+    border-bottom: 1px solid var(--border)
+    padding-bottom: 1rem
+    margin-bottom: 1rem
+
+// ── Prose ─────────────────────────────────────────────────────────────────
+
+.prose
+  min-width: 0
+
+.prose a
+  color: var(--accent)
+  text-decoration: none
+  &:hover
+    text-decoration: underline
+
+.prose h1, .prose h2, .prose h3, .prose h4
+  line-height: 1.25
+  scroll-margin-top: 4.5rem
+
+.prose h1
+  font-size: 2.1rem
+  margin: 0 0 1rem
+
+.prose h2
+  font-size: 1.55rem
+  margin: 2.5rem 0 1rem
+  padding-bottom: 0.3rem
+  border-bottom: 1px solid var(--border)
+
+.prose h3
+  font-size: 1.2rem
+  margin: 2rem 0 0.75rem
+
+.prose h4
+  font-size: 1.02rem
+  margin: 1.5rem 0 0.5rem
+
+.ref-item
+  border-bottom: none
+  margin-top: 2.75rem
+
+.ref-item code
+  background: none
+  padding: 0
+  font-size: inherit
+  color: var(--fg)
+
+.prose p
+  margin: 0.9rem 0
+
+.prose :not(pre) > code
+  background: var(--panel)
+  padding: 0.1rem 0.35rem
+  border-radius: 0.3rem
+  font-size: 0.88em
+
+.prose pre, .signature
+  background: var(--code-bg)
+  color: var(--code-fg)
+  padding: 1rem 1.15rem
+  border-radius: 0.6rem
+  overflow-x: auto
+  line-height: 1.55
+  font-size: 0.88rem
+  margin: 1rem 0
+
+.prose pre code
+  background: none
+  padding: 0
+  font-size: inherit
+  color: inherit
+
+.prose hr
+  border: none
+  border-top: 1px solid var(--border)
+  margin: 2rem 0
+
+.prose blockquote
+  margin: 1rem 0
+  padding: 0.5rem 1rem
+  border-left: 3px solid var(--accent)
+  background: var(--panel)
+  border-radius: 0 0.4rem 0.4rem 0
+
+// ── Tables (typst-reference style) ────────────────────────────────────────
+
+.prose table
+  border-collapse: collapse
+  width: 100%
+  margin: 1.25rem 0
+  font-size: 0.95em
+
+.prose th, .prose td
+  border: 1px solid var(--border)
+  padding: 0.45rem 0.7rem
+  text-align: left
+  vertical-align: top
+
+.prose th
+  background: var(--panel)
+  font-weight: 700
+
+.prose td > code, .prose th > code
+  background: none
+  padding: 0
+
+// ── Function signature ─────────────────────────────────────────────────────
+
+.signature .sig-fn
+  color: #8be9fd
+
+.signature .sig-arg
+  color: #f1fa8c
+
+// ── Type pills ──────────────────────────────────────────────────────────────
+
+.type
+  display: inline-block
+  padding: 0 0.45rem
+  border-radius: 0.35rem
+  font-size: 0.8em
+  line-height: 1.55
+  white-space: nowrap
+  vertical-align: baseline
+
+.type + .type
+  margin-left: 0.3rem
+
+.type-neutral
+  background: var(--type-neutral-bg)
+  color: var(--type-neutral-fg)
+.type-bool
+  background: var(--type-bool-bg)
+  color: var(--type-bool-fg)
+.type-num
+  background: var(--type-num-bg)
+  color: var(--type-num-fg)
+.type-str
+  background: var(--type-str-bg)
+  color: var(--type-str-fg)
+.type-content
+  background: var(--type-content-bg)
+  color: var(--type-content-fg)
+.type-coll
+  background: var(--type-coll-bg)
+  color: var(--type-coll-fg)
+.type-func
+  background: var(--type-func-bg)
+  color: var(--type-func-fg)
+.type-color
+  background: var(--type-color-bg)
+  color: var(--type-color-fg)
+.type-date
+  background: var(--type-date-bg)
+  color: var(--type-date-fg)
+.type-other
+  background: var(--type-other-bg)
+  color: var(--type-other-fg)
+
+// ── Parameters ──────────────────────────────────────────────────────────────
+
+.param
+  border-left: 2px solid var(--border)
+  padding: 0.1rem 0 0.1rem 1rem
+  margin: 1.1rem 0
+
+.param-head
+  display: flex
+  flex-wrap: wrap
+  align-items: baseline
+  gap: 0.45rem
+
+.param-name
+  font-weight: 700
+
+.param-default
+  color: var(--muted)
+  font-size: 0.85em
+
+.param-flag
+  font-size: 0.66rem
+  text-transform: uppercase
+  letter-spacing: 0.04em
+  color: var(--muted)
+  border: 1px solid var(--border)
+  border-radius: 0.3rem
+  padding: 0.05rem 0.35rem
+
+.param-body
+  margin-top: 0.35rem
+  > p:first-child
+    margin-top: 0
+
+.returns
+  margin: 1rem 0
+
+// ── Hero ────────────────────────────────────────────────────────────────────
+
+.hero
+  text-align: center
+  padding: 3.5rem 0 2.5rem
+  border-bottom: 1px solid var(--border)
+  margin-bottom: 2rem
+
+.hero-title
+  font-family: 'Iosevka Web', monospace
+  font-size: 3.5rem
+  letter-spacing: -0.03em
+  margin: 0
+
+.hero-tagline
+  color: var(--muted)
+  font-size: 1.2rem
+  margin: 0.5rem 0 0
+
+// ── Footer ──────────────────────────────────────────────────────────────────
+
+.site-footer
+  border-top: 1px solid var(--border)
+  margin-top: 3rem
+  padding: 1.75rem 1.5rem
+  text-align: center
+  color: var(--muted)
+  font-size: 0.9rem
+
+.site-footer a
+  color: var(--accent)
+  text-decoration: none
+  &:hover
+    text-decoration: underline

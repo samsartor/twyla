@@ -152,8 +152,15 @@ image function or handle it explicitly with Twyla's
 ```typst
 #image("./pretty.png")
 
-#context html.img(src: asset("./pretty.png", format: "webp", resize: 1024).url)
+#context html.img(src: asset.image("./pretty.png", format: "webp", resize: 1024).url)
 ```
+
+#quote(block: true)[
+This is aspirational, and some features documented here,
+like `asset.image` do not yet exist. If you want to help
+out, message #link("https://samsartor.com/")[Sam] or
+#link("https://sumnerevans.com/")[Sumner].
+]
 
 Assets are pretty powerful, you can use them to do all kinds of stuff!
 
@@ -255,13 +262,6 @@ templates/
 ...
 ```
 
-As a shorthand, you can also add the theme to your `Twyla.toml`:
-
-```toml
-theme = "/templates/theme.typ"
-```
-
-Twyla themes can also be arbitrary typst packages such as
-`@samsartor/twyla-pickles` or `@samsartor/twyla-book`. A theme need only
-expose `KIND-template` functions and/or `KIND-default` constants for
-each supported page `KIND` (eg `"page"`, `"root"`, `"dir"`, `"draft"`).
+Twyla themes can also be arbitrary typst packages. Conventionally, a Twyla theme
+should expose `KIND-template` functions and/or `KIND-default` constants for each
+supported page `KIND` (eg `"page"`, `"root"`, `"dir"`, `"draft"`).

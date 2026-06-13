@@ -1,21 +1,4 @@
 //! The `document` element and `documents()` builtin.
-//!
-//! Maintainer notes (the `///` docs below are the user-facing API docs;
-//! this module doc is the implementation story):
-//!
-//! `document` is bound — in [`crate::prelude`] — to [`TwylaDocument`], which
-//! shadows typst's native `document`
-//! Because the fields are settable, `#set document(..)` puts them on the style
-//! chain, which is what makes them both readable on the current page
-//! (`#context document.title`, via typst's `field_from_styles` fallback for
-//! element field access) and harvestable per-document by `crate::compile`.
-//!
-//! `documents()` reads the whole-site list back off the style chain. Twyla
-//! harvests it Rust-side and injects it through [`TwylaDocumentList`]'s hidden
-//! style field (the same trick typst uses for `TargetElem`). A bare
-//! `documents` binding can't work — a bare identifier resolves at eval time,
-//! but the data only exists at realization time — and `for` only iterates
-//! Array/Dict/Str/Bytes, so it has to be a function returning an array.
 
 use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
@@ -32,19 +15,30 @@ use typst::syntax::{FileId, Span};
 
 use crate::project::build_document_url;
 
-/// Metadata for the current page.
+/// Defines a page of the website.
 ///
-/// Set it once, near the top of a page, with a `set` rule. Every field is
-/// then available on this page via `#context document.<field>`, and the whole
-/// site's metadata is available through [`documents`].
+/// Conventionally, document metadata is provided near the top of each page.
+/// with a `set` rule. Every field is then available on this page via `#context
+/// document.<field>`, and the whole site's metadata is available through
+/// #link(<documents>)[`documents()`].
 ///
-/// ```typ
+/// ```example
 /// #set document(
 ///   title: "Rewriting My Blog",
 ///   date: datetime(year: 2026, month: 4, day: 12),
 ///   description: "Why I moved off Markdown.",
 ///   kind: "post",
 /// )
+/// ```
+///
+/// It is also possible to create new pages inline, by constructing documents:
+/// ```example
+/// #context link(
+///     document(
+///         title: "Page within a page",
+///         output: "subpage/index.html",
+///     )[Hello from a page within a page!].url(),
+/// )[This is a link to a page within a page]
 /// ```
 #[elem(scope, name = "document")]
 pub struct TwylaDocument {
@@ -65,9 +59,14 @@ pub struct TwylaDocument {
     /// What kind of page this is, e.g. `"post"` or `"page"` — used to group
     /// pages in listings and feeds, and to pick the `{kind}-template` a
     /// `convert` draft shows. If `auto`, defaults from the source filename:
-    /// - "root" for `content/main.typ` (the site index)
-    /// - "dir" for `content/<dir>/main.typ` (a section index)
-    /// - "page" for any other file
+    ///
+    /// #table(
+    ///   columns: 2,
+    ///   table.header[Kind][Default for],
+    ///   [`"root"`], [`content/main.typ` — the site index],
+    ///   [`"dir"`], [`content/<dir>/main.typ` — a section index],
+    ///   [`"page"`], [any other file],
+    /// )
     pub kind: Smart<EcoString>,
 
     /// Arbitrary extra data for your own use. Available as `document.extra`
