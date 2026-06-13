@@ -106,6 +106,89 @@ fn multiple_assets_resolve_and_sass_renames_to_css() {
     );
 }
 
+/// Encode a solid-color `width`×`height` PNG (test source images).
+fn png(width: u32, height: u32) -> Vec<u8> {
+    let img = ::image::RgbImage::from_pixel(width, height, ::image::Rgb([10, 120, 200]));
+    let mut buf = Vec::new();
+    ::image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut std::io::Cursor::new(&mut buf), ::image::ImageFormat::Png)
+        .unwrap();
+    buf
+}
+
+/// `asset.image` resizes aspect-preserving *and* transcodes: a 100×50 source
+/// asked for `width: 40, format: "webp"` resolves to a `.webp` url whose bytes
+/// decode to a 40×20 WebP (the height follows from the aspect ratio).
+#[test]
+fn image_resizes_and_transcodes() {
+    let (ctx, dir) = site(&[(
+        "content/main.typ",
+        "#context asset.image(\"photo.png\", width: 40, format: \"webp\").url()",
+    )]);
+    std::fs::write(dir.path().join("content/photo.png"), png(100, 50)).unwrap();
+
+    let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    assert_eq!(assets.len(), 1, "got {assets:?}");
+    let asset = &assets[0];
+    assert!(
+        asset.output_path.starts_with("assets/photo-") && asset.output_path.ends_with(".webp"),
+        "unexpected output path: {}",
+        asset.output_path,
+    );
+    assert!(html.contains(&asset.url), "page missing resolved url:\n{html}");
+
+    let bytes = asset.built.emit.read().unwrap();
+    assert_eq!(
+        ::image::guess_format(&bytes).unwrap(),
+        ::image::ImageFormat::WebP,
+        "output should be WebP",
+    );
+    let decoded = ::image::load_from_memory(&bytes).unwrap();
+    assert_eq!(
+        (decoded.width(), decoded.height()),
+        (40, 20),
+        "expected aspect-preserved 40×20",
+    );
+}
+
+/// With no `format`, the source format is kept; with no dimensions, the image
+/// is only transcoded. Here: keep PNG, resize to a 30px-wide box.
+#[test]
+fn image_keeps_source_format_when_unspecified() {
+    let (ctx, dir) = site(&[(
+        "content/main.typ",
+        "#context asset.image(\"photo.png\", width: 30).url()",
+    )]);
+    std::fs::write(dir.path().join("content/photo.png"), png(60, 60)).unwrap();
+
+    let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    let asset = &assets[0];
+    assert!(asset.output_path.ends_with(".png"), "kept source format: {}", asset.output_path);
+    let decoded = ::image::load_from_memory(&asset.built.emit.read().unwrap()).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (30, 30));
+}
+
+/// `fit: "cover"` crops to fill, so it needs both dimensions — one alone is a
+/// build error pointing at the call site.
+#[test]
+fn cover_requires_both_dimensions() {
+    let (ctx, dir) = site(&[(
+        "content/main.typ",
+        "#context asset.image(\"photo.png\", width: 40, fit: \"cover\").url()",
+    )]);
+    std::fs::write(dir.path().join("content/photo.png"), png(100, 50)).unwrap();
+
+    let err = RenderWorld::new(&ctx)
+        .unwrap()
+        .compile_bundle(&mut AssetResolver::new(&ctx))
+        .err()
+        .expect("cover with one dimension should fail");
+    assert!(
+        err.to_string().contains("needs both"),
+        "expected a 'needs both' error, got:\n{err}"
+    );
+}
+
 /// A failed asset build blames the asset call site instead of `<detached>`:
 /// the span threaded through [`AssetRequest`] reaches [`file::build`], so a
 /// missing file's diagnostic names the source file it was referenced from.

@@ -1,0 +1,359 @@
+//! `asset.image` — decode a raster image, optionally resize it, and re-encode
+//! it to a chosen format.
+//!
+//! Like the other asset types it's an *element* ([`ImageAsset`]): calling
+//! `asset.image("photo.jpg", width: 600, format: "webp")` captures the source
+//! path and the processing parameters, and `.url()` / `.read()` resolve that
+//! spec lazily through the asset loop. Every parameter is a settable field, so
+//! `#set asset.image(format: "webp", quality: 80)` configures a whole scope —
+//! the closest thing to Hugo's site-wide `imaging` defaults until twyla grows a
+//! real site-config story.
+//!
+//! Processing model (a deliberately small slice of Hugo's): **width / height /
+//! fit / filter / format / quality**. Drawing-style effects (blur, background
+//! fills, rotation, anchors) are intentionally out of scope — those belong in a
+//! Typst drawing API, not the asset pipeline.
+//!
+//! Encoders: PNG / JPEG / GIF / AVIF go through the `image` crate; lossy WebP
+//! goes through libwebp (the `webp` crate), because `image`'s pure-Rust WebP
+//! encoder is lossless-only and lossless WebP defeats the point for photos.
+
+use std::io::Cursor;
+
+use comemo::Tracked;
+use ecow::{EcoString, EcoVec, eco_format, eco_vec};
+use image::codecs::avif::AvifEncoder;
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::{DynamicImage, ImageEncoder, ImageFormat};
+use typst::World;
+use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
+use typst::foundations::{
+    Bytes, Cast, Content, Context, Packed, PathOrStr, ShowFn, Str, StyleChain, elem, func, scope,
+};
+use typst::loading::{Encoding, Readable};
+use typst::syntax::{FileId, Span};
+use typst_utils::hash128;
+
+use super::{
+    AssetSpec, Built, Upstream, read_or_request, resolve_or_request, resolve_path, show_unresolved,
+};
+use crate::project::TwylaContext;
+use crate::render::Emit;
+
+/// Decode, resize, and re-encode a raster image asset.
+///
+/// ```typ
+/// #context html.elem("img", attrs: (
+///   src: asset.image("photo.jpg", width: 600, format: "webp").url(),
+/// ))
+/// ```
+///
+/// With no `width`/`height` the image is only transcoded (to `format`); with no
+/// `format` it keeps its source format and is only resized. All parameters are
+/// settable, so `#set asset.image(format: "webp")` applies to a whole scope.
+#[elem(scope, name = "image")]
+pub struct ImageAsset {
+    /// Path to the source image, relative to the calling file.
+    #[required]
+    pub path: PathOrStr,
+
+    /// Target width in pixels. With only one of `width`/`height` set the other
+    /// is computed to preserve the aspect ratio; with neither, the image is not
+    /// resized.
+    #[default(None)]
+    pub width: Option<i64>,
+
+    /// Target height in pixels. See [`width`](Self::width).
+    #[default(None)]
+    pub height: Option<i64>,
+
+    /// How the image is fit into `width`×`height` when both are given:
+    /// `"contain"` scales to fit inside the box (aspect preserved), `"cover"`
+    /// scales and crops to fill it (aspect preserved), `"stretch"` forces the
+    /// exact dimensions (aspect distorted). `cover`/`stretch` require both
+    /// dimensions.
+    #[default(Fit::Contain)]
+    pub fit: Fit,
+
+    /// The resampling filter used when scaling. `"lanczos"` (the default) gives
+    /// the best downscaling quality; cheaper options trade quality for speed.
+    #[default(Filter::Lanczos)]
+    pub filter: Filter,
+
+    /// Output format. `{none}` (the default) keeps the source format; otherwise
+    /// the image is transcoded to the named format.
+    #[default(None)]
+    pub format: Option<Format>,
+
+    /// Encoder quality, 1–100, for lossy formats (JPEG, WebP, AVIF). Ignored by
+    /// PNG and GIF.
+    #[default(75)]
+    pub quality: u8,
+}
+
+#[scope]
+impl ImageAsset {
+    /// The resolved, fingerprinted URL of the processed image. Contextual —
+    /// call it inside `#context`.
+    #[func(contextual)]
+    fn url(context: Tracked<Context>, this: Content) -> HintedStrResult<Str> {
+        let elem = this.into_packed::<ImageAsset>().unwrap();
+        let styles = context.styles()?;
+        Ok(resolve_or_request(styles, &spec(&elem, styles)?, elem.span()))
+    }
+
+    /// The processed image's bytes — for inlining instead of linking. Always
+    /// raw `bytes` (an encoded image is not text); the `encoding` argument
+    /// mirrors the other assets' `.read()` but only `none` is meaningful here.
+    #[func(contextual)]
+    fn read(
+        context: Tracked<Context>,
+        this: Content,
+        /// The encoding to read the asset with. Image bytes are binary, so the
+        /// useful value is `{none}` (raw bytes).
+        #[named]
+        #[default(None)]
+        encoding: Option<Encoding>,
+    ) -> HintedStrResult<Readable> {
+        let elem = this.into_packed::<ImageAsset>().unwrap();
+        let styles = context.styles()?;
+        read_or_request(styles, &spec(&elem, styles)?, elem.span(), encoding)
+    }
+}
+
+/// Build an element's [`AssetSpec`] from its (style-resolved) fields.
+fn spec(elem: &Packed<ImageAsset>, styles: StyleChain) -> HintedStrResult<AssetSpec> {
+    Ok(AssetSpec::Image {
+        file: resolve_path(&elem.path, elem.span())?,
+        width: dim(elem.width.get(styles))?,
+        height: dim(elem.height.get(styles))?,
+        fit: elem.fit.get(styles),
+        filter: elem.filter.get(styles),
+        format: elem.format.get(styles),
+        quality: elem.quality.get(styles),
+    })
+}
+
+/// Validate a user-supplied dimension: positive, fits in `u32`. `None` passes
+/// through (the dimension is unconstrained).
+fn dim(value: Option<i64>) -> HintedStrResult<Option<u32>> {
+    match value {
+        None => Ok(None),
+        Some(v) if v > 0 && v <= u32::MAX as i64 => Ok(Some(v as u32)),
+        Some(v) => Err(eco_format!("image dimension must be a positive integer, got {v}").into()),
+    }
+}
+
+/// Default show: a bare `asset.image(..)` cannot be rendered — resolve it with
+/// `.url()`/`.read()`. Registered for the in-page targets in [`crate::rules`].
+pub const SHOW_RULE: ShowFn<ImageAsset> =
+    |elem, _engine, _styles| show_unresolved(elem.span(), "image");
+
+/// How an image is fit into the requested `width`×`height`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Cast)]
+pub enum Fit {
+    /// Scale to fit *inside* the box, preserving aspect ratio (no crop).
+    Contain,
+    /// Scale and crop to *fill* the box, preserving aspect ratio.
+    Cover,
+    /// Scale to the exact dimensions, distorting aspect ratio.
+    Stretch,
+}
+
+/// Resampling filter used when scaling, mapped onto [`image`]'s [`FilterType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Cast)]
+pub enum Filter {
+    /// Nearest-neighbor — fastest, blocky.
+    Nearest,
+    /// Linear (triangle) filter.
+    Triangle,
+    /// Cubic (Catmull-Rom) filter.
+    CatmullRom,
+    /// Gaussian filter.
+    Gaussian,
+    /// Lanczos with window 3 — best downscaling quality.
+    Lanczos,
+}
+
+impl From<Filter> for FilterType {
+    fn from(f: Filter) -> Self {
+        match f {
+            Filter::Nearest => FilterType::Nearest,
+            Filter::Triangle => FilterType::Triangle,
+            Filter::CatmullRom => FilterType::CatmullRom,
+            Filter::Gaussian => FilterType::Gaussian,
+            Filter::Lanczos => FilterType::Lanczos3,
+        }
+    }
+}
+
+/// Output image format. `None` on the spec means "keep the source format".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Cast)]
+pub enum Format {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+    Avif,
+}
+
+impl Format {
+    /// The output file extension (also the static server's Content-Type key).
+    fn ext(self) -> &'static str {
+        match self {
+            Format::Png => "png",
+            Format::Jpeg => "jpg",
+            Format::Gif => "gif",
+            Format::Webp => "webp",
+            Format::Avif => "avif",
+        }
+    }
+
+    /// Map the `image` crate's detected source format to one of ours, for the
+    /// "keep source format" (`format: none`) case. Returns `None` for formats
+    /// we can't re-encode (e.g. an exotic input) — the caller errors.
+    fn from_detected(format: ImageFormat) -> Option<Format> {
+        match format {
+            ImageFormat::Png => Some(Format::Png),
+            ImageFormat::Jpeg => Some(Format::Jpeg),
+            ImageFormat::Gif => Some(Format::Gif),
+            ImageFormat::WebP => Some(Format::Webp),
+            ImageFormat::Avif => Some(Format::Avif),
+            _ => None,
+        }
+    }
+}
+
+/// Decode the source image, resize it per `fit`/`filter` (if any dimension is
+/// given), and re-encode it to `format` (or the source format) at `quality`.
+///
+/// The source is read from disk (so it joins the asset's `upstream` set for
+/// invalidation/watching) rather than through the tracked World: like
+/// [`file::build`](super::file::build), the bytes are an asset input, not a
+/// typst dependency of the page.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build(
+    _world: Tracked<dyn World + '_>,
+    file: FileId,
+    width: Option<u32>,
+    height: Option<u32>,
+    fit: Fit,
+    filter: Filter,
+    format: Option<Format>,
+    quality: u8,
+    ctx: &TwylaContext,
+    span: Span,
+) -> SourceResult<Built> {
+    let on_disk = ctx.root.join(file.vpath().get_without_slash());
+    let (upstream, bytes) = Upstream::new_read_bytes(on_disk).map_err(|err| err_at(span, err))?;
+
+    // Detect the source format up front: it drives both decoding and the
+    // "keep source format" default.
+    let detected = image::guess_format(&bytes).map_err(|err| {
+        err_at(span, format_args!("not a recognized image: {err}"))
+    })?;
+    let out_format = match format {
+        Some(f) => f,
+        None => Format::from_detected(detected).ok_or_else(|| {
+            err_at(span, format_args!("cannot re-encode {detected:?} images; set an explicit `format`"))
+        })?,
+    };
+
+    let img = image::load_from_memory_with_format(&bytes, detected)
+        .map_err(|err| err_at(span, format_args!("failed to decode image: {err}")))?;
+    let img = resize(img, width, height, fit, filter.into(), span)?;
+    let encoded = encode(&img, out_format, quality).map_err(|err| err_at(span, err))?;
+
+    let stem = upstream
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned);
+    let bytes = Bytes::new(encoded);
+    Ok(Built {
+        content_hash: hash128(&bytes),
+        emit: Emit::Bytes(bytes),
+        upstream: vec![upstream],
+        ext: Some(out_format.ext().to_owned()),
+        stem,
+    })
+}
+
+/// Resize per the fit mode, or return the image untouched when no dimension is
+/// requested. `cover`/`stretch` need both dimensions; `contain` accepts one
+/// (the other is left unconstrained, so the set dimension binds).
+fn resize(
+    img: DynamicImage,
+    width: Option<u32>,
+    height: Option<u32>,
+    fit: Fit,
+    filter: FilterType,
+    span: Span,
+) -> SourceResult<DynamicImage> {
+    match (width, height) {
+        (None, None) => Ok(img),
+        _ => match fit {
+            // `resize` fits *within* (w, h) preserving aspect; an unset side
+            // becomes `u32::MAX` so the set side is the binding constraint.
+            Fit::Contain => Ok(img.resize(
+                width.unwrap_or(u32::MAX),
+                height.unwrap_or(u32::MAX),
+                filter,
+            )),
+            Fit::Cover => {
+                let (w, h) = both(width, height, "cover", span)?;
+                Ok(img.resize_to_fill(w, h, filter))
+            }
+            Fit::Stretch => {
+                let (w, h) = both(width, height, "stretch", span)?;
+                Ok(img.resize_exact(w, h, filter))
+            }
+        },
+    }
+}
+
+/// Require both dimensions for a fit mode that crops/stretches.
+fn both(width: Option<u32>, height: Option<u32>, mode: &str, span: Span) -> SourceResult<(u32, u32)> {
+    match (width, height) {
+        (Some(w), Some(h)) => Ok((w, h)),
+        _ => Err(err_at(
+            span,
+            format_args!("`fit: \"{mode}\"` needs both `width` and `height`"),
+        )),
+    }
+}
+
+/// Encode a decoded image to the target format. PNG/JPEG/GIF/AVIF go through the
+/// `image` crate; WebP routes through libwebp for lossy output (see the module
+/// docs).
+fn encode(img: &DynamicImage, format: Format, quality: u8) -> Result<Vec<u8>, EcoString> {
+    let mut buf = Vec::new();
+    match format {
+        Format::Png => img
+            .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .map_err(|e| eco_format!("PNG encode failed: {e}"))?,
+        Format::Gif => img
+            .write_to(&mut Cursor::new(&mut buf), ImageFormat::Gif)
+            .map_err(|e| eco_format!("GIF encode failed: {e}"))?,
+        Format::Jpeg => JpegEncoder::new_with_quality(&mut buf, quality)
+            .encode_image(img)
+            .map_err(|e| eco_format!("JPEG encode failed: {e}"))?,
+        Format::Avif => AvifEncoder::new_with_speed_quality(&mut buf, 4, quality)
+            .write_image(img.as_bytes(), img.width(), img.height(), img.color().into())
+            .map_err(|e| eco_format!("AVIF encode failed: {e}"))?,
+        // `image`'s WebP encoder is lossless-only; libwebp does lossy at the
+        // requested quality. `from_image` handles the RGB/RGBA conversion.
+        Format::Webp => {
+            let encoder = webp::Encoder::from_image(img)
+                .map_err(|e| eco_format!("WebP encode failed: {e}"))?;
+            buf = encoder.encode(quality as f32).to_vec();
+        }
+    }
+    Ok(buf)
+}
+
+/// A spanned image error from any `Display` payload.
+fn err_at(span: Span, msg: impl std::fmt::Display) -> EcoVec<SourceDiagnostic> {
+    eco_vec![SourceDiagnostic::error(span, EcoString::from(msg.to_string()))]
+}

@@ -50,6 +50,16 @@ serde_yaml = "0.9"
 # `default-features = false` drops grass's bundled CLI binary (and its clap dep).
 grass = { version = "0.13", default-features = false }
 
+# Raster image decode/resize/re-encode for `asset.image`. Already in the tree
+# via typst; depending on it directly (and unifying the `avif` feature onto the
+# shared build) lets us drive the resize/transcode pipeline. `avif` turns on
+# AVIF *encoding* via ravif/rav1e — twyla isn't a lightweight binary (we vendor
+# rolldown), so the heavier encoder is fine. Lossy WebP encoding is the one gap
+# the pure-Rust `image` stack still has (its WebP encoder is lossless-only), so
+# `asset.image`'s `format: "webp"` routes through libwebp via the `webp` crate.
+image = { version = "0.25", features = ["avif"] }
+webp = "0.3"
+
 # Heading-anchor slugs. Zola's own dependency, so `= My Heading` →
 # `id="my-heading"` matches zola's auto-anchors byte-for-byte (including
 # unicode transliteration). Used by the native heading HTML rule.

@@ -39,6 +39,7 @@
 #![allow(clippy::mutable_key_type)]
 
 pub(crate) mod file;
+pub(crate) mod image;
 mod raw;
 pub(crate) mod sass;
 
@@ -99,6 +100,19 @@ pub enum AssetSpec {
         /// Output extension (drives the static server's Content-Type), sniffed
         /// by the caller; `None` → `bin`.
         ext: Option<EcoString>,
+    },
+    /// Decode, resize, and re-encode a raster image. See [`image`]. Every field
+    /// is part of the key, so two `asset.image` calls that differ in any
+    /// processing parameter resolve to distinct outputs.
+    Image {
+        file: FileId,
+        width: Option<u32>,
+        height: Option<u32>,
+        fit: image::Fit,
+        filter: image::Filter,
+        /// `None` keeps the source format.
+        format: Option<image::Format>,
+        quality: u8,
     },
 }
 
@@ -265,6 +279,7 @@ pub fn module() -> Module {
     let mut scope = Scope::new();
     scope.define_elem::<file::FileAsset>();
     scope.define_elem::<sass::SassAsset>();
+    scope.define_elem::<image::ImageAsset>();
     Module::new("asset", scope)
 }
 
@@ -619,6 +634,17 @@ impl AssetResolver {
             }
             // `Raw` is in-memory bytes — it can't fail, so it needs no span.
             AssetSpec::Raw { bytes, ext } => raw::build(bytes.clone(), ext.clone()),
+            AssetSpec::Image {
+                file,
+                width,
+                height,
+                fit,
+                filter,
+                format,
+                quality,
+            } => image::build(
+                world, *file, *width, *height, *fit, *filter, *format, *quality, &self.ctx, span,
+            )?,
         };
 
         let output_path = self.ctx.default_asset_output(&built);
