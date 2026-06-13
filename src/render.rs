@@ -386,7 +386,7 @@ impl RenderWorld {
             .with_features([Feature::Html, Feature::Bundle].into_iter().collect())
             .with_inputs(inputs)
             .build();
-        install_stdlib(&mut library);
+        install_stdlib(&mut library, ctx.reflect);
 
         Ok(Self {
             ctx,
@@ -509,12 +509,19 @@ fn duplication_error(err: iddqd::errors::DuplicateItem<Output, &Output>) -> (Ren
 }
 
 /// Install twyla's native customizations into a freshly built library.
-pub fn install_stdlib(library: &mut Library) {
+///
+/// When `reflect` is set (the `--reflect` / `TWYLA_REFLECT` opt-in), also splice
+/// in the `twyla-reflect` module so twyla's own reference site can introspect
+/// the builtins it documents.
+pub fn install_stdlib(library: &mut Library, reflect: bool) {
     crate::rules::install(&mut library.rules);
     let global = library.global.scope_mut();
     crate::document::install(global);
     crate::asset::install(global);
     crate::content::install(global);
+    if reflect {
+        crate::reflect::install(global);
+    }
 }
 
 /// FileLoader for [`FileStore`]. Serves the (empty) virtual main from

@@ -64,8 +64,7 @@ pub struct TwylaDocument {
 
     /// What kind of page this is, e.g. `"post"` or `"page"` — used to group
     /// pages in listings and feeds, and to pick the `{kind}-template` a
-    /// `convert` draft shows. If `auto`, defaults from the source filename
-    /// ([`TwylaContext::default_kind`](crate::project::TwylaContext::default_kind)):
+    /// `convert` draft shows. If `auto`, defaults from the source filename:
     /// - "root" for `content/main.typ` (the site index)
     /// - "dir" for `content/<dir>/main.typ` (a section index)
     /// - "page" for any other file

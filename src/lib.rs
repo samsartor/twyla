@@ -20,6 +20,7 @@ pub mod document;
 pub mod html;
 pub mod import;
 pub mod project;
+pub mod reflect;
 pub mod render;
 pub mod rules;
 pub mod serve;

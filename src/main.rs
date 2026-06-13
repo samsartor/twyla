@@ -56,6 +56,11 @@ struct ContextArgs {
     /// asset URLs land.
     #[arg(long, env = "TWYLA_BASE_URL", global = true)]
     base_url: Option<String>,
+    /// Expose the `twyla-reflect` module so documents can introspect twyla's
+    /// native builtins (used to build twyla's own reference site). Off by
+    /// default; the normal site build never sees it.
+    #[arg(long, env = "TWYLA_REFLECT", global = true)]
+    reflect: bool,
 }
 
 impl ContextArgs {
@@ -68,7 +73,8 @@ impl ContextArgs {
             None => std::env::current_dir()
                 .map_err(|e| format!("cannot read current directory: {e}"))?,
         };
-        let ctx = TwylaContext::new(&root, self.base_url)?;
+        let mut ctx = TwylaContext::new(&root, self.base_url)?;
+        ctx.reflect = self.reflect;
         if !ctx.content_dir().is_dir() {
             return Err(format!(
                 "no `content/` directory under {} — run twyla from \
