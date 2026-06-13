@@ -486,4 +486,43 @@ mod tests {
             "page did not see its derived output (regressed to `auto`?):\n{html}"
         );
     }
+
+    /// TARGET, blocked on `document.url()`: an inline document *consumed by a
+    /// method* — never shown — must still be discovered and emitted. Today
+    /// discovery rides the show rule (`document::RENDER_NOTHING`), so a document
+    /// that `.url()` swallows before realization would route nothing, and the
+    /// `src` here would dangle. The fix is backup discovery inside `.url()`
+    /// (mirroring assets), deduped by output — see the discovery-eagerness
+    /// discussion. Un-ignore when `document.url()` lands.
+    #[test]
+    #[ignore = "blocked on document.url() + method-side discovery"]
+    fn document_consumed_by_url_is_still_emitted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("content")).unwrap();
+        std::fs::write(
+            dir.path().join("content/main.typ"),
+            "#html.elem(\"iframe\", attrs: (\n  \
+               src: document(output: \"sub/index.html\")[Sub body].url(),\n))",
+        )
+        .unwrap();
+        let ctx = TwylaContext::new(dir.path(), Some("https://example.com".into())).unwrap();
+        let world = RenderWorld::new(&ctx).unwrap();
+        let mut resolver = AssetResolver::new(&world.ctx);
+        let outputs = world.compile_bundle(&mut resolver).unwrap();
+
+        // The swallowed document is emitted as its own output, body intact.
+        let sub = match outputs.get("sub/index.html") {
+            Some(crate::render::Output::Doc(d)) => d.html.clone(),
+            other => panic!("sub document not emitted: {other:?}"),
+        };
+        assert!(sub.contains("Sub body"), "sub body missing:\n{sub}");
+
+        // The iframe on the main page points at the resolved sub URL, not a
+        // leftover asset/placeholder.
+        let main = match outputs.get("index.html") {
+            Some(crate::render::Output::Doc(d)) => d.html.clone(),
+            other => panic!("main page missing: {other:?}"),
+        };
+        assert!(main.contains("/sub/"), "iframe src not resolved:\n{main}");
+    }
 }

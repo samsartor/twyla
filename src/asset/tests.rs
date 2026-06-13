@@ -169,6 +169,54 @@ fn raw_html_inlines_a_read_asset() {
     );
 }
 
+/// `#set asset.sass(minify: false)` reaches the asset spec. The migrated
+/// `asset.sass` element carries `minify` as a *settable* field, so a set rule
+/// flips grass to its expanded style — proving set-rule support, the point of
+/// making assets elements. (Compressed default would emit `color:red`.)
+#[test]
+fn set_rule_toggles_sass_minify() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#set asset.sass(minify: false)\n\
+             #context str(asset.sass(\"theme.scss\").read(encoding: none))",
+        ),
+        ("content/theme.scss", "a { color: red; }"),
+    ]);
+    let (html, _assets) = compile(&RenderWorld::new(&ctx).unwrap());
+
+    assert!(
+        html.contains("color: red"),
+        "set asset.sass(minify: false) did not produce expanded CSS:\n{html}"
+    );
+    assert!(
+        !html.contains("__twyla-asset-pending__"),
+        "placeholder leaked:\n{html}"
+    );
+}
+
+/// A bare asset element left in markup (never resolved via `.url()`/`.read()`)
+/// reaches realization and is refused by the default show rule with a helpful
+/// error, rather than mis-rendering.
+#[test]
+fn bare_asset_in_markup_is_refused() {
+    let (ctx, _dir) = site(&[
+        ("content/main.typ", "#asset.file(\"logo.svg\")"),
+        ("content/logo.svg", "<svg/>"),
+    ]);
+    let world = RenderWorld::new(&ctx).unwrap();
+    let mut resolver = AssetResolver::new(&world.ctx);
+    let err = world
+        .compile_bundle(&mut resolver)
+        .err()
+        .expect("a bare asset in markup should error")
+        .to_string();
+    assert!(
+        err.contains("cannot be shown directly"),
+        "expected a show-refusal error, got: {err}"
+    );
+}
+
 /// Two *separate* resolvers in one process (sharing comemo's global cache) must
 /// each resolve independently — the per-resolver epoch base prevents one from
 /// hitting the other's cached placeholder.

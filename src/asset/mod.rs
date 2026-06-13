@@ -38,9 +38,9 @@
 // it's a sound `HashMap` key (the same reason typst hashes `Bytes` freely).
 #![allow(clippy::mutable_key_type)]
 
-mod file;
+pub(crate) mod file;
 mod raw;
-mod sass;
+pub(crate) mod sass;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug, Formatter};
@@ -53,15 +53,15 @@ use std::{fs, io};
 
 use comemo::Tracked;
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use ecow::{EcoString, eco_format};
+use ecow::{EcoString, eco_format, eco_vec};
 use typst::World;
-use typst::diag::{At, HintedStrResult, SourceResult};
+use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{
-    Binding, Bytes, Context, Module, PathOrStr, Repr, Scope, Str, Style, StyleChain, Value, elem,
-    func, scope, ty,
+    Binding, Bytes, Content, Module, PathOrStr, Repr, Scope, Str, Style, StyleChain, Value, elem,
+    ty,
 };
 use typst::loading::{Encoding, Readable};
-use typst::syntax::{FileId, Spanned, VirtualRoot};
+use typst::syntax::{FileId, Span, VirtualRoot};
 use typst::utils::LazyHash;
 use typst_utils::hash128;
 
@@ -115,71 +115,16 @@ pub struct AssetRequest {
     pub spec: AssetSpec,
 }
 
-/// A handle to an asset, returned by `asset.file(..)` / `asset.sass(..)`.
-///
-/// Pure and eval-time: it just captures the [`AssetRequest`]. Resolve its URL
-/// with `.url()` **inside a `#context` block** — that's where the injected
-/// resolved-map is readable.
-#[ty(scope)]
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Asset {
-    request: AssetRequest,
-}
-
-impl Asset {
-    /// Build a handle from a spec (used by the per-type constructors).
-    pub(crate) fn new(spec: AssetSpec) -> Self {
-        Self {
-            request: AssetRequest { spec },
-        }
-    }
-}
-
-#[scope]
-impl Asset {
-    /// The resolved, fingerprinted URL of this asset (e.g.
-    /// `/assets/main-<hash>.css`).
-    ///
-    /// Contextual — call it inside `#context`:
-    ///
-    /// ```typ
-    /// #context html.elem("link", attrs: (
-    ///   rel: "stylesheet",
-    ///   href: asset.sass("main.scss").url(),
-    /// ))
-    /// ```
-    #[func(contextual)]
-    fn url(&self, context: Tracked<Context>) -> HintedStrResult<Str> {
-        Ok(resolve_or_request(context.styles()?, &self.request.spec))
-    }
-
-    /// The asset's resolved output (e.g. compiled CSS, or a file's contents) —
-    /// for inlining instead of linking. Mirrors the native
-    /// [`read`]($read): UTF-8 `str` by default, raw `bytes` with
-    /// `encoding: none`.
-    ///
-    /// Contextual, like [`url`](Self::url) — call it inside `#context`:
-    ///
-    /// ```typ
-    /// #context html.elem("style", asset.sass("main.scss").read())
-    /// #context raw-html(asset.file("icon.svg").read())
-    /// ```
-    ///
-    /// Reads path-backed assets from disk on demand, so it never holds the
-    /// bytes in RAM longer than the call.
-    #[func(contextual)]
-    fn read(
-        &self,
-        context: Tracked<Context>,
-        /// The encoding to read the asset with. If `{none}`, returns raw bytes;
-        /// otherwise the bytes are decoded as UTF-8 into a string.
-        #[named]
-        #[default(Some(Encoding::Utf8))]
-        encoding: Option<Encoding>,
-    ) -> HintedStrResult<Readable> {
-        read_or_request(context.styles()?, &self.request.spec, encoding)
-    }
-}
+// Assets are *elements* ([`file::FileAsset`], [`sass::SassAsset`]), not a
+// single handle type. Each element captures its source fields (so
+// `#set asset.sass(minify: false)` works) and exposes the same two contextual
+// scope methods — `.url()` and `.read()` — that build an [`AssetSpec`] from
+// those fields and resolve it off the style chain. The element→spec→resolve
+// machinery they share lives here: [`resolve_or_request`] / [`read_or_request`]
+// (the placeholder protocol) and [`unresolved_asset_show`] (the default show
+// rule, which refuses to render a bare asset). Discovery is *lazy*: it happens
+// only when `.url()`/`.read()` actually run, so an asset that's never used is
+// never built. See the module docs and [[twyla_element_scope_methods_spike]].
 
 /// The placeholder protocol every `asset.*` consumer obeys, in one place: look
 /// the spec up in the injected resolved-map ([`TwylaAssetMap`]) and either
@@ -274,33 +219,39 @@ fn decode_empty(encoding: Option<Encoding>) -> Readable {
     }
 }
 
-impl Repr for Asset {
-    fn repr(&self) -> EcoString {
-        EcoString::inline("asset(..)")
-    }
-}
-
 /// Placeholder URL returned for an as-yet-unresolved asset. By convergence
 /// every consumer has re-run against a populated map, so this never survives
 /// into output (a leak means non-convergence — a bug).
 const ASSET_PENDING: &str = "/__twyla-asset-pending__";
 
-/// Resolve a path argument to the `FileId` it names, relative to the calling
-/// file (mirrors how `read`/`image` resolve their paths). Shared by the
-/// per-type constructors.
-pub(crate) fn resolve_path(path: Spanned<PathOrStr>) -> SourceResult<FileId> {
-    Ok(path
-        .v
-        .resolve_if_some(path.span.id())
-        .at(path.span)?
-        .intern())
+/// Resolve an asset element's `path` field to the `FileId` it names, relative
+/// to `span`'s file (the file the asset call was written in — mirrors how
+/// `read`/`image` resolve their paths). Shared by the element `.url()`/`.read()`
+/// methods, which resolve lazily off the element's own span.
+pub(crate) fn resolve_path(path: &PathOrStr, span: Span) -> HintedStrResult<FileId> {
+    Ok(path.resolve_if_some(span.id())?.intern())
+}
+
+/// Default show for a bare asset element: refuse to render. An asset exists to
+/// hand back a `url`/bytes; one that reaches realization was never resolved
+/// (`.url()`/`.read()` consume the element before it can be shown), so there is
+/// nothing meaningful to render. Per-element `ShowFn`s delegate here.
+pub(crate) fn show_unresolved(span: Span, name: &str) -> SourceResult<Content> {
+    Err(eco_vec![
+        SourceDiagnostic::error(span, eco_format!("`asset.{name}` cannot be shown directly"))
+            .with_hint(eco_format!(
+                "resolve it inside a `#context` block — `.url()` to link it, `.read()` to inline it"
+            ))
+    ])
 }
 
 /// Build the `asset` module (`asset.file`, `asset.sass`) for the global scope.
+/// Each name binds an *element* so `#set asset.sass(..)` works (see
+/// [`file::FileAsset`] / [`sass::SassAsset`]).
 pub fn module() -> Module {
     let mut scope = Scope::new();
-    scope.define_func::<file::file>();
-    scope.define_func::<sass::sass>();
+    scope.define_elem::<file::FileAsset>();
+    scope.define_elem::<sass::SassAsset>();
     Module::new("asset", scope)
 }
 

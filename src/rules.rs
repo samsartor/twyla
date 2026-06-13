@@ -51,6 +51,15 @@ pub fn install(rules: &mut NativeRuleMap) {
     // left rule-less so the element survives realization for discovery.
     rules.register(Target::Html, crate::document::RENDER_NOTHING);
     rules.register(Target::Paged, crate::document::RENDER_NOTHING);
+
+    // Assets are consumed via `.url()`/`.read()` (which discard the element), so
+    // they never reach realization in normal use. A bare `#asset.file(..)` left
+    // in markup *does* — these rules turn that into a helpful error instead of a
+    // silent mis-render. `register`: twyla owns these elements.
+    rules.register(Target::Html, crate::asset::file::SHOW_RULE);
+    rules.register(Target::Paged, crate::asset::file::SHOW_RULE);
+    rules.register(Target::Html, crate::asset::sass::SHOW_RULE);
+    rules.register(Target::Paged, crate::asset::sass::SHOW_RULE);
 }
 
 /// Heading id: an explicit label wins (so `#link(<slug>)` → `#slug`

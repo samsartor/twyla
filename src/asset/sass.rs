@@ -14,31 +14,89 @@ use std::path::Path;
 use comemo::Tracked;
 use ecow::{EcoString, eco_format, eco_vec};
 use typst::World;
-use typst::diag::{SourceDiagnostic, SourceResult};
-use typst::foundations::{Bytes, PathOrStr, func};
-use typst::syntax::{FileId, Span, Spanned};
+use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
+use typst::foundations::{
+    Bytes, Content, Context, PathOrStr, ShowFn, Str, elem, func, scope,
+};
+use typst::loading::{Encoding, Readable};
+use typst::syntax::{FileId, Span};
 use typst_utils::hash128;
 
-use super::{Asset, AssetSpec, Built, Upstream, resolve_path};
-use crate::render::Emit;
+use super::{
+    AssetSpec, Built, Upstream, read_or_request, resolve_or_request, resolve_path, show_unresolved,
+};
 use crate::project::TwylaContext;
+use crate::render::Emit;
 
 /// Compile a Sass/SCSS file to a fingerprinted CSS asset.
-#[func]
-pub fn sass(
+///
+/// `minify` is a settable field, so `#set asset.sass(minify: false)` switches a
+/// whole page (or site) to expanded output.
+///
+/// ```typ
+/// #context html.elem("link", attrs: (
+///   rel: "stylesheet",
+///   href: asset.sass("main.scss").url(),
+/// ))
+/// ```
+#[elem(scope, name = "sass")]
+pub struct SassAsset {
     /// Path to the `.sass`/`.scss` file, relative to the calling file.
-    path: Spanned<PathOrStr>,
+    #[required]
+    pub path: PathOrStr,
+
     /// Minify the output with grass's compressed style (strips whitespace,
-    /// comments, and other redundant characters).
-    #[named]
+    /// comments, and other redundant characters). Part of the asset key, so the
+    /// minified and expanded builds of one file resolve to distinct assets.
     #[default(true)]
-    minify: bool,
-) -> SourceResult<Asset> {
-    Ok(Asset::new(AssetSpec::Sass {
-        file: resolve_path(path)?,
-        minify,
-    }))
+    pub minify: bool,
 }
+
+#[scope]
+impl SassAsset {
+    /// The resolved, fingerprinted URL of the compiled CSS (e.g.
+    /// `/assets/main-<hash>.css`). Contextual — call it inside `#context`.
+    ///
+    /// `context` precedes the `this` self-positional — see [`super::file`] for
+    /// why (the `#[func]` macro's special-param ordering).
+    #[func(contextual)]
+    fn url(context: Tracked<Context>, this: Content) -> HintedStrResult<Str> {
+        let elem = this.into_packed::<SassAsset>().unwrap();
+        let styles = context.styles()?;
+        let spec = AssetSpec::Sass {
+            file: resolve_path(&elem.path, elem.span())?,
+            minify: elem.minify.get(styles),
+        };
+        Ok(resolve_or_request(styles, &spec))
+    }
+
+    /// The compiled CSS — for inlining instead of linking. Mirrors the native
+    /// [`read`]($read): UTF-8 `str` by default, raw `bytes` with
+    /// `encoding: none`. Contextual.
+    #[func(contextual)]
+    fn read(
+        context: Tracked<Context>,
+        this: Content,
+        /// The encoding to read the asset with. If `{none}`, returns raw bytes;
+        /// otherwise the bytes are decoded as UTF-8 into a string.
+        #[named]
+        #[default(Some(Encoding::Utf8))]
+        encoding: Option<Encoding>,
+    ) -> HintedStrResult<Readable> {
+        let elem = this.into_packed::<SassAsset>().unwrap();
+        let styles = context.styles()?;
+        let spec = AssetSpec::Sass {
+            file: resolve_path(&elem.path, elem.span())?,
+            minify: elem.minify.get(styles),
+        };
+        read_or_request(styles, &spec, encoding)
+    }
+}
+
+/// Default show: a bare `asset.sass(..)` cannot be rendered — resolve it with
+/// `.url()`/`.read()`. Registered for the in-page targets in [`crate::rules`].
+pub const SHOW_RULE: ShowFn<SassAsset> =
+    |elem, _engine, _styles| show_unresolved(elem.span(), "sass");
 
 /// Read the entry, compile it (recording every imported file), fingerprint the
 /// CSS output, and emit it as bytes.
