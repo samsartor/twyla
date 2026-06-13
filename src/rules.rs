@@ -35,7 +35,7 @@ use typst_library::visualize::{
     ExchangeFormat, ImageElem, ImageFormat, RasterFormat, VectorFormat,
 };
 
-use crate::asset::{AssetSpec, resolve_or_request};
+use crate::asset::{AssetSpec, ImageSource, image, resolve_image_or_request, resolve_or_request};
 
 /// Install twyla's native HTML rules into a freshly built library's
 /// rule map. Call from [`crate::prelude::install`] after
@@ -167,41 +167,66 @@ const LINK_RULE: ShowFn<LinkElem> = |elem, engine, _| {
 /// `<img src>` points at a real, fingerprinted asset URL instead of upstream's
 /// base64-inline (`WebImage::to_base64_url`) — twyla emits images as files, so
 /// the page references them. The src resolves through the asset system's
-/// placeholder protocol ([`resolve_or_request`]) off the show rule's live
-/// `styles`, so a plain markdown `![](foo.png)` works with no `#context`.
+/// placeholder protocol off the show rule's live `styles`, so a plain markdown
+/// `![](foo.png)` works with no `#context`.
 ///
-/// A path-backed image becomes a verbatim [`AssetSpec::File`] (fingerprinted
-/// copy). An inline/byte-source image — no project `FileId` — falls back to a
-/// content-addressed [`AssetSpec::Raw`] built from the bytes typst already
-/// loaded, with its extension sniffed from those bytes ([`image_ext`]).
+/// **Raster images** (PNG/JPEG/GIF/WebP/…) route through the full `asset.image`
+/// pipeline ([`AssetSpec::Image`]), so a markdown `![](photo.png)` behaves like
+/// `#show image: it => img(src: asset.image(it.path).url())` — it transcodes /
+/// resizes per any `#set asset.image(..)` on the chain ([`image::spec_from_styles`])
+/// and emits the output's intrinsic `width`/`height` (from the decode the
+/// pipeline does anyway) for layout reservation. A path-backed image becomes an
+/// [`ImageSource::File`] (read + watched), an inline/byte-source image an
+/// [`ImageSource::Bytes`].
+///
+/// **Vector images** (SVG/PDF) can't be raster-processed, so they stay verbatim:
+/// a path-backed one is a fingerprinted [`AssetSpec::File`] copy, a byte-source
+/// one a content-addressed [`AssetSpec::Raw`] with its extension sniffed from the
+/// bytes ([`image_ext`]).
 const IMAGE_RULE: ShowFn<ImageElem> = |elem, _engine, styles| {
     let span = elem.span();
     let Derived { source, derived: loaded } = &elem.source;
 
-    // A `File` asset needs a project `FileId`; only a resolvable path has one.
+    // A project `FileId` (for File-backed assets) needs a resolvable path.
     let file = match source {
-        DataSource::Path(path) => path.resolve_if_some(span.id()).ok(),
+        DataSource::Path(path) => path.resolve_if_some(span.id()).ok().map(|r| r.intern()),
         DataSource::Bytes(_) => None,
     };
-    let spec = match file {
-        Some(rooted) => AssetSpec::File { file: rooted.intern() },
-        None => AssetSpec::Raw {
-            bytes: loaded.data.clone(),
-            ext: image_ext(&loaded.data),
-        },
-    };
 
-    let src = resolve_or_request(styles, &spec, span);
+    // Only raster formats can go through the decode/resize/transcode pipeline;
+    // vectors are copied verbatim.
+    let raster = matches!(ImageFormat::detect(&loaded.data), Some(ImageFormat::Raster(_)));
+
+    let (src, dimensions) = if raster {
+        let img_source = match file {
+            Some(file) => ImageSource::File(file),
+            None => ImageSource::Bytes(loaded.data.clone()),
+        };
+        let spec = image::spec_from_styles(img_source, styles).at(span)?;
+        let resolved = resolve_image_or_request(styles, &spec, span);
+        (resolved.url, resolved.dimensions)
+    } else {
+        let spec = match file {
+            Some(file) => AssetSpec::File { file },
+            None => AssetSpec::Raw {
+                bytes: loaded.data.clone(),
+                ext: image_ext(&loaded.data),
+            },
+        };
+        (resolve_or_request(styles, &spec, span), None)
+    };
 
     let mut img = HtmlElem::new(tag::img).with_attr(attr::src, src.as_str());
     if let Some(alt) = elem.alt.get_cloned(styles) {
         img = img.with_attr(attr::alt, alt);
     }
-
-    // TODO: emit width/height for layout reservation. Upstream fully decodes
-    // every image just to read intrinsic dimensions for these attrs; we skip
-    // that until `AssetSpec::Image` lands and reports dimensions as part of the
-    // decode it has to do anyway.
+    // Intrinsic pixel dimensions reserve the image's box before it loads,
+    // avoiding layout shift; present once the asset resolves (a miss has none).
+    if let Some((w, h)) = dimensions {
+        img = img
+            .with_attr(attr::width, eco_format!("{w}"))
+            .with_attr(attr::height, eco_format!("{h}"));
+    }
     Ok(BlockElem::packed(img.pack().spanned(span)))
 };
 

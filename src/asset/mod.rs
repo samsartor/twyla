@@ -102,10 +102,10 @@ pub enum AssetSpec {
         ext: Option<EcoString>,
     },
     /// Decode, resize, and re-encode a raster image. See [`image`]. Every field
-    /// is part of the key, so two `asset.image` calls that differ in any
-    /// processing parameter resolve to distinct outputs.
+    /// is part of the key, so two image references that differ in any processing
+    /// parameter resolve to distinct outputs.
     Image {
-        file: FileId,
+        source: ImageSource,
         width: Option<u32>,
         height: Option<u32>,
         fit: image::Fit,
@@ -114,6 +114,19 @@ pub enum AssetSpec {
         format: Option<image::Format>,
         quality: u8,
     },
+}
+
+/// Where a processed image's source bytes come from. The `asset.image` element
+/// only ever produces [`File`](ImageSource::File); the native image rule
+/// ([`crate::rules`]) produces either, since a markdown `![](x)` /
+/// `#image(..)` can be path- or bytes-backed (mirroring [`File`](AssetSpec::File)
+/// vs [`Raw`](AssetSpec::Raw) for verbatim assets).
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub enum ImageSource {
+    /// A project file, read from disk (and watched). Fingerprinted by content.
+    File(FileId),
+    /// In-memory bytes (an inline image), content-addressed by the bytes.
+    Bytes(Bytes),
 }
 
 /// Marker `Eq` for the `Raw` variant's non-`Eq` `Bytes` field. Sound because
@@ -186,8 +199,8 @@ fn resolve_with<T>(
 }
 
 /// Resolve a spec's URL off the style chain, or request it (returns
-/// [`ASSET_PENDING`] on a miss). Shared by [`Asset::url`] and the native image
-/// rule.
+/// [`ASSET_PENDING`] on a miss). Shared by the asset elements' `.url()` and the
+/// native image rule's vector path.
 pub(crate) fn resolve_or_request(styles: StyleChain, spec: &AssetSpec, span: Span) -> Str {
     resolve_with(
         styles,
@@ -195,6 +208,36 @@ pub(crate) fn resolve_or_request(styles: StyleChain, spec: &AssetSpec, span: Spa
         span,
         |asset| Str::from(asset.url.as_str()),
         || Str::from(ASSET_PENDING),
+    )
+}
+
+/// A resolved image: its URL plus the output's intrinsic pixel dimensions (when
+/// known). Returned by [`resolve_image_or_request`] for the native image rule.
+pub(crate) struct ResolvedImage {
+    pub url: Str,
+    pub dimensions: Option<(u32, u32)>,
+}
+
+/// Resolve a raster-image spec to its URL *and* output dimensions off the style
+/// chain, or request it on a miss. Like [`resolve_or_request`] but also surfaces
+/// `built.dimensions` so the native rule can emit `<img width height>`.
+pub(crate) fn resolve_image_or_request(
+    styles: StyleChain,
+    spec: &AssetSpec,
+    span: Span,
+) -> ResolvedImage {
+    resolve_with(
+        styles,
+        spec,
+        span,
+        |asset| ResolvedImage {
+            url: Str::from(asset.url.as_str()),
+            dimensions: asset.built.dimensions,
+        },
+        || ResolvedImage {
+            url: Str::from(ASSET_PENDING),
+            dimensions: None,
+        },
     )
 }
 
@@ -416,6 +459,10 @@ pub struct Built {
     pub ext: Option<String>,
     /// The name of the original asset file, if any.
     pub stem: Option<String>,
+    /// Intrinsic pixel dimensions of the output, when it's a raster image
+    /// ([`image::build`]) — lets the native image rule emit `<img width height>`
+    /// for aspect-ratio reservation. `None` for non-image assets.
+    pub dimensions: Option<(u32, u32)>,
 }
 
 /// One on-disk file an asset depends on, with its mtime at resolve time (for
@@ -635,7 +682,7 @@ impl AssetResolver {
             // `Raw` is in-memory bytes — it can't fail, so it needs no span.
             AssetSpec::Raw { bytes, ext } => raw::build(bytes.clone(), ext.clone()),
             AssetSpec::Image {
-                file,
+                source,
                 width,
                 height,
                 fit,
@@ -643,7 +690,7 @@ impl AssetResolver {
                 format,
                 quality,
             } => image::build(
-                world, *file, *width, *height, *fit, *filter, *format, *quality, &self.ctx, span,
+                source, *width, *height, *fit, *filter, *format, *quality, &self.ctx, span,
             )?,
         };
 

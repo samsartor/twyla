@@ -142,6 +142,7 @@ pub(crate) fn build(
         upstream,
         ext: Some("css".to_string()),
         stem,
+        dimensions: None,
     })
 }
 

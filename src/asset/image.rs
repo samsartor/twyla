@@ -26,17 +26,17 @@ use image::codecs::avif::AvifEncoder;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageEncoder, ImageFormat};
-use typst::World;
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{
     Bytes, Cast, Content, Context, Packed, PathOrStr, ShowFn, Str, StyleChain, elem, func, scope,
 };
 use typst::loading::{Encoding, Readable};
-use typst::syntax::{FileId, Span};
+use typst::syntax::Span;
 use typst_utils::hash128;
 
 use super::{
-    AssetSpec, Built, Upstream, read_or_request, resolve_or_request, resolve_path, show_unresolved,
+    AssetSpec, Built, ImageSource, Upstream, read_or_request, resolve_or_request, resolve_path,
+    show_unresolved,
 };
 use crate::project::TwylaContext;
 use crate::render::Emit;
@@ -122,16 +122,60 @@ impl ImageAsset {
     }
 }
 
-/// Build an element's [`AssetSpec`] from its (style-resolved) fields.
+/// Build an `asset.image` element's [`AssetSpec`] from its (style-resolved)
+/// fields. The element is always file-backed; per-call args override the
+/// `#set asset.image(..)` defaults the field accessors fold in.
 fn spec(elem: &Packed<ImageAsset>, styles: StyleChain) -> HintedStrResult<AssetSpec> {
+    let source = ImageSource::File(resolve_path(&elem.path, elem.span())?);
+    image_spec(
+        source,
+        elem.width.get(styles),
+        elem.height.get(styles),
+        elem.fit.get(styles),
+        elem.filter.get(styles),
+        elem.format.get(styles),
+        elem.quality.get(styles),
+    )
+}
+
+/// Build an image [`AssetSpec`] for the native image rule ([`crate::rules`]):
+/// the processing parameters come *entirely* from `#set asset.image(..)` on the
+/// style chain, so a plain `![](photo.png)` behaves like
+/// `asset.image("photo.png")` under the same set rules. `source` is whatever the
+/// rule resolved the image to (path- or bytes-backed).
+pub(crate) fn spec_from_styles(source: ImageSource, styles: StyleChain) -> HintedStrResult<AssetSpec> {
+    image_spec(
+        source,
+        styles.get(ImageAsset::width),
+        styles.get(ImageAsset::height),
+        styles.get(ImageAsset::fit),
+        styles.get(ImageAsset::filter),
+        styles.get(ImageAsset::format),
+        styles.get(ImageAsset::quality),
+    )
+}
+
+/// Assemble an [`AssetSpec::Image`] from resolved parameters, validating the
+/// dimensions. Shared by [`spec`] (element) and [`spec_from_styles`] (native
+/// rule) so the two stay in lock-step.
+#[allow(clippy::too_many_arguments)]
+fn image_spec(
+    source: ImageSource,
+    width: Option<i64>,
+    height: Option<i64>,
+    fit: Fit,
+    filter: Filter,
+    format: Option<Format>,
+    quality: u8,
+) -> HintedStrResult<AssetSpec> {
     Ok(AssetSpec::Image {
-        file: resolve_path(&elem.path, elem.span())?,
-        width: dim(elem.width.get(styles))?,
-        height: dim(elem.height.get(styles))?,
-        fit: elem.fit.get(styles),
-        filter: elem.filter.get(styles),
-        format: elem.format.get(styles),
-        quality: elem.quality.get(styles),
+        source,
+        width: dim(width)?,
+        height: dim(height)?,
+        fit,
+        filter,
+        format,
+        quality,
     })
 }
 
@@ -228,14 +272,15 @@ impl Format {
 /// Decode the source image, resize it per `fit`/`filter` (if any dimension is
 /// given), and re-encode it to `format` (or the source format) at `quality`.
 ///
-/// The source is read from disk (so it joins the asset's `upstream` set for
-/// invalidation/watching) rather than through the tracked World: like
-/// [`file::build`](super::file::build), the bytes are an asset input, not a
-/// typst dependency of the page.
+/// A file-backed source is read from disk (so it joins the asset's `upstream`
+/// set for invalidation/watching) — like [`file::build`](super::file::build),
+/// the bytes are an asset input, not a typst dependency of the page. A
+/// bytes-backed source is an inline image typst already loaded (no `upstream`;
+/// the spec is keyed by content). Reports the output's pixel `dimensions` so the
+/// native rule can emit `<img width height>`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build(
-    _world: Tracked<dyn World + '_>,
-    file: FileId,
+    source: &ImageSource,
     width: Option<u32>,
     height: Option<u32>,
     fit: Fit,
@@ -245,8 +290,21 @@ pub(crate) fn build(
     ctx: &TwylaContext,
     span: Span,
 ) -> SourceResult<Built> {
-    let on_disk = ctx.root.join(file.vpath().get_without_slash());
-    let (upstream, bytes) = Upstream::new_read_bytes(on_disk).map_err(|err| err_at(span, err))?;
+    // Read the source bytes from disk (tracking the file) or take the inline
+    // bytes directly.
+    let (upstream, stem, bytes) = match source {
+        ImageSource::File(file) => {
+            let on_disk = ctx.root.join(file.vpath().get_without_slash());
+            let (up, bytes) = Upstream::new_read_bytes(on_disk).map_err(|err| err_at(span, err))?;
+            let stem = up
+                .path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_owned);
+            (vec![up], stem, bytes)
+        }
+        ImageSource::Bytes(bytes) => (Vec::new(), None, bytes.to_vec()),
+    };
 
     // Detect the source format up front: it drives both decoding and the
     // "keep source format" default.
@@ -263,20 +321,17 @@ pub(crate) fn build(
     let img = image::load_from_memory_with_format(&bytes, detected)
         .map_err(|err| err_at(span, format_args!("failed to decode image: {err}")))?;
     let img = resize(img, width, height, fit, filter.into(), span)?;
+    let dimensions = Some((img.width(), img.height()));
     let encoded = encode(&img, out_format, quality).map_err(|err| err_at(span, err))?;
 
-    let stem = upstream
-        .path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(str::to_owned);
     let bytes = Bytes::new(encoded);
     Ok(Built {
         content_hash: hash128(&bytes),
         emit: Emit::Bytes(bytes),
-        upstream: vec![upstream],
+        upstream,
         ext: Some(out_format.ext().to_owned()),
         stem,
+        dimensions,
     })
 }
 

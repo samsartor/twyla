@@ -102,5 +102,6 @@ pub(crate) fn build(
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase()),
         upstream: vec![on_disk],
+        dimensions: None,
     })
 }

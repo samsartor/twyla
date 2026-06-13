@@ -189,6 +189,71 @@ fn cover_requires_both_dimensions() {
     );
 }
 
+/// A native/markdown image (`#image("x.png")` / `![](x.png)`) routes through
+/// the `asset.image` pipeline: the `<img>` gets a fingerprinted src *and* the
+/// output's intrinsic `width`/`height` attrs (no `#context` needed — the rule
+/// resolves off its live styles).
+#[test]
+fn native_image_routes_through_pipeline_with_dimensions() {
+    let (ctx, dir) = site(&[("content/main.typ", "#image(\"photo.png\")")]);
+    std::fs::write(dir.path().join("content/photo.png"), png(80, 40)).unwrap();
+
+    let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    assert_eq!(assets.len(), 1, "got {assets:?}");
+    assert!(
+        assets[0].output_path.ends_with(".png"),
+        "kept source format: {}",
+        assets[0].output_path
+    );
+    assert!(
+        html.contains("width=\"80\"") && html.contains("height=\"40\""),
+        "expected intrinsic dimensions on <img>:\n{html}"
+    );
+    assert!(html.contains(&assets[0].url), "page missing resolved url:\n{html}");
+}
+
+/// `#set asset.image(format: "webp")` reaches *native* images too: the rule
+/// reads the processing defaults off the chain, so the whole scope's images
+/// transcode without touching the markdown.
+#[test]
+fn set_rule_transcodes_native_images() {
+    let (ctx, dir) = site(&[(
+        "content/main.typ",
+        "#set asset.image(format: \"webp\")\n#image(\"photo.png\")",
+    )]);
+    std::fs::write(dir.path().join("content/photo.png"), png(50, 50)).unwrap();
+
+    let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    assert!(
+        assets[0].output_path.ends_with(".webp"),
+        "native image should pick up the set-rule format: {}",
+        assets[0].output_path
+    );
+}
+
+/// Vector images can't be raster-processed, so a native SVG stays a verbatim
+/// fingerprinted copy with no intrinsic-dimension attrs.
+#[test]
+fn native_vector_image_stays_verbatim() {
+    let (ctx, dir) = site(&[("content/main.typ", "#image(\"logo.svg\")")]);
+    std::fs::write(
+        dir.path().join("content/logo.svg"),
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"></svg>",
+    )
+    .unwrap();
+
+    let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    assert!(
+        assets[0].output_path.ends_with(".svg"),
+        "svg copied verbatim: {}",
+        assets[0].output_path
+    );
+    assert!(
+        !html.contains("width=\"10\""),
+        "vector image should not get raster dimension attrs:\n{html}"
+    );
+}
+
 /// A failed asset build blames the asset call site instead of `<detached>`:
 /// the span threaded through [`AssetRequest`] reaches [`file::build`], so a
 /// missing file's diagnostic names the source file it was referenced from.
@@ -466,6 +531,7 @@ fn map_hashes_by_content_sink_keys_on_epoch() {
             content_hash: 0,
             ext: None,
             stem: None,
+            dimensions: None,
         },
         output_path: String::from(url),
         url: String::from(url),
