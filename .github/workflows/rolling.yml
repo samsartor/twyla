@@ -26,3 +26,13 @@ jobs:
             --title "Latest (main)" \
             --notes "Rolling build from $GITHUB_SHA" \
             twyla-x86_64-unknown-linux-gnu.tar.gz
+      # Build twyla.dev with the binary we just compiled, so the site always
+      # reflects this exact commit (no waiting on a separate release pickup).
+      # --test-examples gates the deploy: a broken example/code block fails here.
+      - run: ./target/release/twyla build --root doc --base-url https://twyla.dev --reflect --test-examples
+      - name: Deploy doc/public to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy doc/public --project-name=twyla --branch=main
