@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use comemo::{Track, Tracked, TrackedMut};
-use ecow::{EcoString, EcoVec, eco_vec};
+use ecow::{EcoString, EcoVec, eco_format, eco_vec};
 use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult, Warned};
 use typst::foundations::{
@@ -350,8 +350,18 @@ fn harvest_metadata(
         }
         draft = cs.get(TwylaDocument::draft);
     }
-    let output =
-        output.unwrap_or_else(|| ctx.default_document_output(id.vpath().get_without_slash()));
+    // An explicit `output` is resolved relative to the source's folder stem
+    // (leading `/` = bundle root); an `auto` output derives from the source path.
+    let source = id.vpath().get_without_slash();
+    let output = match output {
+        Some(raw) => ctx.resolve_document_output(source, &raw).map_err(|msg| {
+            eco_vec![SourceDiagnostic::error(
+                Span::detached(),
+                eco_format!("in {source}: {msg}"),
+            )]
+        })?,
+        None => ctx.default_document_output(source),
+    };
     let kind =
         kind.unwrap_or_else(|| EcoString::from(ctx.default_kind(id.vpath().get_without_slash())));
     let url = ctx.document_url(&output);

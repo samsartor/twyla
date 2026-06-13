@@ -13,7 +13,7 @@ use typst::foundations::{
 };
 use typst::syntax::{FileId, Span};
 
-use crate::project::build_document_url;
+use crate::project::{TwylaContext, build_document_url};
 
 /// Defines a page of the website.
 ///
@@ -42,9 +42,18 @@ use crate::project::build_document_url;
 /// ```
 #[elem(scope, name = "document")]
 pub struct TwylaDocument {
-    /// The output location of the document. For example, `"foo/index.html"` or
-    /// `"foo.html"` to create a page called "foo". Can be used to create a page
-    /// literally called "main".
+    /// Where to write the document, as a bundle output path — e.g.
+    /// `"foo/index.html"` for a page called "foo", or `"foo.html"`. Can be used
+    /// to create a page literally called "main".
+    ///
+    /// A *relative* path (no leading `/`) resolves against a base: for a
+    /// full-file page, the source's folder below `content/`
+    /// (`content/blog/post.typ` → `blog/`, so `output: "extra.html"` →
+    /// `blog/extra.html`); for an inline `document(..)`, the enclosing page's
+    /// output directory. A leading `/` is bundle-root-absolute
+    /// (`output: "/feed.xml"`), ignoring that base. When `auto`, a full-file
+    /// page derives its output from the source filename; an inline document
+    /// must set it explicitly.
     pub output: Smart<EcoString>,
 
     /// The page's title.
@@ -123,15 +132,15 @@ impl TwylaDocument {
             // it on the discovery sink exactly like a shown inline document.
             Some(content) => {
                 let elem = content.into_packed::<TwylaDocument>().unwrap();
-                let Some(Smart::Custom(output)) = elem.output.as_option() else {
-                    return Err(eco_vec![SourceDiagnostic::error(
-                        elem.span(),
-                        EcoString::from("`document(..).url()` needs an explicit `output:`"),
-                    )]);
+                // Resolve against the enclosing page's output (on the chain), then
+                // discover the document for emission at that same resolved path.
+                let Some(output) = resolve_inline_output(styles, &elem)? else {
+                    // No enclosing page output yet (the metadata-harvest render) —
+                    // the URL is discarded, so return the placeholder unresolved.
+                    return Ok(Str::from(DOC_PENDING));
                 };
-                let output = output.clone();
-                send_document(styles, &elem)?;
-                output
+                send_document(styles, &elem, &output)?;
+                EcoString::from(output)
             }
             // Static: the current page's output, injected onto the body chain by
             // `crate::compile`. Absent only where the render is discarded (the
@@ -184,7 +193,13 @@ pub struct TwylaSite {
 /// Registered on the in-page targets (Html/Paged); the rule fires wherever the
 /// element is realized, so documents are discovered at any nesting depth.
 pub const RENDER_NOTHING: ShowFn<TwylaDocument> = |elem, _engine, styles| {
-    send_document(styles, elem)?;
+    // Skip discovery when the output can't be resolved yet (no enclosing page
+    // output on the chain — the metadata-harvest render, whose result is
+    // discarded). `resolve_inline_output` still errors on a missing/escaping
+    // `output:`, which is a genuine bug in either pass.
+    if let Some(output) = resolve_inline_output(styles, elem)? {
+        send_document(styles, elem, &output)?;
+    }
     Ok(Content::empty())
 };
 
@@ -262,19 +277,62 @@ pub struct TwylaDocumentSink {
     pub sink: Value,
 }
 
-/// Read the discovery sink off the style chain and report this inline document,
-/// then [`RENDER_NOTHING`] erases it in place. Errors if no explicit `output:`
-/// was given — an inline document has no source filename to default from. A
-/// no-op if no sink is on the chain (e.g. realized outside twyla's pipeline).
-fn send_document(styles: StyleChain, elem: &Packed<TwylaDocument>) -> SourceResult<()> {
-    let Smart::Custom(output) = elem.output.get_cloned(styles) else {
+/// Resolve an inline `#document(..)`'s explicit `output:` to its bundle path.
+///
+/// The convention (`/` = bundle-root-absolute, else relative) lives in
+/// [`TwylaContext::resolve_output`]; this only supplies the anchor for relative
+/// paths: the **enclosing page's output dir**, read off the style chain
+/// ([`TwylaDocument::output`], which `crate::compile` injects onto each page
+/// body — *not* `elem.output`, which is this inline doc's own field). Returns:
+///
+/// - `Err` if no explicit `output:` was given (an inline document has no source
+///   filename to default from), or if a relative path escapes the site root.
+/// - `Ok(None)` when a *relative* output has no enclosing page output to anchor
+///   on — the metadata-harvest render, whose result is discarded. Absolute
+///   outputs need no anchor and always resolve.
+/// - `Ok(Some(path))` with the resolved bundle path otherwise.
+fn resolve_inline_output(
+    styles: StyleChain,
+    elem: &Packed<TwylaDocument>,
+) -> SourceResult<Option<String>> {
+    let Some(Smart::Custom(raw)) = elem.output.as_option() else {
         return Err(eco_vec![SourceDiagnostic::error(
             elem.span(),
             EcoString::from("an inline `document(..)` needs an explicit `output:`"),
         )]);
     };
+    // The chain carries the enclosing page's resolved output, never this
+    // element's own (that lives on `elem`); `Auto` means no enclosing page yet
+    // (the harvest pass) → no anchor, so a relative `raw` defers.
+    let parent = styles.get_cloned(TwylaDocument::output);
+    let anchor = match &parent {
+        Smart::Custom(p) => Some(parent_dir(p)),
+        Smart::Auto => None,
+    };
+    TwylaContext::resolve_output(anchor, raw)
+        .map_err(|msg| eco_vec![SourceDiagnostic::error(elem.span(), EcoString::from(msg))])
+}
+
+/// The directory portion of a `/`-separated bundle output path (`""` if none) —
+/// the anchor a sibling inline document resolves a relative `output:` against.
+fn parent_dir(output: &str) -> &str {
+    match output.rfind('/') {
+        Some(i) => &output[..i],
+        None => "",
+    }
+}
+
+/// Report this inline document on the discovery sink at its already-resolved
+/// `output` (see [`resolve_inline_output`]); [`RENDER_NOTHING`] then erases it in
+/// place. A no-op if no sink is on the chain (e.g. realized outside twyla's
+/// pipeline).
+fn send_document(
+    styles: StyleChain,
+    elem: &Packed<TwylaDocument>,
+    output: &str,
+) -> SourceResult<()> {
     let doc = DiscoveredDoc {
-        output: output.into(),
+        output: output.to_owned(),
         title: elem.title.get_cloned(styles),
         date: elem.date.get_cloned(styles),
         description: elem.description.get_cloned(styles),

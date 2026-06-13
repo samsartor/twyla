@@ -427,8 +427,10 @@ fn inline_document_hoists_to_own_output() {
     );
 
     // Child page: emitted as its own output, carrying the hoisted body and the
-    // metadata plumbed through the call (contextual `document.extra`).
-    let child = page(&docs, "inline-child/index.html");
+    // metadata plumbed through the call (contextual `document.extra`). Its
+    // relative `output: "inline-child/index.html"` resolves under the parent
+    // page's output dir (`inline-document/`).
+    let child = page(&docs, "inline-document/inline-child/index.html");
     assert!(
         child.contains("child-body-text"),
         "hoisted child body missing: {child}"
@@ -451,8 +453,9 @@ fn context_generated_documents_are_discovered_and_routed() {
     let docs = render();
 
     // hello.typ is the one `kind: "post"` fixture → one generated page, keyed
-    // by the post's url: `ctx` + `/hello/` + `index.html`.
-    let generated = page(&docs, "ctx/hello/index.html");
+    // by the post's url: `ctx` + `/hello/` + `index.html`. The relative output
+    // resolves under the generator page's output dir (`context-documents/`).
+    let generated = page(&docs, "context-documents/ctx/hello/index.html");
     assert!(
         generated.contains("ctx-summary-for"),
         "context-generated document body missing: {generated}"

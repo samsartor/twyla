@@ -180,6 +180,75 @@ impl TwylaContext {
         }
     }
 
+    /// The project's single source of truth for resolving an explicit
+    /// `document(output: ..)` string to a bundle-relative output path
+    /// (`/`-separated, no leading slash — the [`Output`] map key form).
+    ///
+    /// A leading `/` means **bundle-root-absolute** (`"/feed.xml"` → `feed.xml`),
+    /// matching Typst's own path idiom; the `anchor` is then irrelevant.
+    /// Otherwise the path is **relative** to `anchor` — a bundle-relative
+    /// `/`-separated directory with no surrounding slashes (`Some("")` is the
+    /// root). `.`/`..` segments are normalized; `..` above the root, or a path
+    /// that normalizes to empty, is an error.
+    ///
+    /// `anchor` is `None` when the caller has no base to resolve a *relative*
+    /// path against yet — an inline document realized before its enclosing page
+    /// output is known (the discarded metadata-harvest pass). A relative `raw`
+    /// then yields `Ok(None)` and the caller substitutes a placeholder / skips;
+    /// an absolute `raw` ignores the missing anchor and still resolves.
+    ///
+    /// Associated (no `self`): the two anchors are derived elsewhere — the
+    /// source's folder stem ([`resolve_document_output`](Self::resolve_document_output))
+    /// and the parent page's output dir (on the style chain, in
+    /// [`crate::document`]) — but the `/`-vs-relative convention lives only here.
+    pub(crate) fn resolve_output(anchor: Option<&str>, raw: &str) -> Result<Option<String>, String> {
+        // Absolute paths discard the anchor; relative ones need one or defer.
+        let segments: Vec<&str> = match raw.strip_prefix('/') {
+            Some(abs) => abs.split('/').collect(),
+            None => match anchor {
+                Some(a) => a.split('/').chain(raw.split('/')).collect(),
+                None => return Ok(None),
+            },
+        };
+        let mut stack: Vec<&str> = Vec::new();
+        for seg in segments {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    if stack.pop().is_none() {
+                        return Err(format!("output path `{raw}` escapes the site root"));
+                    }
+                }
+                s => stack.push(s),
+            }
+        }
+        if stack.is_empty() {
+            return Err(format!("output path `{raw}` resolves to an empty path"));
+        }
+        Ok(Some(stack.join("/")))
+    }
+
+    /// Resolve an explicit `document(output: ..)` set on a full-file page to its
+    /// bundle output path, anchoring relative paths on the source's **folder
+    /// stem** below `content/` (`content/blog/post.typ` → `blog/`), so
+    /// `output: "extra.html"` lands at `blog/extra.html` and `output: "/x.html"`
+    /// at the root. Delegates the convention to [`resolve_output`](Self::resolve_output).
+    ///
+    /// `source` is the root-relative source path (`content/...`), as passed to
+    /// [`default_document_output`](Self::default_document_output).
+    pub fn resolve_document_output(&self, source: &str, raw: &str) -> Result<String, String> {
+        let source = self.root.join(source);
+        let content_dir = self.content_dir();
+        let rel = source.strip_prefix(&content_dir).map_err(|_| {
+            format!("source {:?} is not within the content dir", source.display())
+        })?;
+        let anchor = rel.parent().map(path_key).unwrap_or_default();
+        // A full-file page always has a concrete folder-stem anchor, so
+        // resolution never defers (`Ok(None)`) — that path is inline-only.
+        Self::resolve_output(Some(&anchor), raw)
+            .map(|out| out.expect("full-file output always has a concrete anchor"))
+    }
+
     /// The default `kind` for a page, used when it doesn't set `document.kind`.
     /// Drives both the harvested metadata (in [`crate::compile`]) and the
     /// `convert` draft's `{kind}-template` import.
@@ -314,6 +383,60 @@ mod tests {
         let ctx = TwylaContext::stub("/tmp");
         let r = ctx.default_document_output("content/guis-2.typ");
         assert_eq!(r, PathBuf::from("guis-2/index.html"));
+    }
+
+    #[test]
+    fn resolve_output_convention() {
+        // Absolute (leading `/`) ignores the anchor and lands at the root.
+        assert_eq!(
+            TwylaContext::resolve_output(Some("blog"), "/feed.xml").unwrap(),
+            Some("feed.xml".to_string())
+        );
+        // Relative joins onto the anchor; `.`/`..` normalize.
+        assert_eq!(
+            TwylaContext::resolve_output(Some("blog"), "extra.html").unwrap(),
+            Some("blog/extra.html".to_string())
+        );
+        assert_eq!(
+            TwylaContext::resolve_output(Some("blog/post"), "../sibling.html").unwrap(),
+            Some("blog/sibling.html".to_string())
+        );
+        assert_eq!(
+            TwylaContext::resolve_output(Some(""), "x.html").unwrap(),
+            Some("x.html".to_string())
+        );
+        // `..` above the root, or an empty result, is an error.
+        assert!(TwylaContext::resolve_output(Some("blog"), "../../x").is_err());
+        assert!(TwylaContext::resolve_output(Some("blog"), "/").is_err());
+        // A relative path with no anchor defers; an absolute one still resolves.
+        assert_eq!(TwylaContext::resolve_output(None, "x.html").unwrap(), None);
+        assert_eq!(
+            TwylaContext::resolve_output(None, "/x.html").unwrap(),
+            Some("x.html".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_document_output_anchors_on_folder_stem() {
+        let ctx = TwylaContext::stub("/tmp");
+        // Relative → folder stem of the source below content/.
+        assert_eq!(
+            ctx.resolve_document_output("content/blog/post.typ", "extra.html")
+                .unwrap(),
+            "blog/extra.html"
+        );
+        // A top-level source has an empty stem → resolves at the root.
+        assert_eq!(
+            ctx.resolve_document_output("content/post.typ", "extra.html")
+                .unwrap(),
+            "extra.html"
+        );
+        // Absolute → bundle root regardless of the source's folder.
+        assert_eq!(
+            ctx.resolve_document_output("content/blog/post.typ", "/feed.xml")
+                .unwrap(),
+            "feed.xml"
+        );
     }
 
     #[test]
