@@ -2,27 +2,111 @@
 #show: page-template
 #set document(title: "Reference")
 
+// Auto-generated reference. Everything below is reflected out of the binary
+// via `twyla-reflect.describe` (see src/reflect.rs) — name, title, the baked
+// `///` docs, parameters, and return type. No hand-written prose yet; this is
+// a raw dump of the stdlib additions to start turning into real docs.
+//
+// Build with the `--reflect` / `TWYLA_REFLECT` opt-in, otherwise the
+// `twyla-reflect` module is not in scope.
+
+#let describe = twyla-reflect.describe
+
+// Render a CastInfo dict (a parameter's accepted types, or a return type) as
+// a short inline type expression.
+#let render-type(info) = {
+  if info == none {
+    return
+  } else if info.kind == "any" {
+    raw("any")
+  } else if info.kind == "type" {
+    // repr wraps the bare-value types (`type(none)`, `type(auto)`); unwrap to
+    // the plain name. Ordinary types (`int`, `str`, `content`) pass through.
+    let name = repr(info.ty)
+    if name.starts-with("type(") and name.ends-with(")") {
+      name = name.slice(5, -1)
+    }
+    raw(name)
+  } else if info.kind == "value" {
+    raw(repr(info.value))
+  } else if info.kind == "union" {
+    info.infos.map(render-type).join([ or ])
+  }
+}
+
+// Render one parameter dict. Built in code mode so a default like `= auto`
+// is never misparsed as a heading, and the doc string is inserted verbatim.
+#let render-param(p) = {
+  let flags = ()
+  if p.required { flags.push("required") }
+  if p.positional { flags.push("positional") }
+  if p.named { flags.push("named") }
+  if p.variadic { flags.push("variadic") }
+  if p.settable { flags.push("settable") }
+
+  let sig = strong(raw(p.name))
+  sig += [ #render-type(p.input)]
+  if "default" in p {
+    sig += [ (default: #raw(repr(p.default)))]
+  }
+  if flags.len() > 0 {
+    sig += [ — #emph(flags.join(", "))]
+  }
+
+  block(inset: (left: 1.2em), {
+    sig
+    if p.docs != none and p.docs != "" {
+      parbreak()
+      p.docs
+    }
+  })
+}
+
+// Render a function/type/symbol value. Modules (and associated scopes such as
+// `asset.file`'s `.url`/`.read`) are recursed into.
+#let render-item(value, depth: 2) = {
+  if type(value) == module {
+    for (name, member) in dictionary(value) {
+      render-item(member, depth: depth)
+    }
+    return
+  }
+
+  let d = describe(value)
+  if d == none {
+    return
+  }
+
+  heading(level: depth, raw(d.name))
+
+  // The baked `///` docs are written in typst-docs reference markup (with
+  // `$func$` cross-refs etc.) that plain markup-eval can't parse, so dump them
+  // verbatim for now — they're hard-wrapped in the Rust source, so the raw
+  // block reads fine.
+  if d.docs != none and d.docs != "" {
+    raw(d.docs, block: true)
+  }
+
+  if d.at("params", default: ()).len() > 0 {
+    for p in d.params {
+      render-param(p)
+    }
+  }
+
+  if d.at("returns", default: none) != none {
+    block[Returns #render-type(d.returns)]
+  }
+
+  if d.at("scope", default: none) != none {
+    render-item(d.scope, depth: depth + 1)
+  }
+}
+
 = Reference
 <reference>
 
-#quote(block: true)[
-This was written by claude. It is better than nothing, but
-#html.span(style: "weight: bold; color: red;")[TODO] have a human re-write.
-]
-
-A minimal reference for Twyla's author-facing API. Expect this to grow.
-
-- #link("/reference/document")[document] — per-page metadata and the
-  `documents()` listing.
-- #link("/reference/asset")[asset] — `asset.file` / `asset.sass` and asset
-  URLs.
-- #link("/reference/configuration")[configuration] — project layout and the
-  knobs Twyla reads.
-
-Beyond these, Twyla adds two small content builtins:
-
-- `raw-html(markup)` — splice literal HTML into the output verbatim. Accepts a
-  string or bytes (e.g. `asset.file("icon.svg").read(encoding: none)`), decoded
-  as UTF-8.
-- `plain-text(content)` — flatten content to a plain string (for slugs, alt
-  text, meta descriptions, …).
+#render-item(document)
+#render-item(documents)
+#render-item(asset)
+#render-item(raw-html)
+#render-item(plain-text)

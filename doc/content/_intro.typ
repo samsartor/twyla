@@ -57,7 +57,7 @@ content/
 
 For a blog you will probably want to list your other pages on your home
 page. To do that, use the
-#link("/reference/document#documents")[documents()] iterator:
+#link("https://twyla.dev/reference/#documents")[documents()] iterator:
 
 ```typst
 = My Blog
@@ -90,9 +90,9 @@ Your other pages should include basic information like `title`, `date`,
 )
 ```
 
-Twyla's #link("reference/document")[document] function supports a number
-of additional features, beyond what are available in normal Typst,
-including an `extra` field you can fill with whatever data you want.
+Twyla's #link("https://twyla.dev/reference#document")[document] function
+supports a number of additional features, beyond what are available in normal
+Typst, including an `extra` field you can fill with whatever data you want.
 
 For the purpose of theming you can also add a SCSS file and
 #link("https://typst.app/docs/reference/html")[some HTML];:
@@ -147,7 +147,7 @@ sass/
 
 If you would like to include an image, you can use either the built-in
 image function or handle it explicitly with Twyla's
-#link("/reference/asset")[asset system];:
+#link("https://twyla.dev/reference/assets")[asset system];:
 
 ```typst
 #image("./pretty.png")
@@ -206,9 +206,9 @@ HTML from scratch:
           else { document.description },
       ))
       html.elem("title", document.title)
-      html.script(src: asset("/scripts/main.ts").url, "")
-      html.link(rel: "stylesheet", href: asset("/sass/main.sass").url)
-      html.link(rel: "icon", href: asset(circle(fill: blue), format: "png").url)
+      html.script(src: asset.rolldown("/scripts/main.ts").url(), "")
+      html.link(rel: "stylesheet", href: asset.sass("/sass/main.sass").url())
+      html.link(rel: "icon", href: asset.image(circle(fill: blue), format: "png").url())
     })
     html.elem("body", body)
   })
@@ -218,14 +218,12 @@ HTML from scratch:
 ...
 ```
 
-Notice the uses of `asset(...).url`. Twyla's
+Notice the uses of `asset.url()`. Twyla's
 #link("/reference/asset")[asset system] can automatically convert assets
 such as SASS to CSS (using the
 #link("https://github.com/connorskees/grass")[grass] library), TS to JS
 (using #link("https://rolldown.rs")[rolldown];), and Typst
-#emph[content] into PNG/SVG/PDF (using Typst itself). Such
-transformations can also be disabled with `asset(transform: none, ...)`
-or customized in #link("/reference/configuration")[`Twyla.toml`];.
+#emph[content] into PNG/SVG/PDF (using Typst itself).
 
 Instead of stylizing every post separately, you probably want to create
 a common set of templates:
