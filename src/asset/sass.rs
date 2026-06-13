@@ -60,7 +60,7 @@ impl SassAsset {
             file: resolve_path(&elem.path, elem.span())?,
             minify: elem.minify.get(styles),
         };
-        Ok(resolve_or_request(styles, &spec))
+        Ok(resolve_or_request(styles, &spec, elem.span()))
     }
 
     #[func(contextual)]
@@ -79,7 +79,7 @@ impl SassAsset {
             file: resolve_path(&elem.path, elem.span())?,
             minify: elem.minify.get(styles),
         };
-        read_or_request(styles, &spec, encoding)
+        read_or_request(styles, &spec, elem.span(), encoding)
     }
 }
 
@@ -93,13 +93,11 @@ pub(crate) fn build(
     file: FileId,
     minify: bool,
     ctx: &TwylaContext,
+    span: Span,
 ) -> SourceResult<Built> {
     let on_disk = ctx.root.join(file.vpath().get_without_slash());
     let (on_disk, src) = Upstream::new_read_string(on_disk).map_err(|err| {
-        eco_vec![SourceDiagnostic::error(
-            Span::detached(),
-            EcoString::from(err.to_string())
-        )]
+        eco_vec![SourceDiagnostic::error(span, EcoString::from(err.to_string()))]
     })?;
     let stem = on_disk
         .path
@@ -129,10 +127,7 @@ pub(crate) fn build(
         options = options.load_path(parent);
     }
     let css = grass::from_string(src.to_string(), &options).map_err(|e| {
-        eco_vec![SourceDiagnostic::error(
-            Span::detached(),
-            eco_format!("sass: {e}")
-        )]
+        eco_vec![SourceDiagnostic::error(span, eco_format!("sass: {e}"))]
     })?;
 
     // Upstream = the imports grass read + the entry (read via the World, so not

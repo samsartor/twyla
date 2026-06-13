@@ -106,6 +106,30 @@ fn multiple_assets_resolve_and_sass_renames_to_css() {
     );
 }
 
+/// A failed asset build blames the asset call site instead of `<detached>`:
+/// the span threaded through [`AssetRequest`] reaches [`file::build`], so a
+/// missing file's diagnostic names the source file it was referenced from.
+#[test]
+fn missing_asset_blames_the_call_site() {
+    let (ctx, _dir) = site(&[(
+        "content/main.typ",
+        "#context asset.file(\"nope.svg\").url()",
+    )]);
+    let world = RenderWorld::new(&ctx).unwrap();
+    let mut resolver = AssetResolver::new(&world.ctx);
+    let err = world
+        .compile_bundle(&mut resolver)
+        .err()
+        .expect("a missing asset file should fail the build");
+    // The rendered diagnostic includes the source snippet header (the file name)
+    // only when the span resolves — a detached span would omit it.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("main.typ"),
+        "asset error should point at the call site's source file, got:\n{msg}"
+    );
+}
+
 /// `.read()` resolves an asset's output through the same loop: a file's
 /// contents inline verbatim (default UTF-8 `str`, no wrapper), and a sass asset
 /// inlines its *compiled* CSS as raw `bytes` (`encoding: none`). The asset is

@@ -48,7 +48,7 @@ impl FileAsset {
         let spec = AssetSpec::File {
             file: resolve_path(&elem.path, elem.span())?,
         };
-        Ok(resolve_or_request(context.styles()?, &spec))
+        Ok(resolve_or_request(context.styles()?, &spec, elem.span()))
     }
 
     /// The file's contents — for inlining instead of linking. Mirrors the
@@ -68,7 +68,7 @@ impl FileAsset {
         let spec = AssetSpec::File {
             file: resolve_path(&elem.path, elem.span())?,
         };
-        read_or_request(context.styles()?, &spec, encoding)
+        read_or_request(context.styles()?, &spec, elem.span(), encoding)
     }
 }
 
@@ -81,13 +81,11 @@ pub(crate) fn build(
     _world: Tracked<dyn World + '_>,
     file: FileId,
     ctx: &TwylaContext,
+    span: Span,
 ) -> SourceResult<Built> {
     let on_disk = ctx.root.join(file.vpath().get_without_slash());
     let (on_disk, bytes) = Upstream::new_read_bytes(on_disk).map_err(|err| {
-        eco_vec![SourceDiagnostic::error(
-            Span::detached(),
-            EcoString::from(err.to_string())
-        )]
+        eco_vec![SourceDiagnostic::error(span, EcoString::from(err.to_string()))]
     })?;
 
     Ok(Built {

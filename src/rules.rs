@@ -189,7 +189,7 @@ const IMAGE_RULE: ShowFn<ImageElem> = |elem, _engine, styles| {
         },
     };
 
-    let src = resolve_or_request(styles, &spec);
+    let src = resolve_or_request(styles, &spec, span);
 
     let mut img = HtmlElem::new(tag::img).with_attr(attr::src, src.as_str());
     if let Some(alt) = elem.alt.get_cloned(styles) {

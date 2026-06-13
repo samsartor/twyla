@@ -107,12 +107,21 @@ pub enum AssetSpec {
 /// `b == b`), which is all `Eq` asserts beyond `PartialEq`.
 impl Eq for AssetSpec {}
 
-/// A spec plus its (future) output policy. The `output: auto | str | info => str`
-/// argument will live here; keeping the wrapper now makes adding it
-/// non-breaking. For today it carries nothing beyond the spec.
+/// A spec plus the call site that requested it (and its future output policy —
+/// the `output: auto | str | info => str` argument will live here; keeping the
+/// wrapper now makes adding it non-breaking).
+///
+/// `span` is the asset call site that triggered discovery, carried so a failed
+/// [`build`](file::build) (missing file, sass error) can blame a real source
+/// location instead of `<detached>`. It is *not* part of the asset's identity —
+/// [`AssetResolver::drain_and_process`] dedups on `spec` alone, so the same
+/// asset referenced from two sites builds once, attributed to whichever request
+/// drained first (any referencing site is a valid location for the error). The
+/// derived `Eq`/`Hash` include it, but nothing keys a map on `AssetRequest`.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct AssetRequest {
     pub spec: AssetSpec,
+    pub span: Span,
 }
 
 // Assets are *elements* ([`file::FileAsset`], [`sass::SassAsset`]), not a
@@ -143,6 +152,7 @@ pub struct AssetRequest {
 fn resolve_with<T>(
     styles: StyleChain,
     spec: &AssetSpec,
+    span: Span,
     hit: impl FnOnce(&ResolvedAsset) -> T,
     miss: impl FnOnce() -> T,
 ) -> T {
@@ -156,7 +166,7 @@ fn resolve_with<T>(
     if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetSink::sink)
         && let Some(sink) = dynamic.downcast::<AssetSink>()
     {
-        let _ = sink.tx.send(AssetRequest { spec: spec.clone() });
+        let _ = sink.tx.send(AssetRequest { spec: spec.clone(), span });
     }
     miss()
 }
@@ -164,10 +174,11 @@ fn resolve_with<T>(
 /// Resolve a spec's URL off the style chain, or request it (returns
 /// [`ASSET_PENDING`] on a miss). Shared by [`Asset::url`] and the native image
 /// rule.
-pub(crate) fn resolve_or_request(styles: StyleChain, spec: &AssetSpec) -> Str {
+pub(crate) fn resolve_or_request(styles: StyleChain, spec: &AssetSpec, span: Span) -> Str {
     resolve_with(
         styles,
         spec,
+        span,
         |asset| Str::from(asset.url.as_str()),
         || Str::from(ASSET_PENDING),
     )
@@ -181,11 +192,13 @@ pub(crate) fn resolve_or_request(styles: StyleChain, spec: &AssetSpec) -> Str {
 fn read_or_request(
     styles: StyleChain,
     spec: &AssetSpec,
+    span: Span,
     encoding: Option<Encoding>,
 ) -> HintedStrResult<Readable> {
     resolve_with(
         styles,
         spec,
+        span,
         |asset| {
             let bytes = asset
                 .built
@@ -542,7 +555,7 @@ impl AssetResolver {
             if self.resolved.contains_key(&request.spec) {
                 continue;
             }
-            let asset = self.process(world, &request.spec)?;
+            let asset = self.process(world, &request.spec, request.span)?;
             self.resolved.insert(request.spec, asset);
             settled = false;
         }
@@ -597,12 +610,14 @@ impl AssetResolver {
         &self,
         world: Tracked<dyn World + '_>,
         spec: &AssetSpec,
+        span: Span,
     ) -> SourceResult<ResolvedAsset> {
         let built = match spec {
-            AssetSpec::File { file } => file::build(world, *file, &self.ctx)?,
+            AssetSpec::File { file } => file::build(world, *file, &self.ctx, span)?,
             AssetSpec::Sass { file, minify } => {
-                sass::build(world, *file, *minify, &self.ctx)?
+                sass::build(world, *file, *minify, &self.ctx, span)?
             }
+            // `Raw` is in-memory bytes — it can't fail, so it needs no span.
             AssetSpec::Raw { bytes, ext } => raw::build(bytes.clone(), ext.clone()),
         };
 
