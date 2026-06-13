@@ -31,6 +31,23 @@ pub struct TwylaContext {
     pub base_url: Option<String>,
 }
 
+/// Build a document's public URL from the site `base_url` and its bundle output
+/// path: strip a trailing `index.html` (directory-style URLs), then join under
+/// `base_url` (absolute) or `/` (relative). Pure function of its inputs, so it
+/// backs both [`TwylaContext::document_url`] and `document.url()`'s on-chain
+/// computation (which has `base_url` but no `TwylaContext`).
+pub(crate) fn build_document_url(base_url: Option<&str>, output: &str) -> String {
+    let path = output.strip_suffix("index.html").unwrap_or(output);
+    match base_url {
+        Some(base) => format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        ),
+        None => format!("/{}", path.trim_start_matches('/')),
+    }
+}
+
 /// Normalize a relative path into a `/`-separated, no-leading-slash manifest
 /// key — the form [`crate::html::resolve`] and the output manifests share.
 pub(crate) fn path_key(p: &Path) -> String {
@@ -177,18 +194,7 @@ impl TwylaContext {
     }
 
     pub fn document_url(&self, output: &str) -> String {
-        let path = match output.strip_suffix("index.html") {
-            Some(rest) => rest,
-            None => output,
-        };
-        match &self.base_url {
-            Some(base) => format!(
-                "{}/{}",
-                base.trim_end_matches('/'),
-                path.trim_start_matches('/')
-            ),
-            None => format!("/{}", path.trim_start_matches('/')),
-        }
+        build_document_url(self.base_url.as_deref(), output)
     }
 
     /// Bundle-relative directory processed assets are emitted into, e.g.

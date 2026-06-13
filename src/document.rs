@@ -23,12 +23,14 @@ use std::hash::{Hash, Hasher};
 use comemo::Tracked;
 use crossbeam_channel::Sender;
 use ecow::{EcoString, eco_vec};
-use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
+use typst::diag::{At as _, HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{
     Array, Binding, Content, Context, Datetime, Dict, NativeElement as _, Packed, Repr, Scope,
-    ShowFn, Smart, StyleChain, Value, elem, func, ty,
+    ShowFn, Smart, Str, StyleChain, Value, elem, func, scope, ty,
 };
-use typst::syntax::FileId;
+use typst::syntax::{FileId, Span};
+
+use crate::project::build_document_url;
 
 /// Metadata for the current page.
 ///
@@ -44,7 +46,7 @@ use typst::syntax::FileId;
 ///   kind: "post",
 /// )
 /// ```
-#[elem(name = "document")]
+#[elem(scope, name = "document")]
 pub struct TwylaDocument {
     /// The output location of the document. For example, `"foo/index.html"` or
     /// `"foo.html"` to create a page called "foo". Can be used to create a page
@@ -88,6 +90,89 @@ pub struct TwylaDocument {
     /// settable), so the set-rule-only metadata-carrier use is unaffected.
     #[required]
     pub body: Content,
+}
+
+#[scope]
+impl TwylaDocument {
+    /// The page's public URL. Two call forms:
+    ///
+    /// - `document.url()` (no self) → the **current** page's URL, built from the
+    ///   output twyla derived for it.
+    /// - `document(output: "x")[..].url()` (method, on an instance) → that
+    ///   document's URL, and **discovers it for emission** — so an inline
+    ///   document consumed only through `.url()` (never shown) is still routed.
+    ///   Discovery dedups by `output`, so calling `.url()` repeatedly, or
+    ///   `.url()` on a document that is also shown, emits it exactly once.
+    ///
+    /// Contextual — call it inside `#context`. `context` precedes the optional
+    /// `this` self-positional: the `#[func]` macro classifies special params by
+    /// name and forwards them ahead of ordinary positionals (the instance is
+    /// prepended as that positional on a method call).
+    #[func(contextual)]
+    fn url(
+        context: Tracked<Context>,
+        /// The document instance — present only on a method call (`doc.url()`),
+        /// absent on the static `document.url()`.
+        #[default]
+        this: Option<Content>,
+    ) -> SourceResult<Str> {
+        let styles = context.styles().at(Span::detached())?;
+        let base = base_url_on_chain(styles);
+
+        let output = match this {
+            // Instance: read the element's *own* output (not chain-resolved, so
+            // it can't accidentally inherit the surrounding page's), then report
+            // it on the discovery sink exactly like a shown inline document.
+            Some(content) => {
+                let elem = content.into_packed::<TwylaDocument>().unwrap();
+                let Some(Smart::Custom(output)) = elem.output.as_option() else {
+                    return Err(eco_vec![SourceDiagnostic::error(
+                        elem.span(),
+                        EcoString::from("`document(..).url()` needs an explicit `output:`"),
+                    )]);
+                };
+                let output = output.clone();
+                send_document(styles, &elem)?;
+                output
+            }
+            // Static: the current page's output, injected onto the body chain by
+            // `crate::compile`. Absent only where the render is discarded (the
+            // metadata harvest) — return the placeholder rather than erroring; it
+            // never reaches real output.
+            None => match styles.get_cloned(TwylaDocument::output) {
+                Smart::Custom(output) => output,
+                Smart::Auto => return Ok(Str::from(DOC_PENDING)),
+            },
+        };
+
+        Ok(Str::from(build_document_url(base.as_deref(), &output)))
+    }
+}
+
+/// Placeholder returned by the static `document.url()` when no current-page
+/// output is on the chain (the metadata-harvest render, which is discarded). A
+/// real compile injects the output, so this never reaches emitted HTML — a leak
+/// would signal that injection regressed.
+const DOC_PENDING: &str = "/__twyla-doc-pending__";
+
+/// Read the site `base_url` off the style chain ([`TwylaSite`]), or `None` for a
+/// relative-URL build. Lets `document.url()` build URLs without a `TwylaContext`.
+fn base_url_on_chain(styles: StyleChain) -> Option<EcoString> {
+    match styles.get_cloned(TwylaSite::base_url) {
+        Value::Str(s) => Some(EcoString::from(s.as_str())),
+        _ => None,
+    }
+}
+
+/// Internal host carrying the site `base_url` on the style chain, injected by
+/// [`crate::compile`] each iteration. Not user-constructible, not bound in the
+/// global scope (mirrors [`TwylaDocumentList`]).
+#[elem]
+pub struct TwylaSite {
+    /// The `base_url` as a [`Value::Str`], or [`Value::None`] for a relative
+    /// build.
+    #[default(Value::None)]
+    pub base_url: Value,
 }
 
 /// An inline `#document(..)[body]` renders to **nothing** where it sits, so

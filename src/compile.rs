@@ -20,7 +20,7 @@ use typst_library::routines::{Arenas, RealizationKind};
 use typst_utils::Protected;
 
 use crate::asset::{AssetResolver, ResolvedAsset};
-use crate::document::{DiscoveredDoc, TwylaDocument, TwylaDocumentList};
+use crate::document::{DiscoveredDoc, TwylaDocument, TwylaDocumentList, TwylaSite};
 use crate::project::TwylaContext;
 
 /// One page's harvested twyla metadata — the row that becomes one
@@ -181,6 +181,14 @@ fn compile_bundle_loop(
     let library = world.library();
     let base = StyleChain::new(&library.styles);
     let target = TargetElem::target.set(Bundle::target()).wrap();
+    // The site `base_url`, carried on the chain so `document.url()` can build
+    // absolute URLs without a `TwylaContext`. Constant across the build.
+    let base_url = TwylaSite::base_url
+        .set(match &ctx.base_url {
+            Some(url) => Value::Str(url.as_str().into()),
+            None => Value::None,
+        })
+        .wrap();
     // Constant across iterations within one discovery generation — build once.
     let asset_sink = resolver.sink_style();
     let doc_sink = resolver.doc_sink_style();
@@ -201,6 +209,7 @@ fn compile_bundle_loop(
         // link-by-link). The asset map is rebuilt each iteration as it drains.
         let combined: Styles = [
             target.clone(),
+            base_url.clone(),
             docs_list,
             resolver.map_style(),
             asset_sink.clone(),
@@ -487,42 +496,79 @@ mod tests {
         );
     }
 
-    /// TARGET, blocked on `document.url()`: an inline document *consumed by a
-    /// method* — never shown — must still be discovered and emitted. Today
-    /// discovery rides the show rule (`document::RENDER_NOTHING`), so a document
-    /// that `.url()` swallows before realization would route nothing, and the
-    /// `src` here would dangle. The fix is backup discovery inside `.url()`
-    /// (mirroring assets), deduped by output — see the discovery-eagerness
-    /// discussion. Un-ignore when `document.url()` lands.
-    #[test]
-    #[ignore = "blocked on document.url() + method-side discovery"]
-    fn document_consumed_by_url_is_still_emitted() {
+    /// Every output of one compile of a one-file site.
+    fn compile_outputs(body: &str) -> crate::render::Outputs {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("content")).unwrap();
-        std::fs::write(
-            dir.path().join("content/main.typ"),
-            "#html.elem(\"iframe\", attrs: (\n  \
-               src: document(output: \"sub/index.html\")[Sub body].url(),\n))",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("content/main.typ"), body).unwrap();
         let ctx = TwylaContext::new(dir.path(), Some("https://example.com".into())).unwrap();
         let world = RenderWorld::new(&ctx).unwrap();
         let mut resolver = AssetResolver::new(&world.ctx);
-        let outputs = world.compile_bundle(&mut resolver).unwrap();
+        world.compile_bundle(&mut resolver).unwrap()
+    }
 
-        // The swallowed document is emitted as its own output, body intact.
-        let sub = match outputs.get("sub/index.html") {
+    /// HTML of one specific output (by bundle key).
+    fn doc_html(outputs: &crate::render::Outputs, key: &str) -> String {
+        match outputs.get(key) {
             Some(crate::render::Output::Doc(d)) => d.html.clone(),
-            other => panic!("sub document not emitted: {other:?}"),
-        };
+            other => panic!("output {key:?} not a document: {other:?}"),
+        }
+    }
+
+    /// Static `document.url()` (no self) returns the current page's URL, built
+    /// from its derived output + the site `base_url`. `content/main.typ` →
+    /// output `index.html` → `https://example.com/`.
+    #[test]
+    fn current_page_url_is_derived() {
+        let html = compile_main("#context document.url()");
+        assert!(
+            html.contains("https://example.com/"),
+            "static document.url() did not resolve to the page URL:\n{html}"
+        );
+        assert!(
+            !html.contains("__twyla-doc-pending__"),
+            "doc-url placeholder leaked into output:\n{html}"
+        );
+    }
+
+    /// An inline document *consumed by `.url()`* — never shown — is still
+    /// discovered and emitted as its own output, and the method returns its URL
+    /// (`base_url` + output). The reverse of show-driven discovery: here the
+    /// element is swallowed before realization, so `.url()` must report it.
+    #[test]
+    fn document_consumed_by_url_is_still_emitted() {
+        let outputs = compile_outputs(
+            "#context html.elem(\"iframe\", attrs: (\n  \
+               src: document(output: \"sub/index.html\")[Sub body].url(),\n))",
+        );
+
+        let sub = doc_html(&outputs, "sub/index.html");
         assert!(sub.contains("Sub body"), "sub body missing:\n{sub}");
 
-        // The iframe on the main page points at the resolved sub URL, not a
-        // leftover asset/placeholder.
-        let main = match outputs.get("index.html") {
-            Some(crate::render::Output::Doc(d)) => d.html.clone(),
-            other => panic!("main page missing: {other:?}"),
-        };
-        assert!(main.contains("/sub/"), "iframe src not resolved:\n{main}");
+        let main = doc_html(&outputs, "index.html");
+        assert!(
+            main.contains("https://example.com/sub/"),
+            "iframe src not resolved to the sub URL:\n{main}"
+        );
+    }
+
+    /// Dedup, the property Sam called out: a document that is BOTH shown inline
+    /// AND `.url()`'d (here twice) — all targeting one `output` — is emitted
+    /// exactly once, and the compile still converges. Discovery dedups by
+    /// `output` (in the resolver) and the output map is keyed by path, so
+    /// neither repeated `.url()` calls nor show+url duplicate it.
+    #[test]
+    fn url_and_show_discovery_dedup_to_one_output() {
+        let outputs = compile_outputs(
+            "#document(output: \"dup/index.html\")[Dup body]\n\
+             #context document(output: \"dup/index.html\")[Dup body].url()\n\
+             #context document(output: \"dup/index.html\")[Dup body].url()",
+        );
+
+        let dups = outputs
+            .docs()
+            .filter(|d| d.output_path == "dup/index.html")
+            .count();
+        assert_eq!(dups, 1, "document emitted {dups} times, expected exactly 1");
     }
 }
