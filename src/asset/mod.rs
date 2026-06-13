@@ -482,20 +482,29 @@ impl Upstream {
     }
 
     pub fn new_read_string(path: PathBuf) -> io::Result<(Self, String)> {
-        let mut f = fs::File::open(&path)?;
-        let mtime = f.metadata()?.modified().ok();
+        let mut f = fs::File::open(&path).map_err(|e| annotate(&path, e))?;
+        let mtime = f.metadata().map_err(|e| annotate(&path, e))?.modified().ok();
         let mut text = String::new();
-        f.read_to_string(&mut text)?;
+        f.read_to_string(&mut text).map_err(|e| annotate(&path, e))?;
         Ok((Upstream { path, mtime }, text))
     }
 
     pub fn new_read_bytes(path: PathBuf) -> io::Result<(Self, Vec<u8>)> {
-        let mut f = fs::File::open(&path)?;
-        let mtime = f.metadata()?.modified().ok();
+        let mut f = fs::File::open(&path).map_err(|e| annotate(&path, e))?;
+        let mtime = f.metadata().map_err(|e| annotate(&path, e))?.modified().ok();
         let mut bytes = Vec::new();
-        f.read_to_end(&mut bytes)?;
+        f.read_to_end(&mut bytes).map_err(|e| annotate(&path, e))?;
         Ok((Upstream { path, mtime }, bytes))
     }
+}
+
+/// Annotate an I/O error with the absolute path it concerns, so a failed asset
+/// read reports *which* file (`/abs/path: No such file or directory`) instead of
+/// a bare OS error. `std::path::absolute` resolves the path against the cwd
+/// without touching the filesystem (so it works even when the file is missing).
+fn annotate(path: &Path, err: io::Error) -> io::Error {
+    let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    io::Error::new(err.kind(), format!("{}: {err}", shown.display()))
 }
 
 /// One processed asset: where it lives, how to emit it, and what it depends on.

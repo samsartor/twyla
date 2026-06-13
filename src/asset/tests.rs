@@ -276,6 +276,12 @@ fn missing_asset_blames_the_call_site() {
         msg.contains("main.typ"),
         "asset error should point at the call site's source file, got:\n{msg}"
     );
+    // ...and the message names the absolute path it tried to read (`content/`
+    // appears only in the joined path, not in the `"nope.svg"` source snippet).
+    assert!(
+        msg.contains("content/nope.svg"),
+        "asset error should name the absolute path it tried, got:\n{msg}"
+    );
 }
 
 /// `.read()` resolves an asset's output through the same loop: a file's
