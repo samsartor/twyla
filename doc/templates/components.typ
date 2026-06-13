@@ -64,9 +64,13 @@
 // --- the function signature code block ------------------------------------
 //
 // Mirrors typst's reference: `name(arg: type, …) -> type`, params on their own
-// indented lines, rendered in an always-dark code panel.
+// indented lines, rendered in an always-dark code panel. `receiver` prefixes
+// the name to spell out how the item is reached — `asset.` for a constructor
+// (`asset.sass(..)`), `asset.*.` for a method shared by every asset type
+// (`asset.*.read(..)`), `document.` for a type's own method (`document.url()`).
 
-#let render-signature(d) = html.elem("pre", attrs: (class: "signature"), {
+#let render-signature(d, receiver: "") = html.elem("pre", attrs: (class: "signature"), {
+  if receiver != "" { html.span(class: "sig-recv", receiver) }
   html.span(class: "sig-fn", d.name)
   "("
   let params = visible-params(d)
@@ -131,14 +135,40 @@
   [#head#label(anchor)]
 }
 
-#let render-item(name, value, depth: 2, prefix: "") = {
+// Members are rendered in one of two styles, set by their parent:
+//   • constructor — a callable item reached by a path (`asset.sass`, `document`)
+//   • method      — a function called on an instance (`.url()`, `.read()`)
+// `display` is the heading/TOC label, `receiver` the signature name prefix.
+#let constructor-style(name, parent) = (
+  display: if parent == "" { name } else { parent + "." + name },
+  receiver: if parent == "" { "" } else { parent + "." },
+)
+#let method-style(name, receiver) = (
+  display: "." + name + "()",
+  receiver: receiver,
+)
+
+#let render-item(name, value, depth: 2, prefix: "", recurse-scope: true, display: none, receiver: "") = {
   let anchor = item-anchor(name, prefix)
+  let head-label = if display == none { name } else { display }
 
   // A bare module (e.g. `asset`): a section heading, then its members.
   if type(value) == module {
-    ref-heading(name, anchor, depth)
+    ref-heading(head-label, anchor, depth)
+    // The `asset` types share `.url()`/`.read()`: promote them to the head of
+    // the section (reflected off the first type, `asset.file`, their canonical
+    // source) as methods on any asset (`asset.*.`), then render each type as a
+    // constructor without its (now-promoted) scope.
+    let promote-scope = name == "asset"
+    if promote-scope {
+      let shared = describe(dictionary(value).values().first()).scope
+      for (m-name, m) in dictionary(shared) {
+        render-item(m-name, m, depth: depth + 1, prefix: anchor, ..method-style(m-name, "asset.*."))
+      }
+    }
     for (member-name, member) in dictionary(value) {
-      render-item(member-name, member, depth: depth + 1, prefix: anchor)
+      render-item(member-name, member, depth: depth + 1, prefix: anchor,
+        recurse-scope: not promote-scope, ..constructor-style(member-name, name))
     }
     return
   }
@@ -146,8 +176,8 @@
   let d = describe(value)
   if d == none { return }
 
-  ref-heading(name, anchor, depth)
-  render-signature(d)
+  ref-heading(head-label, anchor, depth)
+  render-signature(d, receiver: receiver)
 
   if d.docs != none and d.docs != "" {
     eval(d.docs, mode: "markup")
@@ -161,10 +191,12 @@
     html.elem("div", attrs: (class: "returns"), { strong("Returns") + [ ]; render-type(d.returns) })
   }
 
-  // Associated scope (e.g. `document.url`, `asset.file`'s `.url`/`.read`).
-  if d.at("scope", default: none) != none {
+  // Associated scope (e.g. `document.url`) — rendered as methods on this item.
+  // Suppressed for the `asset` types, whose shared `.url`/`.read` are promoted
+  // to the section head instead.
+  if recurse-scope and d.at("scope", default: none) != none {
     for (member-name, member) in dictionary(d.scope) {
-      render-item(member-name, member, depth: depth + 1, prefix: anchor)
+      render-item(member-name, member, depth: depth + 1, prefix: anchor, ..method-style(member-name, d.name + "."))
     }
   }
 }
@@ -174,23 +206,38 @@
 // Walks the same items as `render-item` to collect (name, anchor, children)
 // triples, then renders them as a nested nav list linking to the anchors.
 
-#let toc-entries(name, value, prefix: "") = {
+// Mirrors `render-item`'s walk, carrying the same `display` label so the TOC
+// reads `.url()` for methods and `asset.file` for constructors. Takes the same
+// `..constructor-style`/`..method-style` spread as `render-item`, so it also
+// accepts `receiver` — unused here (the TOC renders no signature).
+#let toc-entries(name, value, prefix: "", recurse-scope: true, display: none, receiver: "") = {
   let anchor = item-anchor(name, prefix)
   let children = ()
   if type(value) == module {
+    // The `asset` types' shared scope is promoted to the section head (as
+    // methods), and not listed under each type.
+    let promote-scope = name == "asset"
+    if promote-scope {
+      let shared = describe(dictionary(value).values().first()).scope
+      for (m-name, m) in dictionary(shared) {
+        children += toc-entries(m-name, m, prefix: anchor, ..method-style(m-name, "asset.*."))
+      }
+    }
+    // Constructors keep their bare name in the sidebar — they're already nested
+    // under the module (`sass`, not `asset.sass`); the body heading qualifies.
     for (member-name, member) in dictionary(value) {
-      children += toc-entries(member-name, member, prefix: anchor)
+      children += toc-entries(member-name, member, prefix: anchor, recurse-scope: not promote-scope)
     }
   } else {
     let d = describe(value)
     if d == none { return () }
-    if d.at("scope", default: none) != none {
+    if recurse-scope and d.at("scope", default: none) != none {
       for (member-name, member) in dictionary(d.scope) {
-        children += toc-entries(member-name, member, prefix: anchor)
+        children += toc-entries(member-name, member, prefix: anchor, ..method-style(member-name, d.name + "."))
       }
     }
   }
-  ((name: name, anchor: anchor, children: children),)
+  ((name: if display == none { name } else { display }, anchor: anchor, children: children),)
 }
 
 #let toc-list(entries) = html.elem("ul", {
