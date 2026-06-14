@@ -180,7 +180,7 @@ Ok, so what is happening there in that last example? Twyla is rendering a
 folder, and then providing the URL to reference as the src of an image _OR_
 inline as an `<svg>` element.
 
-You can find an even cooler example here on Twyla's own website. See
+You can find an even cooler example here on Twyla's own website. See the
 little fireplace tongs we use as an icon? Those are drawn procedurally in a
 #link("https://cetz-package.github.io")[Cetz] canvas, and then rendered by Twyla
 as part of the theme, in order to generate the actual favicon URL!

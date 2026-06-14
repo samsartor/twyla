@@ -43,14 +43,18 @@ try {
     type: "image/x-icon",
     href: asset.typst([
       #set page(width: auto, height: auto, fill: none, margin: 0mm)
-      #grabber-canvas(
+      #let thing = grabber-canvas(
         theta: -40deg,
         phi: 40deg,
-        color: grabber-grad,
-        ht: 2mm,
+        color: white,
+        rad: 0.5,
+        hw: 0.5,
+        ht: 3mm,
         st: 4mm,
-        gt: 2mm
+        gt: 3mm
       )
+      #context rect(fill: black, height: auto, width: auto, inset: 5mm, radius: 20mm, thing)
+      
     ], format: "svg").url(),
   )
   html.elem("link", attrs: (rel: "stylesheet", href: "https://bin.samsartor.com/iosevka_27.3.3/iosevka.css"))

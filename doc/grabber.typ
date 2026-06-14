@@ -56,4 +56,4 @@
 
 #let grabber-canvas(..stuff) = cetz.canvas(grabber(..stuff))
 
-#let grabber-grad = gradient.linear(rgb("e8a76c"), rgb("5cc6e8"), relative: "parent", space: oklch)
+#let grabber-grad = gradient.linear(rgb("5cc6e8"), rgb("e8a76c"), relative: "parent", space: oklch)
