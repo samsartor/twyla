@@ -18,6 +18,14 @@ typst-eval = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8
 typst-html = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
 typst-kit = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070", default-features = false, features = ["scan-fonts", "embedded-fonts", "watcher", "system-packages", "system-downloader", "emit-diagnostics"] }
 typst-library = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
+# `asset.typst` compiles a stock-typst document in-process and serializes it to
+# the requested format: paged layout (`typst-layout`'s `PagedDocument`) feeds
+# the SVG/PDF/PNG encoders (`typst-svg`/`typst-pdf`/`typst-render`); the `html`
+# format reuses `typst-html` above. Same pinned rev as the rest of typst.
+typst-layout = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
+typst-svg = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
+typst-pdf = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
+typst-render = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }
 # Referenced by the `#[func]` macro expansion (`typst_utils::Static`); a
 # direct dep so twyla can define native typst builtins. Same pinned rev.
 typst-utils = { git = "https://github.com/typst/typst", rev = "de6f400976f9bf6ab8b923d13a068722959d0070" }

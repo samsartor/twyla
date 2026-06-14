@@ -62,6 +62,8 @@ pub fn install(rules: &mut NativeRuleMap) {
     rules.register(Target::Paged, crate::asset::sass::SHOW_RULE);
     rules.register(Target::Html, crate::asset::image::SHOW_RULE);
     rules.register(Target::Paged, crate::asset::image::SHOW_RULE);
+    rules.register(Target::Html, crate::asset::typst_doc::SHOW_RULE);
+    rules.register(Target::Paged, crate::asset::typst_doc::SHOW_RULE);
 }
 
 /// Heading id: an explicit label wins (so `#link(<slug>)` → `#slug`

@@ -42,6 +42,7 @@ pub(crate) mod file;
 pub(crate) mod image;
 mod raw;
 pub(crate) mod sass;
+pub(crate) mod typst_doc;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug, Formatter};
@@ -113,6 +114,18 @@ pub enum AssetSpec {
         /// `None` keeps the source format.
         format: Option<image::Format>,
         quality: u8,
+    },
+    /// Compile a typst document (a project `.typ` file or an inline content
+    /// value) and emit it in a chosen format. See [`typst_doc`]. Compiled as
+    /// stock typst, so its output is a pure function of `(input, format, ppi)`.
+    Typst {
+        /// The document source — a project file or a captured content value.
+        input: typst_doc::TypstInput,
+        /// The output format (svg / png / pdf / html).
+        format: typst_doc::Format,
+        /// `png` resolution in pixels per inch. Normalized to `0` for the other
+        /// formats, so it never fragments their output.
+        ppi: i64,
     },
 }
 
@@ -323,6 +336,7 @@ pub fn module() -> Module {
     scope.define_elem::<file::FileAsset>();
     scope.define_elem::<sass::SassAsset>();
     scope.define_elem::<image::ImageAsset>();
+    scope.define_elem::<typst_doc::TypstAsset>();
     Module::new("asset", scope)
 }
 
@@ -701,6 +715,9 @@ impl AssetResolver {
             } => image::build(
                 source, *width, *height, *fit, *filter, *format, *quality, &self.ctx, span,
             )?,
+            AssetSpec::Typst { input, format, ppi } => {
+                typst_doc::build(world, input, *format, *ppi, &self.ctx, span)?
+            }
         };
 
         let output_path = self.ctx.default_asset_output(&built);

@@ -130,26 +130,36 @@ If you would like to include an image, you can use either the built-in image fun
 ```typst
 #image("./pretty.png")
 
-#context html.img(src: asset.image("./pretty.png", format: "webp", resize: 1024).url)
+#context html.img(src: asset.image("./pretty.png", format: "webp", width: 1024).url())
 ```
 
-> This is aspirational, and some features documented here, like `asset.image` do not yet exist. If you want to help out, message [Sam](https://samsartor.com/) or [Sumner](https://sumnerevans.com/).
+> Some features documented here, like `asset.rolldown` (TS → JS), do not exist yet. If you want to help out, message [Sam](https://samsartor.com/) or [Sumner](https://sumnerevans.com/).
 
 Assets are pretty powerful, you can use them to do all kinds of stuff!
 
 ```typst
-Check out this pretty #html.img(src: asset("icon.svg").data-url) icon.
+// Compile a standalone typst document to a downloadable PDF:
+#context html.a(href: asset.typst("/resume/cv.typ", format: "pdf").url())[Download my CV]
 
+// Inline a typst diagram as SVG, straight into the page:
 #figure(
-  context raw-html(asset("./_diagram.typ", format: "svg").content),
+  context raw-html(asset.typst("./_diagram.typ", format: "svg").read()),
   caption: [A diagram of some sort],
 )
 
+// Inline content works too — rendered as plain, stock typst:
 #figure(
-  context html.img(src: asset(circle(), format: "svg").url, style: "width: 100%"),
-  caption: [A big cirle],
+  context html.img(src: asset.typst(circle(), format: "svg").url(), style: "width: 100%"),
+  caption: [A big circle],
 )
 ```
+
+`asset.typst` compiles its source — a project `.typ` file or an inline content
+value — as **plain, stock Typst** (no Twyla builtins, no cross-linking, no
+`#document`), so the result is a self-contained artifact. Pick the output with
+`format`: `"svg"`, `"png"` (`ppi:` controls resolution), `"pdf"`, or `"html"`.
+The compile runs in-process, so `#import`s, `@preview` packages, diagnostics,
+and hot-reload all work.
 
 ## Customization
 

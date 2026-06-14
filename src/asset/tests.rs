@@ -514,6 +514,152 @@ fn editing_source_revalidates_inline_document() {
     );
 }
 
+/// `asset.typst` with an inline content value compiles to SVG under a stock
+/// library and inlines via `raw-html` — the README's `circle()` icon case. The
+/// content is built in the page's (twyla) library but laid out as stock typst.
+#[test]
+fn typst_inline_content_compiles_to_svg() {
+    let (ctx, _dir) = site(&[(
+        "content/main.typ",
+        "#context raw-html(asset.typst(circle(fill: blue, radius: 6pt), format: \"svg\").read())",
+    )]);
+    let (html, _assets) = compile(&RenderWorld::new(&ctx).unwrap());
+
+    assert!(html.contains("<svg"), "inline content not rendered to svg:\n{html}");
+    assert!(
+        !html.contains("__twyla-asset-pending__"),
+        "placeholder leaked:\n{html}"
+    );
+}
+
+/// `asset.typst` with a path source compiles a standalone `.typ` file (here to
+/// PDF). The source lives at the project root, *not* under `content/`, so it is
+/// an asset, not a page. Proves the path branch: the real file compiles as
+/// `main` through the delegating loader.
+#[test]
+fn typst_path_source_compiles_to_pdf() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context asset.typst(\"/doc.typ\", format: \"pdf\").url()",
+        ),
+        ("doc.typ", "= A Standalone Document\n\nWith a paragraph of text."),
+    ]);
+    let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+
+    assert_eq!(assets.len(), 1, "got {assets:?}");
+    let asset = &assets[0];
+    assert!(
+        asset.output_path.starts_with("assets/doc-") && asset.output_path.ends_with(".pdf"),
+        "unexpected output path: {}",
+        asset.output_path,
+    );
+    assert!(html.contains(&asset.url), "page missing resolved url:\n{html}");
+    let bytes = asset.built.emit.read().unwrap();
+    assert!(
+        bytes.starts_with(b"%PDF"),
+        "output is not a PDF (starts with {:?})",
+        &bytes[..bytes.len().min(8)],
+    );
+}
+
+/// The `png` format renders to a raster image at the requested `ppi`.
+#[test]
+fn typst_inline_content_compiles_to_png() {
+    let (ctx, _dir) = site(&[(
+        "content/main.typ",
+        "#context asset.typst(circle(fill: red, radius: 10pt), format: \"png\", ppi: 96).url()",
+    )]);
+    let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+
+    let asset = &assets[0];
+    assert!(asset.output_path.ends_with(".png"), "not png: {}", asset.output_path);
+    assert_eq!(
+        ::image::guess_format(&asset.built.emit.read().unwrap()).unwrap(),
+        ::image::ImageFormat::Png,
+        "output should be a PNG",
+    );
+}
+
+/// The `html` format compiles the document like a page and emits an `.html`
+/// asset.
+#[test]
+fn typst_path_source_compiles_to_html() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context asset.typst(\"/frag.typ\", format: \"html\").url()",
+        ),
+        ("frag.typ", "= Heading\n\nbody text"),
+    ]);
+    let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+
+    let asset = &assets[0];
+    assert!(asset.output_path.ends_with(".html"), "not html: {}", asset.output_path);
+    let body = String::from_utf8(asset.built.emit.read().unwrap().to_vec()).unwrap();
+    assert!(body.contains("body text"), "html missing body:\n{body}");
+}
+
+/// A bare `asset.typst(..)` left in markup is refused by the default show rule
+/// (consumed via `.url()`/`.read()` in normal use), like the other assets.
+#[test]
+fn bare_typst_asset_is_refused() {
+    let (ctx, _dir) = site(&[(
+        "content/main.typ",
+        "#asset.typst(circle(), format: \"svg\")",
+    )]);
+    let err = RenderWorld::new(&ctx)
+        .unwrap()
+        .compile_bundle(&mut AssetResolver::new(&ctx))
+        .err()
+        .expect("a bare typst asset in markup should error")
+        .to_string();
+    assert!(
+        err.contains("cannot be shown directly"),
+        "expected a show-refusal error, got: {err}"
+    );
+}
+
+/// Editing a typst asset's source file (or an import) revalidates it to a new
+/// fingerprint on a warm rebuild — proving the sub-compile's file reads are
+/// harvested into `upstream` and drive invalidation, like sass partials.
+#[test]
+fn editing_typst_source_revalidates_to_new_fingerprint() {
+    let (ctx, dir) = site(&[
+        (
+            "content/main.typ",
+            "#context asset.typst(\"/doc.typ\", format: \"svg\").url()",
+        ),
+        ("doc.typ", "= First Version"),
+    ]);
+    let mut world = RenderWorld::new(&ctx).unwrap();
+    let mut resolver = AssetResolver::new(&ctx);
+
+    let url1 = world
+        .compile_bundle(&mut resolver)
+        .unwrap()
+        .assets()
+        .next()
+        .unwrap()
+        .output_path
+        .clone();
+
+    std::thread::sleep(Duration::from_millis(10));
+    std::fs::write(dir.path().join("doc.typ"), "= A Different Version").unwrap();
+    comemo::evict(0);
+    world.files.reset();
+
+    let outputs2 = world.compile_bundle(&mut resolver).unwrap();
+    let url2 = outputs2.assets().next().unwrap().output_path.clone();
+    let html2 = outputs2.docs().next().unwrap().html.clone();
+
+    assert_ne!(url1, url2, "fingerprint did not change after editing the typst source");
+    assert!(
+        !html2.contains("__twyla-asset-pending__"),
+        "placeholder leaked after edit:\n{html2}"
+    );
+}
+
 /// Hash discipline (the comemo split): the resolved-map hashes by *content* and
 /// is order-independent; the sink hashes on *epoch* (constant within a
 /// generation, distinct across them).

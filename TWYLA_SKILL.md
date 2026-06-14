@@ -102,8 +102,10 @@ Twyla registers these on top of stock Typst. This is your whole toolbox.
 **Assets** — fingerprinted, emitted to `/assets/...`, resolved contextually:
 
 ```typ
-#context asset.sass("/sass/site.sass").url()   // compile SCSS/Sass → CSS
-#context asset.file("/static/logo.png").url()  // copy a file verbatim
+#context asset.sass("/sass/site.sass").url()    // compile SCSS/Sass → CSS
+#context asset.file("/static/logo.png").url()   // copy a file verbatim
+#context asset.image("/img/hero.jpg", width: 1024, format: "webp").url()  // resize + transcode
+#context asset.typst("/resume/cv.typ", format: "pdf").url()  // compile a typst doc (svg/png/pdf/html)
 ```
 
 Paths are project-root-relative when they start with `/`. `.url()` is
