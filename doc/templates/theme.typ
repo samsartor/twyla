@@ -24,6 +24,8 @@ try {
   if (saved) document.documentElement.style.colorScheme = saved;
 } catch (e) {}"
 
+#import "/grabber.typ": grabber-canvas
+
 // The `<head>`: charset/viewport, title + description from this page's
 // `document` metadata, the Iosevka fonts, the compiled stylesheet, and the
 // theme script.
@@ -73,6 +75,13 @@ try {
 
 // The home-page hero banner.
 #let hero = html.elem("section", attrs: (class: "hero"), {
+  html.div(class: "heroicon", for p in (70deg, 40deg, 20deg) {
+    html.frame(grabber-canvas(
+      theta: 0deg,
+      phi: p,
+      color: gradient.linear(rgb("0a7ea4"), rgb("5cc6e8"), relative: "parent"),
+    ))
+  })
   html.elem("h1", attrs: (class: "hero-title"), "Twyla")
   html.elem("p", attrs: (class: "hero-tagline"), [The static site generator where everything is Typst.])
 })
