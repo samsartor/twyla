@@ -78,8 +78,7 @@ I make bread!
 
 You can see Twyla's main idea in action: _there is no configuration, only code._
 Typst is a real programming language. If you want to create sidebars, listings,
-tags, "recents", your own personal #strike[Twitter] #strike[X] BlueSky clone ...
-well that is what a for loop is good for!
+tags, "recents", whatever ... well that is what for loops are for!
 
 Before you get carried away, please include basic information like `title` and `date`:
 
@@ -153,34 +152,38 @@ If you would like to include an image, you can use either the built-in
 image function or handle it explicitly with Twyla's
 #link("https://twyla.dev/reference/assets")[asset system];:
 
-```typst
-#image("./pretty.png")
+```example
+#image("./audrey.jpg")
 
-#context html.img(src: asset.image("./pretty.png", format: "webp", resize: 1024).url)
+#context html.img(src: asset.image("./audrey.jpg", format: "webp", width: 512).url())
 ```
-
-#quote(block: true)[
-This is aspirational, and some features documented here,
-like `asset.image` do not yet exist. If you want to help
-out, message #link("https://samsartor.com/")[Sam] or
-#link("https://sumnerevans.com/")[Sumner].
-]
 
 Assets are pretty powerful, you can use them to do all kinds of stuff!
 
-```typst
-Check out this pretty #html.img(src: asset("icon.svg").data-url) icon.
+```example
+
+Check out this pretty #context html.img(src: asset.file("icon.svg").url()) icon.
 
 #figure(
-  context raw-html(asset("./_diagram.typ", format: "svg").content),
+  context raw-html(asset.typst("./_diagram.typ", format: "svg").read()),
   caption: [A diagram of some sort],
 )
 
 #figure(
-  context html.img(src: asset(circle(), format: "svg").url, style: "width: 100%"),
+  context html.img(src: asset.typst(circle(), format: "svg").url(), style: "width: 100%"),
   caption: [A big cirle],
 )
 ```
+
+Ok, so what is happening there in that last example? Twyla is rendering a
+`circle()` as an SVG, writing that SVG to a generated path in your `public/`
+folder, and then providing the URL to reference as the src of an image _OR_
+inline as an `<svg>` element.
+
+You can find an even cooler example here on Twyla's own website. See
+little fireplace tongs we use as an icon? Those are drawn procedurally in a
+#link("https://cetz-package.github.io")[Cetz] canvas, and then rendered by Twyla
+as part of the theme, in order to generate the actual favicon URL!
 
 = Customization
 <customization>
@@ -190,7 +193,7 @@ usual
 For example, you can replace Twyla's default theme and build your own
 HTML from scratch:
 
-```typst
+```example
 #show: body => {
   set smartquote(enabled: true)
   set raw(theme: "/templates/Dracula.tmTheme")
@@ -206,15 +209,14 @@ HTML from scratch:
         name: "viewport",
         content: "width=device-width, initial-scale=1",
       ))
-      html.elem("meta", attrs: (
+      context html.elem("meta", attrs: (
         name: "description",
         content: if document.description == none { "" }
-          else { document.description },
+          else { plain-text(document.description) },
       ))
-      html.elem("title", document.title)
-      html.script(src: asset.rolldown("/scripts/main.ts").url(), "")
-      html.link(rel: "stylesheet", href: asset.sass("/sass/main.sass").url())
-      html.link(rel: "icon", href: asset.image(circle(fill: blue), format: "png").url())
+      context html.elem("title", document.title)
+      context html.link(rel: "stylesheet", href: asset.sass("/sass/main.sass").url())
+      context html.link(rel: "icon", href: asset.typst(circle(fill: blue), format: "png").url())
     })
     html.elem("body", body)
   })
@@ -224,12 +226,11 @@ HTML from scratch:
 ...
 ```
 
-Notice the uses of `asset.url()`. Twyla's
-#link("/reference/asset")[asset system] can automatically convert assets
-such as SASS to CSS (using the
-#link("https://github.com/connorskees/grass")[grass] library), TS to JS
-(using #link("https://rolldown.rs")[rolldown];), and Typst
-#emph[content] into PNG/SVG/PDF (using Typst itself).
+Again, notice the uses of `asset.url()`. Twyla's #link("/reference/asset")[asset
+system] can automatically convert assets such as SASS to CSS (using the
+#link("https://github.com/connorskees/grass")[grass] library) and Typst
+#emph[content] into PNG/SVG/PDF (using Typst itself). Soon we'll include TS to
+JS conversion using #link("https://rolldown.rs")[rolldown] as well.
 
 Instead of stylizing every post separately, you probably want to create
 a common set of templates:
@@ -276,8 +277,8 @@ but instead of overwriting `public/` like `twyla build`, the `twyla convert
 You can iterate on the Typst version of your source personally: replacing
 placeholders, writing templates, recreating your theme, etc until the diff
 is small enough that you are satisfied. Or alternatively, you can download
-#link("https://raw.githubusercontent.com/samsartor/twyla/refs/heads/main/TWYLA_S
-KILL.md")[`TWYLA_SKILL.md`] and throw your agent of choice at the problem.
+#link("https://raw.githubusercontent.com/samsartor/twyla/refs/heads/main/TWYLA_SKILL.md")[TWYLA_SKILL.md]
+and throw your agent of choice at the problem.
 
 Feel free to simultaneously iterate on the `twyla convert` utility itself too,
 especially if you use a currently-unsupported SSG (or unusual features thereof).

@@ -24,7 +24,7 @@ try {
   if (saved) document.documentElement.style.colorScheme = saved;
 } catch (e) {}"
 
-#import "/grabber.typ": grabber-canvas
+#import "/grabber.typ": grabber-canvas, grabber-grad
 
 // The `<head>`: charset/viewport, title + description from this page's
 // `document` metadata, the Iosevka fonts, the compiled stylesheet, and the
@@ -38,7 +38,21 @@ try {
   if document.description != none {
     html.elem("meta", attrs: (name: "description", content: plain-text(document.description)))
   }
-
+  context html.link(
+    rel: "icon",
+    type: "image/x-icon",
+    href: asset.typst([
+      #set page(width: auto, height: auto, fill: none, margin: 0mm)
+      #grabber-canvas(
+        theta: -40deg,
+        phi: 40deg,
+        color: grabber-grad,
+        ht: 2mm,
+        st: 4mm,
+        gt: 2mm
+      )
+    ], format: "svg").url(),
+  )
   html.elem("link", attrs: (rel: "stylesheet", href: "https://bin.samsartor.com/iosevka_27.3.3/iosevka.css"))
   html.elem("link", attrs: (rel: "stylesheet", href: "https://bin.samsartor.com/iosevka_27.3.3/iosevka-aile.css"))
   html.elem("link", attrs: (rel: "stylesheet", href: asset.sass("/sass/main.sass").url()))
@@ -79,7 +93,7 @@ try {
     html.frame(grabber-canvas(
       theta: 0deg,
       phi: p,
-      color: gradient.linear(rgb("0a7ea4"), rgb("5cc6e8"), relative: "parent"),
+      color: grabber-grad,
     ))
   })
   html.elem("h1", attrs: (class: "hero-title"), "Twyla")
