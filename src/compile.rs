@@ -2,25 +2,27 @@
 //! plus twyla's per-document metadata harvest.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use comemo::{Track, Tracked, TrackedMut};
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
+use iddqd::IdHashMap;
 use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult, Warned};
 use typst::foundations::{
-    Array, BundlePath, Content, Datetime, Dict, IntoValue, NativeElement, Output, Smart,
+    Array, BundlePath, Content, Datetime, Dict, Dynamic, IntoValue, NativeElement, Output, Smart,
     StyleChain, Styles, Target, TargetElem, Value,
 };
 use typst::syntax::{FileId, Span, VirtualPath};
-use typst_bundle::Bundle;
+use typst_bundle::{Bundle, BundleIntrospector};
 use typst_library::engine::{Engine, Route, Sink, Traced};
 use typst_library::introspection::{EmptyIntrospector, Introspector, Locator, MAX_ITERS, analyze};
 use typst_library::model::{DocumentElem, DocumentInfo};
 use typst_library::routines::{Arenas, RealizationKind};
 use typst_utils::Protected;
 
-use crate::asset::{AssetResolver, ResolvedAsset};
-use crate::document::{DiscoveredDoc, TwylaDocument, TwylaDocumentList, TwylaSite};
+use crate::asset::{AssetReqIntrospect, AssetResolver, ResolvedAsset, hash_spec};
+use crate::document::{DOCUMENTS_LIST_KEY, DocumentReqIntrospect, ResolvedDocument};
 use crate::project::TwylaContext;
 
 /// One page's harvested twyla metadata — the row that becomes one
@@ -153,6 +155,97 @@ fn eval_file(engine: &mut Engine, id: FileId) -> SourceResult<Content> {
         &source,
     )?
     .content())
+}
+
+pub struct TwylaIntrospector {
+    pub inner: Arc<BundleIntrospector>,
+    pub resolver: AssetResolver,
+}
+
+impl Introspector for TwylaIntrospector {
+    fn query(&self, selector: &Selector) -> EcoVec<Content> {
+        self.inner.query(selector)
+    }
+
+    fn query_first(&self, selector: &Selector) -> Option<Content> {
+        self.inner.query_first(selector)
+    }
+
+    fn query_unique(&self, selector: &Selector) -> StrResult<Content> {
+        self.inner.query_unique(selector)
+    }
+
+    fn query_label(&self, label: Label) -> StrResult<&Content> {
+        self.inner.query_label(label)
+    }
+
+    fn query_labelled(&self) -> EcoVec<Content> {
+        self.inner.query_labelled()
+    }
+
+    fn query_count_before(&self, selector: &Selector, end: Location) -> usize {
+        self.inner.query_count_before(selector, end)
+    }
+
+    fn label_count(&self, label: Label) -> usize {
+        todo!()
+    }
+
+    fn locator(&self, key: u128, base: Location) -> Option<Location> {
+        todo!()
+    }
+
+    fn pages(&self, location: Location) -> Option<NonZeroUsize> {
+        todo!()
+    }
+
+    fn page(&self, location: Location) -> Option<NonZeroUsize> {
+        todo!()
+    }
+
+    fn position(&self, location: Location) -> Option<DocumentPosition> {
+        todo!()
+    }
+
+    fn page_numbering(&self, location: Location) -> Option<&Numbering> {
+        todo!()
+    }
+
+    fn page_supplement(&self, location: Location) -> Option<&Content> {
+        todo!()
+    }
+
+    fn anchor(&self, location: Location) -> Option<&EcoString> {
+        todo!()
+    }
+
+    fn document(&self, location: Location) -> Option<Location> {
+        todo!()
+    }
+
+    fn path(&self, location: Location) -> Option<&VirtualPath> {
+        todo!()
+    }
+
+    // TODO: update ustream to return Value instead of &Value
+    fn value(&self, key: u128) -> Option<Value> {
+        if key == DOCUMENTS_LIST_KEY {
+            // TODO: only compute when updated
+            return Some(
+                self.resolver
+                    .documents()
+                    .map(|doc| doc.doc.to_dict().to_value())
+                    .collect(),
+            );
+        }
+        for asset in self.resolver.resolved_assets() {
+            // TODO: can we use the IdHashMap for this lookup somehow?
+            if hash_spec(&asset.spec) == key {
+                return Some(Value::Dyn(Dynamic::new(asset.clone())));
+            }
+        }
+        None
+    }
 }
 
 /// The single fixed-point loop: typst's introspection convergence, asset URL
@@ -352,7 +445,7 @@ fn harvest_metadata(
     }
     // An explicit `output` is resolved relative to the source's folder stem
     // (leading `/` = bundle root); an `auto` output derives from the source path.
-    let source = id.vpath().get_without_slash();
+    let source = id.vpath().get_with_slash();
     let output = match output {
         Some(raw) => ctx.resolve_document_output(source, &raw).map_err(|msg| {
             eco_vec![SourceDiagnostic::error(
@@ -363,7 +456,7 @@ fn harvest_metadata(
         None => ctx.default_document_output(source),
     };
     let kind =
-        kind.unwrap_or_else(|| EcoString::from(ctx.default_kind(id.vpath().get_without_slash())));
+        kind.unwrap_or_else(|| EcoString::from(ctx.default_kind(id.vpath().get_with_slash())));
     let url = ctx.document_url(&output);
 
     Ok(HarvestedDoc {

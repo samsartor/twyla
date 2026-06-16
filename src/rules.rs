@@ -49,8 +49,8 @@ pub fn install(rules: &mut NativeRuleMap) {
     // hoisted to its own bundle output). `register` (not `replace`) — twyla owns
     // this element, so there is no upstream rule. Bundle target is intentionally
     // left rule-less so the element survives realization for discovery.
-    rules.register(Target::Html, crate::document::RENDER_NOTHING);
-    rules.register(Target::Paged, crate::document::RENDER_NOTHING);
+    rules.register(Target::Html, crate::document::RENDER_INTROSPECTION);
+    rules.register(Target::Paged, crate::document::RENDER_INTROSPECTION);
 
     // Assets are consumed via `.url()`/`.read()` (which discard the element), so
     // they never reach realization in normal use. A bare `#asset.file(..)` left
@@ -142,9 +142,10 @@ const LINK_RULE: ShowFn<LinkElem> = |elem, engine, _| {
             Some(url)
         }
         Destination::Position(_) => {
-            engine
-                .sink
-                .warn(warning!(span, "positional link was ignored during HTML export"));
+            engine.sink.warn(warning!(
+                span,
+                "positional link was ignored during HTML export"
+            ));
             None
         }
         Destination::Location(location) => Some(
@@ -187,7 +188,10 @@ const LINK_RULE: ShowFn<LinkElem> = |elem, engine, _| {
 /// bytes ([`image_ext`]).
 const IMAGE_RULE: ShowFn<ImageElem> = |elem, _engine, styles| {
     let span = elem.span();
-    let Derived { source, derived: loaded } = &elem.source;
+    let Derived {
+        source,
+        derived: loaded,
+    } = &elem.source;
 
     // A project `FileId` (for File-backed assets) needs a resolvable path.
     let file = match source {
@@ -197,7 +201,10 @@ const IMAGE_RULE: ShowFn<ImageElem> = |elem, _engine, styles| {
 
     // Only raster formats can go through the decode/resize/transcode pipeline;
     // vectors are copied verbatim.
-    let raster = matches!(ImageFormat::detect(&loaded.data), Some(ImageFormat::Raster(_)));
+    let raster = matches!(
+        ImageFormat::detect(&loaded.data),
+        Some(ImageFormat::Raster(_))
+    );
 
     let (src, dimensions) = if raster {
         let img_source = match file {

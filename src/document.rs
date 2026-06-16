@@ -1,19 +1,22 @@
 //! The `document` element and `documents()` builtin.
 
-use std::fmt::{self, Debug, Formatter};
-use std::hash::{Hash, Hasher};
+use std::fmt::Debug;
+use std::hash::Hash;
 
 use comemo::Tracked;
-use crossbeam_channel::Sender;
 use ecow::{EcoString, eco_vec};
-use typst::diag::{At as _, HintedStrResult, SourceDiagnostic, SourceResult};
+use iddqd::IdHashItem;
+use typst::diag::{At as _, SourceDiagnostic, SourceResult};
+use typst::engine::Engine;
 use typst::foundations::{
-    Array, Binding, Content, Context, Datetime, Dict, NativeElement as _, Packed, Repr, Scope,
-    ShowFn, Smart, Str, StyleChain, Value, elem, func, scope, ty,
+    Array, Binding, Content, Context, Datetime, Dict, IntoValue as _, NativeElement as _, Packed,
+    Scope, ShowFn, Smart, Str, StyleChain, Value, elem, func, scope,
 };
+use typst::introspection::{History, Introspect, Introspector, Location};
 use typst::syntax::{FileId, Span};
 
-use crate::project::{TwylaContext, build_document_url};
+use crate::asset::Upstream;
+use crate::project::TwylaContext;
 
 /// Defines a page of the website.
 ///
@@ -117,6 +120,7 @@ impl TwylaDocument {
     /// prepended as that positional on a method call).
     #[func(contextual)]
     fn url(
+        engine: &mut Engine,
         context: Tracked<Context>,
         /// The document instance — present only on a method call (`doc.url()`),
         /// absent on the static `document.url()`.
@@ -124,215 +128,36 @@ impl TwylaDocument {
         this: Option<Content>,
     ) -> SourceResult<Str> {
         let styles = context.styles().at(Span::detached())?;
-        let base = base_url_on_chain(styles);
 
-        let output = match this {
-            // Instance: read the element's *own* output (not chain-resolved, so
-            // it can't accidentally inherit the surrounding page's), then report
-            // it on the discovery sink exactly like a shown inline document.
+        let meta = match this {
+            // Instance: register a DocumentIntrospect in case the this TwylaDocument
+            // element is never shown (eg called like `document(output: "foo.html")[].url()`)
+            // and then use it to look up the resolved url.
             Some(content) => {
-                let elem = content.into_packed::<TwylaDocument>().unwrap();
-                // Resolve against the enclosing page's output (on the chain), then
-                // discover the document for emission at that same resolved path.
-                let Some(output) = resolve_inline_output(styles, &elem)? else {
-                    // No enclosing page output yet (the metadata-harvest render) —
-                    // the URL is discarded, so return the placeholder unresolved.
-                    return Ok(Str::from(DOC_PENDING));
-                };
-                send_document(styles, &elem, &output)?;
-                EcoString::from(output)
+                let elem = content.to_packed::<TwylaDocument>().unwrap();
+                engine.introspect(DocumentReqIntrospect(request(styles, elem)?))
             }
-            // Static: the current page's output, injected onto the body chain by
-            // `crate::compile`. Absent only where the render is discarded (the
-            // metadata harvest) — return the placeholder rather than erroring; it
-            // never reaches real output.
-            None => match styles.get_cloned(TwylaDocument::output) {
-                Smart::Custom(output) => output,
-                Smart::Auto => return Ok(Str::from(DOC_PENDING)),
-            },
+            // Static: the current page's url.
+            None => engine.introspect(DocumentAtIntrospect(context.location().unwrap())),
         };
-
-        Ok(Str::from(build_document_url(base.as_deref(), &output)))
+        match meta.get("url") {
+            Ok(Value::Str(url)) => Ok(url.clone()),
+            _ => Ok(Str::from(DOC_PENDING)),
+        }
     }
 }
 
-/// Placeholder returned by the static `document.url()` when no current-page
-/// output is on the chain (the metadata-harvest render, which is discarded). A
-/// real compile injects the output, so this never reaches emitted HTML — a leak
-/// would signal that injection regressed.
-const DOC_PENDING: &str = "/__twyla-doc-pending__";
-
-/// Read the site `base_url` off the style chain ([`TwylaSite`]), or `None` for a
-/// relative-URL build. Lets `document.url()` build URLs without a `TwylaContext`.
-fn base_url_on_chain(styles: StyleChain) -> Option<EcoString> {
-    match styles.get_cloned(TwylaSite::base_url) {
-        Value::Str(s) => Some(EcoString::from(s.as_str())),
-        _ => None,
-    }
-}
-
-/// Internal host carrying the site `base_url` on the style chain, injected by
-/// [`crate::compile`] each iteration. Not user-constructible, not bound in the
-/// global scope (mirrors [`TwylaDocumentList`]).
-#[elem]
-pub struct TwylaSite {
-    /// The `base_url` as a [`Value::Str`], or [`Value::None`] for a relative
-    /// build.
-    #[default(Value::None)]
-    pub base_url: Value,
-}
-
-/// An inline `#document(..)[body]` renders to **nothing** where it sits, so
-/// `foo #document(output: "x")[stuff] bar` lays out as `foo bar` — but on the
-/// way out it reports itself on the discovery sink ([`send_document`]), so
-/// twyla can re-home its body as its own bundle output. This is the exact same
-/// side-channel trick the asset system uses ([`crate::asset`]): the element
-/// doesn't need to *survive* realization, so discovery happens in the normal
-/// Html render pass, in the same relayout iteration as asset resolution.
-///
-/// Registered on the in-page targets (Html/Paged); the rule fires wherever the
-/// element is realized, so documents are discovered at any nesting depth.
-pub const RENDER_NOTHING: ShowFn<TwylaDocument> = |elem, _engine, styles| {
-    // Skip discovery when the output can't be resolved yet (no enclosing page
-    // output on the chain — the metadata-harvest render, whose result is
-    // discarded). `resolve_inline_output` still errors on a missing/escaping
-    // `output:`, which is a genuine bug in either pass.
-    if let Some(output) = resolve_inline_output(styles, elem)? {
-        send_document(styles, elem, &output)?;
-    }
-    Ok(Content::empty())
-};
-
-/// A document discovered through the sink during realization — the shape of a
-/// [`documents`] row plus its body and originating source. Flows Rust-side
-/// through [`DocumentSink`] to [`crate::asset::AssetResolver`], which collects
-/// it, dedups by `output`, and invalidates by `source` across warm rebuilds.
-#[derive(Clone)]
-pub struct DiscoveredDoc {
-    pub output: String,
-    pub title: Option<Content>,
-    pub date: Option<Datetime>,
-    pub description: Option<Content>,
-    pub kind: EcoString,
-    pub extra: Value,
-    pub draft: bool,
-    /// The inline document's body, as written at the call site.
-    pub body: Content,
-    /// The file the `#document(..)` call was written in — twyla evicts this
-    /// document when that file changes.
-    pub source: Option<FileId>,
-}
-
-/// Write-only channel reporting discovered documents out of an otherwise-pure
-/// realization pass. `Hash`/`Eq` key on `epoch` (the resolver's discovery
-/// generation), never the channel — identical to `crate::asset`'s `AssetSink`,
-/// and for the same reason: a constant hash would let comemo replay a cached
-/// realization without re-sending on a warm rebuild. Shares the asset
-/// resolver's epoch so the two sinks form one discovery generation.
-#[ty(name = "twyla-document-sink")]
-#[derive(Clone)]
-pub struct DocumentSink {
-    epoch: u64,
-    tx: Sender<DiscoveredDoc>,
-}
-
-impl DocumentSink {
-    /// Build a sink for the given discovery `epoch` and channel. Called by the
-    /// resolver when chaining the sink onto the style chain each iteration.
-    pub fn new(epoch: u64, tx: Sender<DiscoveredDoc>) -> Self {
-        Self { epoch, tx }
-    }
-}
-
-impl Debug for DocumentSink {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "DocumentSink(epoch={})", self.epoch)
-    }
-}
-
-impl Repr for DocumentSink {
-    fn repr(&self) -> EcoString {
-        EcoString::inline("twyla-document-sink")
-    }
-}
-
-impl PartialEq for DocumentSink {
-    fn eq(&self, other: &Self) -> bool {
-        self.epoch == other.epoch
-    }
-}
-
-impl Hash for DocumentSink {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.epoch.hash(state);
-    }
-}
-
-/// Internal host carrying the discovery sink on the style chain (mirrors
-/// `TwylaAssetSink`). Not user-constructible, not bound in the global scope.
-#[elem]
-pub struct TwylaDocumentSink {
-    /// A [`Value::Dyn`] wrapping [`DocumentSink`].
-    #[default(Value::None)]
-    pub sink: Value,
-}
-
-/// Resolve an inline `#document(..)`'s explicit `output:` to its bundle path.
-///
-/// The convention (`/` = bundle-root-absolute, else relative) lives in
-/// [`TwylaContext::resolve_output`]; this only supplies the anchor for relative
-/// paths: the **enclosing page's output dir**, read off the style chain
-/// ([`TwylaDocument::output`], which `crate::compile` injects onto each page
-/// body — *not* `elem.output`, which is this inline doc's own field). Returns:
-///
-/// - `Err` if no explicit `output:` was given (an inline document has no source
-///   filename to default from), or if a relative path escapes the site root.
-/// - `Ok(None)` when a *relative* output has no enclosing page output to anchor
-///   on — the metadata-harvest render, whose result is discarded. Absolute
-///   outputs need no anchor and always resolve.
-/// - `Ok(Some(path))` with the resolved bundle path otherwise.
-fn resolve_inline_output(
-    styles: StyleChain,
-    elem: &Packed<TwylaDocument>,
-) -> SourceResult<Option<String>> {
-    let Some(Smart::Custom(raw)) = elem.output.as_option() else {
-        return Err(eco_vec![SourceDiagnostic::error(
-            elem.span(),
-            EcoString::from("an inline `document(..)` needs an explicit `output:`"),
-        )]);
-    };
-    // The chain carries the enclosing page's resolved output, never this
-    // element's own (that lives on `elem`); `Auto` means no enclosing page yet
-    // (the harvest pass) → no anchor, so a relative `raw` defers.
-    let parent = styles.get_cloned(TwylaDocument::output);
-    let anchor = match &parent {
-        Smart::Custom(p) => Some(parent_dir(p)),
-        Smart::Auto => None,
-    };
-    TwylaContext::resolve_output(anchor, raw)
-        .map_err(|msg| eco_vec![SourceDiagnostic::error(elem.span(), EcoString::from(msg))])
-}
-
-/// The directory portion of a `/`-separated bundle output path (`""` if none) —
-/// the anchor a sibling inline document resolves a relative `output:` against.
-fn parent_dir(output: &str) -> &str {
-    match output.rfind('/') {
-        Some(i) => &output[..i],
-        None => "",
-    }
-}
-
-/// Report this inline document on the discovery sink at its already-resolved
-/// `output` (see [`resolve_inline_output`]); [`RENDER_NOTHING`] then erases it in
-/// place. A no-op if no sink is on the chain (e.g. realized outside twyla's
-/// pipeline).
-fn send_document(
-    styles: StyleChain,
-    elem: &Packed<TwylaDocument>,
-    output: &str,
-) -> SourceResult<()> {
-    let doc = DiscoveredDoc {
-        output: output.to_owned(),
+pub fn request(styles: StyleChain, elem: &Packed<TwylaDocument>) -> SourceResult<DocumentReq> {
+    Ok(DocumentReq {
+        output: match elem.output.get_cloned(styles) {
+            Smart::Auto => {
+                return Err(eco_vec![SourceDiagnostic::error(
+                    elem.span(),
+                    EcoString::from("an inline `document(..)` needs an explicit `output:`"),
+                )]);
+            }
+            Smart::Custom(out) => out.to_string(),
+        },
         title: elem.title.get_cloned(styles),
         date: elem.date.get_cloned(styles),
         description: elem.description.get_cloned(styles),
@@ -345,14 +170,174 @@ fn send_document(
         draft: elem.draft.get(styles),
         body: elem.body.clone(),
         source: elem.span().id(),
-    };
+        root: false,
+    })
+}
 
-    if let Value::Dyn(dynamic) = styles.get_cloned(TwylaDocumentSink::sink)
-        && let Some(sink) = dynamic.downcast::<DocumentSink>()
-    {
-        let _ = sink.tx.send(doc);
+/// Placeholder returned by the static `document.url()` when no current-page
+/// output is on the chain (the metadata-harvest render, which is discarded). A
+/// real compile injects the output, so this never reaches emitted HTML — a leak
+/// would signal that injection regressed.
+const DOC_PENDING: &str = "/__twyla-doc-pending__";
+
+/// Internal host carrying the site `base_url` on the style chain, injected by
+/// [`crate::compile`] each iteration. Not user-constructible, not bound in the
+/// global scope (mirrors [`TwylaDocumentList`]).
+#[elem]
+pub struct TwylaSite {
+    /// The `base_url` as a [`Value::Str`], or [`Value::None`] for a relative
+    /// build.
+    #[default(Value::None)]
+    pub base_url: Value,
+}
+
+pub const RENDER_INTROSPECTION: ShowFn<TwylaDocument> = |elem, engine, styles| {
+    engine.introspect(DocumentReqIntrospect(request(styles, elem)?));
+    Ok(Content::empty())
+};
+
+/// A document discovered through the sink during realization — the shape of a
+/// [`documents`] row plus its body and originating source. Flows Rust-side
+/// through [`DocumentSink`] to [`crate::asset::AssetResolver`], which collects
+/// it, dedups by `output`, and invalidates by `source` across warm rebuilds.
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub struct DocumentReq {
+    pub output: String,
+    pub title: Option<Content>,
+    pub date: Option<Datetime>,
+    pub description: Option<Content>,
+    pub kind: EcoString,
+    pub extra: Value,
+    pub draft: bool,
+    pub body: Content,
+    /// The file that is the source for this document. Twyla evicts this
+    /// document when that file changes. None if the document came
+    /// from a detached span.
+    pub source: Option<FileId>,
+    /// Was this document discovered as a *.typ file, or from document element.
+    pub root: bool,
+}
+
+impl DocumentReq {
+    /// The `documents()` dictionary form of this row.
+    pub fn to_dict(&self, ctx: &TwylaContext) -> Dict {
+        let mut d = Dict::new();
+        d.insert("url".into(), ctx.document_url(&self.output).into_value());
+        d.insert("output".into(), self.output.clone().into_value());
+        d.insert("title".into(), self.title.clone().into_value());
+        d.insert("date".into(), self.date.into_value());
+        d.insert("description".into(), self.description.clone().into_value());
+        d.insert("draft".into(), self.draft.into_value());
+        d.insert("kind".into(), self.kind.clone().into_value());
+        d.insert("extra".into(), self.extra.clone());
+        d
     }
-    Ok(())
+}
+
+pub struct ResolvedDocument {
+    pub doc: DocumentReq,
+    pub upstream: Upstream,
+    pub content_hash: u128,
+}
+
+impl IdHashItem for ResolvedDocument {
+    type Key<'a> = &'a str;
+
+    fn key(&self) -> &str {
+        &self.doc.output
+    }
+
+    iddqd::id_upcast!();
+}
+
+pub const DOCUMENTS_LIST_KEY: u128 = 0xdb18a2675fe9365ff4f5e2734237ff5c;
+
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub struct DocumentReqIntrospect(pub DocumentReq);
+
+impl Introspect for DocumentReqIntrospect {
+    type Output = Dict;
+
+    fn introspect(
+        &self,
+        _engine: &mut Engine,
+        introspector: Tracked<dyn Introspector + '_>,
+    ) -> Self::Output {
+        let Some(Value::Array(array)) = introspector.value(DOCUMENTS_LIST_KEY) else {
+            return Dict::new();
+        };
+        for doc in array {
+            let Value::Dict(doc) = doc else { continue };
+            let Ok(Value::Str(output)) = doc.get("output") else {
+                continue;
+            };
+            if output.as_str() == self.0.output {
+                return doc.clone();
+            }
+        }
+        Dict::new()
+    }
+
+    fn diagnose(&self, history: &History<Self::Output>) -> SourceDiagnostic {
+        todo!()
+    }
+}
+
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub struct DocumentAtIntrospect(pub Location);
+
+impl Introspect for DocumentAtIntrospect {
+    type Output = Dict;
+
+    fn introspect(
+        &self,
+        _engine: &mut Engine,
+        introspector: Tracked<dyn Introspector + '_>,
+    ) -> Self::Output {
+        let Some(path) = introspector.path(self.0) else {
+            return Dict::new();
+        };
+        let at_output = path.get_with_slash();
+        let Some(Value::Array(array)) = introspector.value(DOCUMENTS_LIST_KEY) else {
+            return Dict::new();
+        };
+        for doc in array {
+            let Value::Dict(doc) = doc else { continue };
+            let Ok(Value::Str(doc_output)) = doc.get("output") else {
+                continue;
+            };
+            if doc_output.as_str() == at_output {
+                return doc.clone();
+            }
+        }
+        Dict::new()
+    }
+
+    fn diagnose(&self, history: &History<Self::Output>) -> SourceDiagnostic {
+        todo!()
+    }
+}
+
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub struct DocumentsArrayIntrospect;
+
+impl Introspect for DocumentsArrayIntrospect {
+    type Output = Array;
+
+    fn introspect(
+        &self,
+        _engine: &mut Engine,
+        introspector: Tracked<dyn Introspector + '_>,
+    ) -> Self::Output {
+        let Some(Value::Array(array)) = introspector.value(DOCUMENTS_LIST_KEY) else {
+            return Array::new();
+        };
+        return array.clone();
+    }
+
+    fn diagnose(&self, history: &History<Self::Output>) -> SourceDiagnostic {
+        todo!()
+    }
 }
 
 /// The list of every page in the site.
@@ -374,24 +359,9 @@ fn send_document(
 ///   ]
 /// }
 /// ```
-#[func(contextual)]
-pub fn documents(
-    /// The context to read the page list from.
-    context: Tracked<Context>,
-) -> HintedStrResult<Array> {
-    Ok(context.styles()?.get_cloned(TwylaDocumentList::all))
-}
-
-/// Internal host for the [`documents`] list.
-///
-/// Not constructed by users and not bound in the global scope — it exists only
-/// to carry the harvested page list on the style chain, where [`documents`]
-/// reads it back (mirrors how typst's `TargetElem` hosts the `target` field).
-#[elem]
-pub struct TwylaDocumentList {
-    /// Every page's metadata, injected by [`crate::compile`] each compile.
-    #[default(Array::new())]
-    pub all: Array,
+#[func]
+pub fn documents(engine: &mut Engine) -> Array {
+    engine.introspect(DocumentsArrayIntrospect)
 }
 
 pub fn install(global: &mut Scope) {

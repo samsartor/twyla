@@ -712,9 +712,9 @@ fn map_hashes_by_content_sink_keys_on_epoch() {
             .set(Value::dynamic(AssetSink { epoch, tx }))
             .wrap()
     };
-    let (tx1, _r1) = unbounded::<AssetRequest>();
-    let (tx2, _r2) = unbounded::<AssetRequest>();
-    let (tx3, _r3) = unbounded::<AssetRequest>();
+    let (tx1, _r1) = unbounded::<AssetReq>();
+    let (tx2, _r2) = unbounded::<AssetReq>();
+    let (tx3, _r3) = unbounded::<AssetReq>();
     let same_a: LazyHash<Style> = sink(7, tx1);
     let same_b: LazyHash<Style> = sink(7, tx2);
     let other: LazyHash<Style> = sink(8, tx3);

@@ -95,7 +95,7 @@ pub struct OutputDoc {
 }
 
 /// Some data which can be emitted to the output directory.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Emit {
     Bytes(Bytes),
     Copy(PathBuf),
@@ -210,9 +210,9 @@ impl Outputs {
                     io::Error::new(e.kind(), format!("creating {}: {e}", parent.display()))
                 })?;
             }
-            output
-                .write_to(&dest)
-                .map_err(|e| io::Error::new(e.kind(), format!("writing {}: {e}", dest.display())))?;
+            output.write_to(&dest).map_err(|e| {
+                io::Error::new(e.kind(), format!("writing {}: {e}", dest.display()))
+            })?;
         }
         Ok(())
     }
@@ -448,7 +448,7 @@ impl RenderWorld {
             let raw = typst_html::html(doc).map_err(|errors| compile_err(self, &errors))?;
             if let Err(err) = all.insert_unique(Output::Doc(OutputDoc {
                 html: resolve_raw_html_placeholders(&raw),
-                output_path: path.get_without_slash().to_owned(),
+                output_path: path.get_with_slash().to_owned(),
                 meta: None,
             })) {
                 return Err(duplication_error(err).0);

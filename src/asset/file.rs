@@ -85,7 +85,10 @@ pub(crate) fn build(
 ) -> SourceResult<Built> {
     let on_disk = ctx.root.join(file.vpath().get_without_slash());
     let (on_disk, bytes) = Upstream::new_read_bytes(on_disk).map_err(|err| {
-        eco_vec![SourceDiagnostic::error(span, EcoString::from(err.to_string()))]
+        eco_vec![SourceDiagnostic::error(
+            span,
+            EcoString::from(err.to_string())
+        )]
     })?;
 
     Ok(Built {

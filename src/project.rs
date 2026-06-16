@@ -77,7 +77,12 @@ impl TwylaContext {
             .canonicalize()
             .map_err(|e| format!("cannot canonicalize root {}: {e}", root.display()))?;
         let base_url = base_url.map(|s| s.trim_end_matches('/').to_string());
-        Ok(Self { root, base_url, reflect: false, test_examples: false })
+        Ok(Self {
+            root,
+            base_url,
+            reflect: false,
+            test_examples: false,
+        })
     }
 
     /// A bare context for unit tests: fields take their defaults and `root` is
@@ -201,7 +206,10 @@ impl TwylaContext {
     /// source's folder stem ([`resolve_document_output`](Self::resolve_document_output))
     /// and the parent page's output dir (on the style chain, in
     /// [`crate::document`]) — but the `/`-vs-relative convention lives only here.
-    pub(crate) fn resolve_output(anchor: Option<&str>, raw: &str) -> Result<Option<String>, String> {
+    pub(crate) fn resolve_output(
+        anchor: Option<&str>,
+        raw: &str,
+    ) -> Result<Option<String>, String> {
         // Absolute paths discard the anchor; relative ones need one or defer.
         let segments: Vec<&str> = match raw.strip_prefix('/') {
             Some(abs) => abs.split('/').collect(),
@@ -237,10 +245,13 @@ impl TwylaContext {
     /// `source` is the root-relative source path (`content/...`), as passed to
     /// [`default_document_output`](Self::default_document_output).
     pub fn resolve_document_output(&self, source: &str, raw: &str) -> Result<String, String> {
-        let source = self.root.join(source);
+        let source = self.root.join(source.trim_start_matches('/'));
         let content_dir = self.content_dir();
         let rel = source.strip_prefix(&content_dir).map_err(|_| {
-            format!("source {:?} is not within the content dir", source.display())
+            format!(
+                "source {:?} is not within the content dir",
+                source.display()
+            )
         })?;
         let anchor = rel.parent().map(path_key).unwrap_or_default();
         // A full-file page always has a concrete folder-stem anchor, so
