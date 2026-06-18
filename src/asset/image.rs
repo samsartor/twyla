@@ -20,24 +20,17 @@
 
 use std::io::Cursor;
 
-use comemo::Tracked;
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
 use image::codecs::avif::AvifEncoder;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageEncoder, ImageFormat};
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
-use typst::foundations::{
-    Bytes, Cast, Content, Context, Packed, PathOrStr, ShowFn, Str, StyleChain, elem, func, scope,
-};
-use typst::loading::{Encoding, Readable};
+use typst::foundations::{Bytes, Cast, Packed, PathOrStr, ShowFn, StyleChain, elem, func, scope};
 use typst::syntax::Span;
 use typst_utils::hash128;
 
-use super::{
-    AssetSpec, Built, ImageSource, Upstream, read_or_request, resolve_or_request, resolve_path,
-    show_unresolved,
-};
+use super::{AssetSpec, Built, ImageSource, Upstream, resolve_path, show_unresolved};
 use crate::project::TwylaContext;
 use crate::render::Emit;
 
@@ -92,35 +85,9 @@ pub struct ImageAsset {
     pub quality: u8,
 }
 
-#[scope]
-impl ImageAsset {
-    /// The resolved, fingerprinted URL of the processed image. Contextual —
-    /// call it inside `#context`.
-    #[func(contextual)]
-    fn url(context: Tracked<Context>, this: Content) -> HintedStrResult<Str> {
-        let elem = this.into_packed::<ImageAsset>().unwrap();
-        let styles = context.styles()?;
-        Ok(resolve_or_request(styles, &spec(&elem, styles)?, elem.span()))
-    }
-
-    /// The processed image's bytes — for inlining instead of linking. Always
-    /// raw `bytes` (an encoded image is not text); the `encoding` argument
-    /// mirrors the other assets' `.read()` but only `none` is meaningful here.
-    #[func(contextual)]
-    fn read(
-        context: Tracked<Context>,
-        this: Content,
-        /// The encoding to read the asset with. Image bytes are binary, so the
-        /// useful value is `{none}` (raw bytes).
-        #[named]
-        #[default(None)]
-        encoding: Option<Encoding>,
-    ) -> HintedStrResult<Readable> {
-        let elem = this.into_packed::<ImageAsset>().unwrap();
-        let styles = context.styles()?;
-        read_or_request(styles, &spec(&elem, styles)?, elem.span(), encoding)
-    }
-}
+// Image bytes are binary, so `.read()` defaults to raw bytes (`None`) rather
+// than the UTF-8 default the text-ish assets use.
+asset_methods!(ImageAsset, spec, None);
 
 /// Build an `asset.image` element's [`AssetSpec`] from its (style-resolved)
 /// fields. The element is always file-backed; per-call args override the

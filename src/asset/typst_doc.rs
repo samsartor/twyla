@@ -42,11 +42,11 @@ use comemo::Tracked;
 use ecow::{EcoString, eco_format, eco_vec};
 use typst::diag::{FileResult, HintedStrResult, SourceDiagnostic, SourceResult, Warned};
 use typst::foundations::{
-    Bytes, Cast, Content, Context, Datetime, Duration, IntoValue, Packed, PathOrStr, ShowFn, Str,
-    StyleChain, cast, elem, func, scope,
+    Bytes, Cast, Content, Datetime, Duration, IntoValue, Packed, PathOrStr, ShowFn, StyleChain,
+    cast, elem, func, scope,
 };
 use typst::layout::Abs;
-use typst::loading::{Encoding, Readable};
+use typst::loading::Encoding;
 use typst::syntax::{FileId, RootedPath, Source, Span, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
@@ -58,9 +58,7 @@ use typst_library::Feature;
 use typst_pdf::PdfOptions;
 use typst_utils::hash128;
 
-use super::{
-    AssetSpec, Built, Upstream, read_or_request, resolve_or_request, show_unresolved,
-};
+use super::{AssetSpec, Built, Upstream, show_unresolved};
 use crate::project::TwylaContext;
 use crate::render::Emit;
 
@@ -95,36 +93,7 @@ pub struct TypstAsset {
     pub ppi: i64,
 }
 
-#[scope]
-impl TypstAsset {
-    /// The resolved, fingerprinted URL of the compiled document. Contextual —
-    /// call it inside `#context`.
-    #[func(contextual)]
-    fn url(context: Tracked<Context>, this: Content) -> HintedStrResult<Str> {
-        let elem = this.into_packed::<TypstAsset>().unwrap();
-        let styles = context.styles()?;
-        Ok(resolve_or_request(styles, &spec(&elem, styles)?, elem.span()))
-    }
-
-    /// The compiled document's bytes — for inlining instead of linking (e.g.
-    /// `raw-html(asset.typst(.., format: "svg").read())`). Defaults to a UTF-8
-    /// `str` (the right choice for the text formats `svg`/`html`); pass
-    /// `encoding: none` for the binary formats `png`/`pdf`.
-    #[func(contextual)]
-    fn read(
-        context: Tracked<Context>,
-        this: Content,
-        /// The encoding to read the asset with. If `{none}`, returns raw bytes;
-        /// otherwise the bytes are decoded as UTF-8 into a string.
-        #[named]
-        #[default(Some(Encoding::Utf8))]
-        encoding: Option<Encoding>,
-    ) -> HintedStrResult<Readable> {
-        let elem = this.into_packed::<TypstAsset>().unwrap();
-        let styles = context.styles()?;
-        read_or_request(styles, &spec(&elem, styles)?, elem.span(), encoding)
-    }
-}
+asset_methods!(TypstAsset, spec, Some(Encoding::Utf8));
 
 /// Build a `asset.typst` element's [`AssetSpec`] from its (style-resolved)
 /// fields. A path source is resolved to its [`FileId`]; an inline content value

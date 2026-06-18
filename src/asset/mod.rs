@@ -3,6 +3,62 @@
 // it's a sound `HashMap` key (the same reason typst hashes `Bytes` freely).
 #![allow(clippy::mutable_key_type)]
 
+/// Generate the shared `.url()` / `.read()` contextual scope methods for an
+/// asset element. Every asset element behaves identically bar *how its spec is
+/// built*, so each module supplies only that: `$spec` is its
+/// `fn(&Packed<Elem>, StyleChain) -> HintedStrResult<AssetSpec>` (which folds in
+/// `#set` styles), and `$default_encoding` is its `.read()` default (`Some(..)`
+/// for text-ish assets, `None` for binary like images).
+///
+/// Both methods build the spec, then resolve it through the introspector —
+/// `.url()` to a fingerprinted URL, `.read()` to the asset's bytes. They are
+/// contextual so they run during realization, when the introspector (and so the
+/// resolved asset) exists, rather than eagerly at eval. Types are fully
+/// qualified so the macro needs nothing imported at its call site beyond the
+/// `func`/`scope` attributes the element already uses.
+macro_rules! asset_methods {
+    ($this:ty, $spec:path, $default_encoding:expr) => {
+        #[scope]
+        impl $this {
+            /// The resolved, fingerprinted URL of this asset. Contextual — call
+            /// it inside `#context`.
+            ///
+            /// `engine` precedes the `this` self-positional: the `#[func]` macro
+            /// forwards special params ahead of ordinary positionals, and the
+            /// method call prepends the element as that positional.
+            #[func(contextual)]
+            fn url(
+                engine: &mut ::typst::engine::Engine,
+                context: ::comemo::Tracked<::typst::foundations::Context>,
+                this: ::typst::foundations::Content,
+            ) -> ::typst::diag::HintedStrResult<::typst::foundations::Str> {
+                let elem = this.into_packed::<$this>().unwrap();
+                let spec = $spec(&elem, context.styles()?)?;
+                Ok($crate::asset::resolve_or_request(engine, spec, elem.span()))
+            }
+
+            /// This asset's bytes — for inlining instead of linking. Mirrors the
+            /// native `read`: UTF-8 `str` by default, raw `bytes` with
+            /// `encoding: none`. Contextual.
+            #[func(contextual)]
+            fn read(
+                engine: &mut ::typst::engine::Engine,
+                context: ::comemo::Tracked<::typst::foundations::Context>,
+                this: ::typst::foundations::Content,
+                /// The encoding to read the asset with. If `{none}`, returns raw
+                /// bytes; otherwise the bytes are decoded as UTF-8 into a string.
+                #[named]
+                #[default($default_encoding)]
+                encoding: Option<::typst::loading::Encoding>,
+            ) -> ::typst::diag::HintedStrResult<::typst::loading::Readable> {
+                let elem = this.into_packed::<$this>().unwrap();
+                let spec = $spec(&elem, context.styles()?)?;
+                $crate::asset::read_or_request(engine, spec, elem.span(), encoding)
+            }
+        }
+    };
+}
+
 pub(crate) mod file;
 pub(crate) mod image;
 pub(crate) mod raw;
@@ -17,15 +73,15 @@ use comemo::Tracked;
 use ecow::{EcoString, eco_format, eco_vec};
 use iddqd::IdHashItem;
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
+use typst::engine::Engine;
 use typst::foundations::{
-    Binding, Bytes, Content, Module, PathOrStr, Repr, Scope, Str, StyleChain, Value, elem, ty,
+    Binding, Bytes, Content, Module, PathOrStr, Repr, Scope, Str, Value, ty,
 };
 use typst::introspection::{History, Introspect, Introspector};
 use typst::loading::{Encoding, Readable};
 use typst::syntax::{FileId, Span};
 use typst_utils::hash128;
 
-use crate::project::TwylaContext;
 use crate::render::Emit;
 use crate::resolver::Upstream;
 
@@ -121,8 +177,14 @@ impl Introspect for AssetReqIntrospect {
         value.downcast().cloned()
     }
 
-    fn diagnose(&self, history: &History<Self::Output>) -> SourceDiagnostic {
-        todo!()
+    fn diagnose(&self, _history: &History<Self::Output>) -> SourceDiagnostic {
+        // An asset's output is a pure function of its spec, so the realistic
+        // cause of non-convergence is a generator that derives the *spec* from
+        // something unstable (e.g. an asset whose contents depend on a counter).
+        SourceDiagnostic::warning(self.0.span, "this asset did not stabilize").with_hint(
+            "an asset's output should be a pure function of its source; resolving one whose \
+             inputs keep changing each pass cannot converge",
+        )
     }
 }
 
@@ -130,63 +192,46 @@ impl Introspect for AssetReqIntrospect {
 // single handle type. Each element captures its source fields (so
 // `#set asset.sass(minify: false)` works) and exposes the same two contextual
 // scope methods — `.url()` and `.read()` — that build an [`AssetSpec`] from
-// those fields and resolve it off the style chain. The element→spec→resolve
+// those fields and resolve it through the introspector. The element→spec→resolve
 // machinery they share lives here: [`resolve_or_request`] / [`read_or_request`]
-// (the placeholder protocol) and [`unresolved_asset_show`] (the default show
-// rule, which refuses to render a bare asset). Discovery is *lazy*: it happens
-// only when `.url()`/`.read()` actually run, so an asset that's never used is
-// never built. See the module docs and [[twyla_element_scope_methods_spike]].
+// (the introspect-or-request protocol) and [`show_unresolved`] (the default
+// show rule, which refuses to render a bare asset). Discovery is *lazy*: it
+// happens only when `.url()`/`.read()` actually run, so an asset that's never
+// used is never built. See the module docs and
+// [[twyla_element_scope_methods_spike]].
 
-/// The placeholder protocol every `asset.*` consumer obeys, in one place: look
-/// the spec up in the injected resolved-map ([`TwylaAssetMap`]) and either
-/// answer from the hit or request it on a miss.
+/// The resolve-or-request protocol every `asset.*` consumer obeys, in one
+/// place: [`introspect`](Engine::introspect) the spec through the resolver-backed
+/// introspector ([`AssetReqIntrospect`]). A **hit** returns the built
+/// [`ResolvedAsset`]; a **miss** returns `None` *and* records the request, so
+/// the compile loop builds it and a later iteration re-runs this against the
+/// now-populated introspector (that re-run is what makes the page converge).
 ///
-/// - **Hit** — the map already has this spec's [`ResolvedAsset`]; `hit` reads
-///   what it needs off it (URL, bytes, …). This tracked read is what makes the
-///   page *converge*.
-/// - **Miss** — report the spec on the write-only discovery sink
-///   ([`TwylaAssetSink`]; its epoch is in the comemo key, the channel isn't) and
-///   return `miss`. A later relayout iteration re-runs this against the
-///   now-populated map.
-///
-/// Used off `context.styles()` (the contextual methods) or a show rule's live
-/// `styles` directly (the native image rule — no `#context` needed).
-fn resolve_with<T>(
-    styles: StyleChain,
-    spec: &AssetSpec,
+/// `outputs` records how the caller intends to use the asset (a URL vs raw
+/// bytes) — carried for emission policy and the upcoming per-request output
+/// paths. `span` blames a real source location when a [`build`](file::build)
+/// fails (missing file, sass error).
+fn introspect_asset(
+    engine: &mut Engine,
+    spec: AssetSpec,
     span: Span,
-    hit: impl FnOnce(&ResolvedAsset) -> T,
-    miss: impl FnOnce() -> T,
-) -> T {
-    if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetMap::map)
-        && let Some(map) = dynamic.downcast::<ResolvedAssets>()
-        && let Some(asset) = map.get(spec)
-    {
-        return hit(asset);
-    }
-
-    if let Value::Dyn(dynamic) = styles.get_cloned(TwylaAssetSink::sink)
-        && let Some(sink) = dynamic.downcast::<AssetSink>()
-    {
-        let _ = sink.tx.send(AssetReq {
-            spec: spec.clone(),
-            span,
-        });
-    }
-    miss()
+    outputs: BTreeSet<OutputReq>,
+) -> Option<ResolvedAsset> {
+    engine.introspect(AssetReqIntrospect(AssetReq { spec, span, outputs }))
 }
 
-/// Resolve a spec's URL off the style chain, or request it (returns
-/// [`ASSET_PENDING`] on a miss). Shared by the asset elements' `.url()` and the
-/// native image rule's vector path.
-pub(crate) fn resolve_or_request(styles: StyleChain, spec: &AssetSpec, span: Span) -> Str {
-    resolve_with(
-        styles,
-        spec,
-        span,
-        |asset| Str::from(asset.url.as_str()),
-        || Str::from(ASSET_PENDING),
-    )
+/// The set for a caller that wants a URL.
+fn want_url() -> BTreeSet<OutputReq> {
+    BTreeSet::from([OutputReq::Url])
+}
+
+/// Resolve a spec's URL, or request it (returns [`ASSET_PENDING`] on a miss).
+/// Shared by the asset elements' `.url()` and the native image rule.
+pub(crate) fn resolve_or_request(engine: &mut Engine, spec: AssetSpec, span: Span) -> Str {
+    match introspect_asset(engine, spec, span, want_url()) {
+        Some(asset) => Str::from(asset.url.as_str()),
+        None => Str::from(ASSET_PENDING),
+    }
 }
 
 /// A resolved image: its URL plus the output's intrinsic pixel dimensions (when
@@ -196,54 +241,48 @@ pub(crate) struct ResolvedImage {
     pub dimensions: Option<(u32, u32)>,
 }
 
-/// Resolve a raster-image spec to its URL *and* output dimensions off the style
-/// chain, or request it on a miss. Like [`resolve_or_request`] but also surfaces
-/// `built.dimensions` so the native rule can emit `<img width height>`.
+/// Resolve a raster-image spec to its URL *and* output dimensions, or request it
+/// on a miss. Like [`resolve_or_request`] but also surfaces `built.dimensions`
+/// so the native rule can emit `<img width height>`.
 pub(crate) fn resolve_image_or_request(
-    styles: StyleChain,
-    spec: &AssetSpec,
+    engine: &mut Engine,
+    spec: AssetSpec,
     span: Span,
 ) -> ResolvedImage {
-    resolve_with(
-        styles,
-        spec,
-        span,
-        |asset| ResolvedImage {
+    match introspect_asset(engine, spec, span, want_url()) {
+        Some(asset) => ResolvedImage {
             url: Str::from(asset.url.as_str()),
             dimensions: asset.built.dimensions,
         },
-        || ResolvedImage {
+        None => ResolvedImage {
             url: Str::from(ASSET_PENDING),
             dimensions: None,
         },
-    )
+    }
 }
 
-/// Resolve a spec's output off the style chain, or request it (returns an empty
-/// value on a miss — the placeholder, discarded before convergence). Backs
-/// [`Asset::read`]; `encoding` selects `str` (UTF-8) vs raw `bytes`, mirroring
-/// the native `read`. The bytes come from `built.emit`, so a path-backed asset
-/// is read from disk here rather than held in RAM.
+/// Resolve a spec's bytes, or request it (returns an empty value on a miss — the
+/// placeholder, discarded before convergence). Backs the elements' `.read()`;
+/// `encoding` selects `str` (UTF-8) vs raw `bytes`, mirroring the native `read`.
+/// The bytes come from `built.emit`, so a path-backed asset is read from disk
+/// here rather than held in RAM.
 fn read_or_request(
-    styles: StyleChain,
-    spec: &AssetSpec,
+    engine: &mut Engine,
+    spec: AssetSpec,
     span: Span,
     encoding: Option<Encoding>,
 ) -> HintedStrResult<Readable> {
-    resolve_with(
-        styles,
-        spec,
-        span,
-        |asset| {
+    match introspect_asset(engine, spec, span, BTreeSet::from([OutputReq::Read])) {
+        Some(asset) => {
             let bytes = asset
                 .built
                 .emit
                 .read()
                 .map_err(|err| eco_format!("failed to read asset bytes: {err}"))?;
             decode(bytes, encoding)
-        },
-        || Ok(decode_empty(encoding)),
-    )
+        }
+        None => Ok(decode_empty(encoding)),
+    }
 }
 
 /// Apply `read`'s `encoding` to resolved bytes: `none` → raw bytes, UTF-8 →

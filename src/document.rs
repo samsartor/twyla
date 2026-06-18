@@ -148,16 +148,35 @@ impl TwylaDocument {
 }
 
 pub fn request(styles: StyleChain, elem: &Packed<TwylaDocument>) -> SourceResult<DocumentReq> {
+    let raw = match elem.output.get_cloned(styles) {
+        Smart::Auto => {
+            return Err(eco_vec![SourceDiagnostic::error(
+                elem.span(),
+                EcoString::from("an inline `document(..)` needs an explicit `output:`"),
+            )]);
+        }
+        Smart::Custom(out) => out,
+    };
+    // A *relative* `output:` resolves against the enclosing page's output
+    // *directory* — the parent output (carried on the chain by the loop) minus
+    // its filename. An absolute (`/`-prefixed) output ignores the anchor. The
+    // anchor is absent only during the discarded metadata-harvest pass, where a
+    // relative output yields `Ok(None)`; we keep `raw` there and the main loop
+    // re-resolves it once the parent output is on the chain.
+    let parent = styles.get_cloned(TwylaDocument::output).custom();
+    let anchor = parent.as_deref().map(parent_dir);
+    let output = match TwylaContext::resolve_output(anchor, raw.as_str()) {
+        Ok(Some(out)) => out,
+        Ok(None) => raw.to_string(),
+        Err(msg) => {
+            return Err(eco_vec![SourceDiagnostic::error(
+                elem.span(),
+                EcoString::from(msg),
+            )]);
+        }
+    };
     Ok(DocumentReq {
-        output: match elem.output.get_cloned(styles) {
-            Smart::Auto => {
-                return Err(eco_vec![SourceDiagnostic::error(
-                    elem.span(),
-                    EcoString::from("an inline `document(..)` needs an explicit `output:`"),
-                )]);
-            }
-            Smart::Custom(out) => out.to_string(),
-        },
+        output,
         title: elem.title.get_cloned(styles),
         date: elem.date.get_cloned(styles),
         description: elem.description.get_cloned(styles),
@@ -172,6 +191,16 @@ pub fn request(styles: StyleChain, elem: &Packed<TwylaDocument>) -> SourceResult
         source: elem.span().id(),
         root: false,
     })
+}
+
+/// The directory portion of an output path — everything before the last `/`, or
+/// `""` for a root-level output. Anchors a relative child `output:` on the
+/// enclosing page's directory.
+fn parent_dir(output: &str) -> &str {
+    match output.rfind('/') {
+        Some(i) => &output[..i],
+        None => "",
+    }
 }
 
 /// Placeholder returned by the static `document.url()` when no current-page
@@ -281,8 +310,9 @@ impl Introspect for DocumentReqIntrospect {
         Dict::new()
     }
 
-    fn diagnose(&self, history: &History<Self::Output>) -> SourceDiagnostic {
-        todo!()
+    fn diagnose(&self, _history: &History<Self::Output>) -> SourceDiagnostic {
+        SourceDiagnostic::warning(self.0.body.span(), "this page's metadata did not stabilize")
+            .with_hint("its `document(..)` fields resolve differently each pass")
     }
 }
 
@@ -300,7 +330,8 @@ impl Introspect for DocumentAtIntrospect {
         let Some(path) = introspector.path(self.0) else {
             return Dict::new();
         };
-        let at_output = path.get_with_slash();
+        // Compare against the documents listing in the no-leading-slash key form.
+        let at_output = path.get_without_slash();
         let Some(Value::Array(array)) = introspector.value(DOCUMENTS_LIST_KEY) else {
             return Dict::new();
         };
@@ -316,8 +347,9 @@ impl Introspect for DocumentAtIntrospect {
         Dict::new()
     }
 
-    fn diagnose(&self, history: &History<Self::Output>) -> SourceDiagnostic {
-        todo!()
+    fn diagnose(&self, _history: &History<Self::Output>) -> SourceDiagnostic {
+        SourceDiagnostic::warning(Span::detached(), "this page's metadata did not stabilize")
+            .with_hint("`document.*` for the current page resolves differently each pass")
     }
 }
 
@@ -338,8 +370,11 @@ impl Introspect for DocumentsArrayIntrospect {
         return array.clone();
     }
 
-    fn diagnose(&self, history: &History<Self::Output>) -> SourceDiagnostic {
-        todo!()
+    fn diagnose(&self, _history: &History<Self::Output>) -> SourceDiagnostic {
+        SourceDiagnostic::warning(Span::detached(), "the set of pages did not stabilize").with_hint(
+            "a `#context`-generated `document(..)` is likely emitting a new page every pass \
+             (e.g. deriving its `output` from `documents()` itself)",
+        )
     }
 }
 

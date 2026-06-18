@@ -15,14 +15,12 @@ use comemo::Tracked;
 use ecow::{EcoString, eco_format, eco_vec};
 use typst::World;
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
-use typst::foundations::{Bytes, Content, Context, PathOrStr, ShowFn, Str, elem, func, scope};
-use typst::loading::{Encoding, Readable};
+use typst::foundations::{Bytes, Packed, PathOrStr, ShowFn, StyleChain, elem, func, scope};
+use typst::loading::Encoding;
 use typst::syntax::{FileId, Span};
 use typst_utils::hash128;
 
-use super::{
-    AssetSpec, Built, Upstream, read_or_request, resolve_or_request, resolve_path, show_unresolved,
-};
+use super::{AssetSpec, Built, Upstream, resolve_path, show_unresolved};
 use crate::project::TwylaContext;
 use crate::render::Emit;
 
@@ -50,37 +48,16 @@ pub struct SassAsset {
     pub minify: bool,
 }
 
-#[scope]
-impl SassAsset {
-    #[func(contextual)]
-    fn url(context: Tracked<Context>, this: Content) -> HintedStrResult<Str> {
-        let elem = this.into_packed::<SassAsset>().unwrap();
-        let styles = context.styles()?;
-        let spec = AssetSpec::Sass {
-            file: resolve_path(&elem.path, elem.span())?,
-            minify: elem.minify.get(styles),
-        };
-        Ok(resolve_or_request(styles, &spec, elem.span()))
-    }
+asset_methods!(SassAsset, spec, Some(Encoding::Utf8));
 
-    #[func(contextual)]
-    fn read(
-        context: Tracked<Context>,
-        this: Content,
-        /// The encoding to read the asset with. If `{none}`, returns raw bytes;
-        /// otherwise the bytes are decoded as UTF-8 into a string.
-        #[named]
-        #[default(Some(Encoding::Utf8))]
-        encoding: Option<Encoding>,
-    ) -> HintedStrResult<Readable> {
-        let elem = this.into_packed::<SassAsset>().unwrap();
-        let styles = context.styles()?;
-        let spec = AssetSpec::Sass {
-            file: resolve_path(&elem.path, elem.span())?,
-            minify: elem.minify.get(styles),
-        };
-        read_or_request(styles, &spec, elem.span(), encoding)
-    }
+/// Build a `asset.sass` element's [`AssetSpec`] from its (style-resolved)
+/// fields: the source path plus the `minify` flag (so the minified and expanded
+/// builds of one file are distinct assets).
+fn spec(elem: &Packed<SassAsset>, styles: StyleChain) -> HintedStrResult<AssetSpec> {
+    Ok(AssetSpec::Sass {
+        file: resolve_path(&elem.path, elem.span())?,
+        minify: elem.minify.get(styles),
+    })
 }
 
 /// Default show: a bare `asset.sass(..)` cannot be rendered — resolve it with

@@ -11,14 +11,12 @@ use comemo::Tracked;
 use ecow::{EcoString, eco_vec};
 use typst::World;
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
-use typst::foundations::{Content, Context, PathOrStr, ShowFn, Str, elem, func, scope};
-use typst::loading::{Encoding, Readable};
+use typst::foundations::{Packed, PathOrStr, ShowFn, StyleChain, elem, func, scope};
+use typst::loading::Encoding;
 use typst::syntax::{FileId, Span};
 use typst_utils::hash128;
 
-use super::{
-    AssetSpec, Built, Upstream, read_or_request, resolve_or_request, resolve_path, show_unresolved,
-};
+use super::{AssetSpec, Built, Upstream, resolve_path, show_unresolved};
 use crate::project::TwylaContext;
 use crate::render::Emit;
 
@@ -34,42 +32,15 @@ pub struct FileAsset {
     pub path: PathOrStr,
 }
 
-#[scope]
-impl FileAsset {
-    /// The resolved, fingerprinted URL of this asset (e.g.
-    /// `/assets/logo-<hash>.svg`). Contextual — call it inside `#context`.
-    ///
-    /// `context` must precede the `this` self-positional: the `#[func]` macro
-    /// classifies special params by name and forwards them ahead of ordinary
-    /// positionals, and the method call prepends the element as that positional.
-    #[func(contextual)]
-    fn url(context: Tracked<Context>, this: Content) -> HintedStrResult<Str> {
-        let elem = this.into_packed::<FileAsset>().unwrap();
-        let spec = AssetSpec::File {
-            file: resolve_path(&elem.path, elem.span())?,
-        };
-        Ok(resolve_or_request(context.styles()?, &spec, elem.span()))
-    }
+asset_methods!(FileAsset, spec, Some(Encoding::Utf8));
 
-    /// The file's contents — for inlining instead of linking. Mirrors the
-    /// native `read` function: UTF-8 `str` by default, raw `bytes` with
-    /// `encoding: none`. Contextual.
-    #[func(contextual)]
-    fn read(
-        context: Tracked<Context>,
-        this: Content,
-        /// The encoding to read the asset with. If `{none}`, returns raw bytes;
-        /// otherwise the bytes are decoded as UTF-8 into a string.
-        #[named]
-        #[default(Some(Encoding::Utf8))]
-        encoding: Option<Encoding>,
-    ) -> HintedStrResult<Readable> {
-        let elem = this.into_packed::<FileAsset>().unwrap();
-        let spec = AssetSpec::File {
-            file: resolve_path(&elem.path, elem.span())?,
-        };
-        read_or_request(context.styles()?, &spec, elem.span(), encoding)
-    }
+/// Build a `asset.file` element's [`AssetSpec`]. A file asset is a verbatim copy
+/// keyed only by its path, so the style chain is unused (`_styles`); it takes
+/// one solely to share the [`asset_methods`] shape with the other elements.
+fn spec(elem: &Packed<FileAsset>, _styles: StyleChain) -> HintedStrResult<AssetSpec> {
+    Ok(AssetSpec::File {
+        file: resolve_path(&elem.path, elem.span())?,
+    })
 }
 
 /// Default show: a bare `asset.file(..)` cannot be rendered — resolve it with

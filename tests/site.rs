@@ -489,16 +489,16 @@ fn context_generated_documents_are_discovered_and_routed() {
 /// without the redundant explicit-field metadata the old site needed.
 #[test]
 fn spike_harvest_reads_per_doc_extra() {
-    use twyla::asset::AssetResolver;
     use twyla::compile::HarvestedDoc;
     use twyla::render::RenderWorld;
+    use twyla::resolver::Resolver;
 
     let ctx = ctx();
     let world = RenderWorld::new(&ctx).expect("world");
     // Harvest shares the single eval/compile with the rendered HTML; the
     // metadata now rides on each `OutputDoc.meta`.
     let outputs = world
-        .compile_bundle(&mut AssetResolver::new(&ctx))
+        .compile_bundle(&mut Resolver::new(&ctx))
         .expect("compile+harvest");
     let docs: Vec<&HarvestedDoc> = outputs.docs().filter_map(|d| d.meta.as_ref()).collect();
     let spike = docs

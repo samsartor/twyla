@@ -2,18 +2,11 @@
 // `Bytes` only *looks* interior-mutable to clippy (`Arc` refcount).
 #![allow(clippy::mutable_key_type)]
 
-use std::collections::HashMap;
 use std::time::Duration;
-
-use crossbeam_channel::unbounded;
-use typst::foundations::{Bytes, Style, Value};
-use typst::syntax::{FileId, RootedPath, VirtualPath, VirtualRoot};
-use typst::utils::LazyHash;
-use typst_utils::hash128;
 
 use super::*;
 use crate::project::TwylaContext;
-use crate::render::{Emit, RenderWorld};
+use crate::render::RenderWorld;
 use crate::resolver::Resolver;
 
 fn site(files: &[(&str, &str)]) -> (TwylaContext, tempfile::TempDir) {
@@ -33,13 +26,6 @@ fn compile(world: &RenderWorld) -> (String, Vec<ResolvedAsset>) {
     let outputs = world.compile_bundle(&mut resolver).unwrap();
     let html = outputs.docs().next().unwrap().html.clone();
     (html, outputs.assets().cloned().collect())
-}
-
-fn fid(path: &str) -> FileId {
-    FileId::new(RootedPath::new(
-        VirtualRoot::Project,
-        VirtualPath::new(path).unwrap(),
-    ))
 }
 
 /// The core of Phase 0/1: an `asset.*().url()` call resolves to a fingerprinted
@@ -658,75 +644,5 @@ fn editing_typst_source_revalidates_to_new_fingerprint() {
     assert!(
         !html2.contains("__twyla-asset-pending__"),
         "placeholder leaked after edit:\n{html2}"
-    );
-}
-
-/// Hash discipline (the comemo split): the resolved-map hashes by *content* and
-/// is order-independent; the sink hashes on *epoch* (constant within a
-/// generation, distinct across them).
-#[test]
-fn map_hashes_by_content_sink_keys_on_epoch() {
-    let a = AssetSpec::File {
-        file: fid("content/a.css"),
-    };
-    let b = AssetSpec::Sass {
-        file: fid("content/b.scss"),
-        minify: false,
-    };
-
-    // A minimal resolved record; the map's hash only looks at `(spec,
-    // content_hash, url)`, so the emit/upstream fields can be empty here.
-    let resolved = |spec: &AssetSpec, url: &str| ResolvedAsset {
-        spec: spec.clone(),
-        built: Built {
-            emit: Emit::Bytes(Bytes::new(Vec::<u8>::new())),
-            upstream: Vec::new(),
-            content_hash: 0,
-            ext: None,
-            stem: None,
-            dimensions: None,
-        },
-        output_path: String::from(url),
-        url: String::from(url),
-    };
-    let make = |pairs: &[(&AssetSpec, &str)]| {
-        let mut m = HashMap::new();
-        for (k, v) in pairs {
-            m.insert((*k).clone(), resolved(k, v));
-        }
-        ResolvedAssets(m)
-    };
-
-    let m1 = make(&[(&a, "ua"), (&b, "ub")]);
-    let m2 = make(&[(&b, "ub"), (&a, "ua")]);
-    assert_eq!(
-        hash128(&m1),
-        hash128(&m2),
-        "resolved-map hash must be order-independent"
-    );
-
-    let m3 = make(&[(&a, "CHANGED"), (&b, "ub")]);
-    assert_ne!(hash128(&m1), hash128(&m3), "map must track its contents");
-
-    let sink = |epoch, tx| {
-        TwylaAssetSink::sink
-            .set(Value::dynamic(AssetSink { epoch, tx }))
-            .wrap()
-    };
-    let (tx1, _r1) = unbounded::<AssetReq>();
-    let (tx2, _r2) = unbounded::<AssetReq>();
-    let (tx3, _r3) = unbounded::<AssetReq>();
-    let same_a: LazyHash<Style> = sink(7, tx1);
-    let same_b: LazyHash<Style> = sink(7, tx2);
-    let other: LazyHash<Style> = sink(8, tx3);
-    assert_eq!(
-        hash128(&same_a),
-        hash128(&same_b),
-        "same epoch must hash equal regardless of channel"
-    );
-    assert_ne!(
-        hash128(&same_a),
-        hash128(&other),
-        "distinct epochs must hash differently"
     );
 }

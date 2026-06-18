@@ -162,7 +162,10 @@ impl TwylaContext {
     /// `somepost/index.html`. Joined under the build output dir on disk and
     /// exposed at the matching root-relative URL ([`document_url`](Self::document_url)).
     pub fn default_document_output(&self, source: &str) -> String {
-        let source = self.root.join(source);
+        // A leading `/` makes the vpath OS-absolute to `Path::join`, which would
+        // discard `root`; strip it so it stays root-relative (mirrors
+        // [`resolve_document_output`](Self::resolve_document_output)).
+        let source = self.root.join(source.trim_start_matches('/'));
         let content_dir = self.content_dir();
         let Ok(path) = source.strip_prefix(&content_dir) else {
             panic!(
@@ -272,6 +275,9 @@ impl TwylaContext {
     /// - `content/<dir>/main.typ` → `dir` (a section index)
     /// - anything else → `page`
     pub fn default_kind(&self, source: &str) -> String {
+        // The source vpath may carry a leading `/` (`/content/main.typ`); strip
+        // it before the `content/` prefix so the index/section/leaf test works.
+        let source = source.trim_start_matches('/');
         let rel = source.strip_prefix("content/").unwrap_or(source);
         let path = Path::new(rel);
         if path.file_stem().and_then(|s| s.to_str()) == Some("main") {

@@ -2,29 +2,35 @@
 //! plus twyla's per-document metadata harvest.
 
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use comemo::{Track, Tracked, TrackedMut};
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
 use iddqd::IdHashMap;
 use typst::World;
-use typst::diag::{SourceDiagnostic, SourceResult, Warned};
+use typst::diag::{SourceDiagnostic, SourceResult, StrResult, Warned};
 use typst::foundations::{
-    Array, BundlePath, Content, Datetime, Dict, Dynamic, IntoValue, NativeElement, Output, Smart,
-    StyleChain, Styles, Target, TargetElem, Value,
+    BundlePath, Content, Datetime, Dict, Dynamic, IntoValue, Label, NativeElement, Output, Selector,
+    Smart, StyleChain, Styles, Target, TargetElem, Value,
 };
 use typst::syntax::{FileId, Span, VirtualPath};
-use typst_bundle::{Bundle, BundleIntrospector};
+use typst_bundle::Bundle;
 use typst_library::engine::{Engine, Route, Sink, Traced};
-use typst_library::introspection::{EmptyIntrospector, Introspector, Locator, MAX_ITERS, analyze};
-use typst_library::model::{DocumentElem, DocumentInfo};
+use typst_library::introspection::{
+    DocumentPosition, EmptyIntrospector, Introspection, Introspector, Location, Locator, MAX_ITERS,
+    analyze,
+};
+use typst_library::model::{DocumentInfo, DocumentElem, Numbering};
 use typst_library::routines::{Arenas, RealizationKind};
 use typst_utils::Protected;
 
 use crate::asset::{AssetReqIntrospect, ResolvedAsset, hash_spec};
-use crate::resolver::Resolver;
-use crate::document::{DOCUMENTS_LIST_KEY, DocumentReqIntrospect, ResolvedDocument};
+use crate::document::{
+    DOCUMENTS_LIST_KEY, DocumentReq, DocumentReqIntrospect, ResolvedDocument, TwylaDocument,
+};
 use crate::project::TwylaContext;
+use crate::resolver::Resolver;
 
 /// One page's harvested twyla metadata — the row that becomes one
 /// `documents()` entry and feeds feeds/listings.
@@ -158,9 +164,45 @@ fn eval_file(engine: &mut Engine, id: FileId) -> SourceResult<Content> {
     .content())
 }
 
+/// The introspector twyla feeds into each realization pass.
+///
+/// It is an ordinary bundle introspector (the previous iteration's output, or
+/// empty on the first pass) *plus* twyla's resolved assets and document
+/// listing, surfaced through the open-ended [`Introspector::value`] hook. So
+/// `asset.*().url()`/`.read()`, inline `document(..).url()`, and `documents()`
+/// all read back through that one tracked hook — their resolution rides the
+/// same comemo introspection convergence as counters and queries, with no
+/// style-chain channels.
+///
+/// Every method except [`value`](Self::value) delegates to `inner`; the
+/// snapshots are cheap [`Arc`] clones of the resolver's stores (see
+/// [`Resolver::assets_snapshot`]), so building one per iteration — and keeping
+/// the per-iteration history for [`analyze`] — is nearly free.
 pub struct TwylaIntrospector {
-    pub inner: Arc<BundleIntrospector>,
-    pub resolver: Resolver,
+    inner: Arc<dyn Introspector>,
+    assets: Arc<IdHashMap<ResolvedAsset>>,
+    documents: Arc<IdHashMap<ResolvedDocument>>,
+    /// The file-page rows of the `documents()` listing, as ready-made dicts.
+    /// Constant across the whole compile (derived from the eval'd files), so
+    /// shared by `Arc`; the discovered inline documents are appended.
+    file_docs: Arc<Vec<Value>>,
+    /// For deriving each discovered document's `url` in the listing.
+    ctx: TwylaContext,
+}
+
+impl TwylaIntrospector {
+    /// The `documents()` listing: the constant file-page rows followed by every
+    /// inline document discovered so far. Recomputed per call — `value` is hit a
+    /// bounded number of times per realization and the set is small.
+    fn documents_value(&self) -> Value {
+        let mut docs = (*self.file_docs).clone();
+        docs.extend(
+            self.documents
+                .iter()
+                .map(|stored| stored.doc.to_dict(&self.ctx).into_value()),
+        );
+        Value::Array(docs.into_iter().collect())
+    }
 }
 
 impl Introspector for TwylaIntrospector {
@@ -189,81 +231,78 @@ impl Introspector for TwylaIntrospector {
     }
 
     fn label_count(&self, label: Label) -> usize {
-        todo!()
+        self.inner.label_count(label)
     }
 
     fn locator(&self, key: u128, base: Location) -> Option<Location> {
-        todo!()
+        self.inner.locator(key, base)
     }
 
     fn pages(&self, location: Location) -> Option<NonZeroUsize> {
-        todo!()
+        self.inner.pages(location)
     }
 
     fn page(&self, location: Location) -> Option<NonZeroUsize> {
-        todo!()
+        self.inner.page(location)
     }
 
     fn position(&self, location: Location) -> Option<DocumentPosition> {
-        todo!()
+        self.inner.position(location)
     }
 
     fn page_numbering(&self, location: Location) -> Option<&Numbering> {
-        todo!()
+        self.inner.page_numbering(location)
     }
 
     fn page_supplement(&self, location: Location) -> Option<&Content> {
-        todo!()
+        self.inner.page_supplement(location)
     }
 
     fn anchor(&self, location: Location) -> Option<&EcoString> {
-        todo!()
+        self.inner.anchor(location)
     }
 
     fn document(&self, location: Location) -> Option<Location> {
-        todo!()
+        self.inner.document(location)
     }
 
     fn path(&self, location: Location) -> Option<&VirtualPath> {
-        todo!()
+        self.inner.path(location)
     }
 
-    // TODO: update ustream to return Value instead of &Value
+    /// Twyla's extension: answer the documents-listing key with the current
+    /// `documents()` array, and any asset-spec-hash key with the resolved asset
+    /// (as a `Value::Dyn`, downcast back by [`AssetReqIntrospect`]). Everything
+    /// else falls through to the bundle introspector.
     fn value(&self, key: u128) -> Option<Value> {
         if key == DOCUMENTS_LIST_KEY {
-            // TODO: only compute when updated
-            return Some(
-                self.resolver
-                    .documents()
-                    .map(|doc| doc.doc.to_dict().to_value())
-                    .collect(),
-            );
+            return Some(self.documents_value());
         }
-        for asset in self.resolver.resolved_assets() {
-            // TODO: can we use the IdHashMap for this lookup somehow?
-            if hash_spec(&asset.spec) == key {
-                return Some(Value::Dyn(Dynamic::new(asset.clone())));
-            }
-        }
-        None
+        // Keyed by `hash_spec(spec)`, not the spec itself, so this is a scan
+        // rather than a map lookup — the asset set is small.
+        self.assets
+            .iter()
+            .find(|asset| hash_spec(&asset.spec) == key)
+            .map(|asset| Value::Dyn(Dynamic::new(asset.clone())))
+            .or_else(|| self.inner.value(key))
     }
 }
 
 /// The single fixed-point loop: typst's introspection convergence, asset URL
 /// resolution, and document discovery all settle here together. Mirrors the
 /// loop in `typst::compile_impl`, but each iteration rebuilds the bundle content
-/// and `documents()` listing from the file pages *plus every document discovered
-/// so far*, then drains both discovery sinks.
+/// from the file pages *plus every document discovered so far*, feeds in a
+/// [`TwylaIntrospector`] that answers asset/document reads, then resolves
+/// whatever that realization requested.
 ///
-/// Why all three share one loop: a `#document(..)` (inline or `#context`-
-/// generated) reports itself on the doc sink during the very same Html
-/// realization that resolves assets, so there's no reason to separate them — and
-/// doing so would waste iterations rendering with placeholder assets. Document
-/// discovery needs its *own* settle flag (not just typst's introspection check):
-/// a freshly discovered doc isn't in the content that was just realized, and the
-/// `documents()` list is a style-chain read introspection doesn't track, so
-/// neither registers in `constraint`. Convergence therefore requires all of
-/// introspection-stable **and** assets-settled **and** documents-settled.
+/// Why all three share one loop *and* one convergence test: with the
+/// introspection system, an `asset.*().url()` / inline `document(..)` is just a
+/// read on the introspector ([`Introspector::value`]). A newly resolved asset
+/// or discovered document is therefore a `value()` answer that *changed* since
+/// it was read this pass, which `constraint.validate` against the post-discovery
+/// introspector catches exactly as it catches an unstable counter. So there is
+/// no separate "assets settled" / "documents settled" bookkeeping — the comemo
+/// constraint is the whole convergence criterion.
 fn compile_bundle_loop(
     ctx: &TwylaContext,
     world: Tracked<dyn World + '_>,
@@ -274,56 +313,43 @@ fn compile_bundle_loop(
 ) -> SourceResult<Bundle> {
     let library = world.library();
     let base = StyleChain::new(&library.styles);
-    let target = TargetElem::target.set(Bundle::target()).wrap();
-    // The site `base_url`, carried on the chain so `document.url()` can build
-    // absolute URLs without a `TwylaContext`. Constant across the build.
-    let base_url = TwylaSite::base_url
-        .set(match &ctx.base_url {
-            Some(url) => Value::Str(url.as_str().into()),
-            None => Value::None,
-        })
-        .wrap();
-    // Constant across iterations within one discovery generation — build once.
-    let asset_sink = resolver.sink_style();
-    let doc_sink = resolver.doc_sink_style();
-    let empty_introspector = EmptyIntrospector;
+    let combined: Styles = [TargetElem::target.set(Bundle::target()).wrap()]
+        .into_iter()
+        .collect();
+    let styles = base.chain(&combined);
 
-    let mut history: Vec<Bundle> = Vec::new();
+    // The file-page rows of `documents()` are constant across the compile;
+    // build them once and share into every introspector wrapper.
+    let file_docs: Arc<Vec<Value>> =
+        Arc::new(files.iter().map(|(_, meta)| meta.to_dict().into_value()).collect());
+
+    // The first iteration realizes against an empty introspector; subsequent
+    // ones against the previous iteration's output wrapper. We keep every output
+    // wrapper so `analyze` can replay each recorded introspection across the
+    // whole history on non-convergence.
+    let empty = TwylaIntrospector {
+        inner: Arc::new(EmptyIntrospector),
+        assets: Arc::new(IdHashMap::new()),
+        documents: Arc::new(IdHashMap::new()),
+        file_docs: file_docs.clone(),
+        ctx: ctx.clone(),
+    };
+    let mut history: Vec<TwylaIntrospector> = Vec::new();
     let mut document: Bundle;
 
     loop {
-        // Rebuild content + the `documents()` listing from the file pages plus
-        // every document discovered so far; both grow as discovery proceeds.
-        let documents = build_documents_array(ctx, files, resolver);
-        let docs_list = TwylaDocumentList::all.set(documents).wrap();
+        // Content = file pages + every document discovered so far, each routed
+        // to its own bundle output; grows as discovery proceeds.
         let content = build_content(files, resolver);
 
-        // Fold target + documents list + asset map + both discovery sinks into
-        // one `Styles` and chain it once (variable-length chaining can't be done
-        // link-by-link). The asset map is rebuilt each iteration as it drains.
-        let combined: Styles = [
-            target.clone(),
-            base_url.clone(),
-            docs_list,
-            resolver.map_style(),
-            asset_sink.clone(),
-            doc_sink.clone(),
-        ]
-        .into_iter()
-        .collect();
-        let styles = base.chain(&combined);
-
-        let introspector = history
-            .last()
-            .map(|doc| doc.introspector())
-            .unwrap_or(&empty_introspector);
+        let input: &TwylaIntrospector = history.last().unwrap_or(&empty);
         let constraint = comemo::Constraint::new();
 
         let mut subsink = Sink::new();
         let mut engine = Engine {
             library,
             world,
-            introspector: Protected::new(introspector.track_with(&constraint)),
+            introspector: Protected::new((input as &dyn Introspector).track_with(&constraint)),
             traced,
             sink: subsink.track_mut(),
             route: Route::default(),
@@ -331,35 +357,35 @@ fn compile_bundle_loop(
 
         document = Bundle::create(&mut engine, &content, styles)?;
 
-        // Drain both discovery channels (assets process eagerly; documents are
-        // just collected). Each returns whether it's *settled* this round.
-        let assets_settled = resolver.drain_and_process(world)?;
-        let docs_settled = resolver.drain_documents();
+        // Resolve every asset and collect every document this realization
+        // requested (recorded as introspections), growing the resolver's stores.
+        discover(resolver, world, subsink.introspections())?;
 
-        if constraint.validate(document.introspector()) && assets_settled && docs_settled {
+        // This iteration's output introspector: the fresh bundle introspector
+        // wrapped with the *post-discovery* asset/document snapshot.
+        let output = TwylaIntrospector {
+            inner: document.introspector.clone(),
+            assets: resolver.assets_snapshot(),
+            documents: resolver.documents_snapshot(),
+            file_docs: file_docs.clone(),
+            ctx: ctx.clone(),
+        };
+
+        if constraint.validate(&output as &dyn Introspector) {
             sink.extend_from_sink(subsink);
             break;
         }
 
         if history.len() >= MAX_ITERS - 1 {
-            // Distinguish *our* non-convergence (an unstable document set) from
-            // typst's own (introspection), which it just warns about and accepts.
-            if !docs_settled {
-                return Err(eco_vec![SourceDiagnostic::error(
-                    Span::detached(),
-                    EcoString::from(
-                        "the set of `#context`-generated documents did not stabilize; a \
-                         generator is likely emitting a new `document(..)` every pass (e.g. \
-                         deriving its `output` from `documents()` itself)"
-                    ),
-                )]);
-            }
-
-            let mut introspectors = [&empty_introspector as &dyn Introspector; MAX_ITERS + 1];
+            // Out of attempts. Replay every recorded introspection across the
+            // history so each can diagnose its own non-convergence (a twyla
+            // asset/document that never stabilized produces a tailored message
+            // via its `Introspect::diagnose`). Mirrors `typst::compile_impl`.
+            let mut introspectors = [&empty as &dyn Introspector; MAX_ITERS + 1];
             for i in 1..MAX_ITERS {
-                introspectors[i] = history[i - 1].introspector();
+                introspectors[i] = &history[i - 1];
             }
-            introspectors[MAX_ITERS] = document.introspector();
+            introspectors[MAX_ITERS] = &output;
 
             let warnings = analyze(world, introspectors, subsink.introspections());
 
@@ -370,7 +396,7 @@ fn compile_bundle_loop(
             break;
         }
 
-        history.push(document);
+        history.push(output);
     }
 
     // Promote delayed errors.
@@ -380,6 +406,28 @@ fn compile_bundle_loop(
     }
 
     Ok(document)
+}
+
+/// Resolve every asset and collect every document a realization requested.
+///
+/// Each `asset.*().url()`/`.read()` and inline `document(..)` records an
+/// [`Introspection`] during realization; we replay that list to drive
+/// resolution. Because the records live in the comemo-tracked [`Sink`], a
+/// memoized (cached) realization still reports its assets/documents here, so
+/// discovery never misses a page just because it didn't re-run.
+fn discover(
+    resolver: &mut Resolver,
+    world: Tracked<dyn World + '_>,
+    introspections: &[Introspection],
+) -> SourceResult<()> {
+    for introspection in introspections {
+        if let Some(req) = introspection.downcast::<AssetReqIntrospect>() {
+            resolver.resolve_asset(world, &req.0)?;
+        } else if let Some(req) = introspection.downcast::<DocumentReqIntrospect>() {
+            resolver.collect_document(&req.0);
+        }
+    }
+    Ok(())
 }
 
 /// Harvest each page's twyla `document` fields from its body's resolved style
@@ -472,24 +520,6 @@ fn harvest_metadata(
     })
 }
 
-/// The `documents()` array for the current loop iteration: every file page,
-/// then every document discovered so far (in the resolver's deterministic
-/// order).
-fn build_documents_array(
-    ctx: &TwylaContext,
-    files: &[(Content, HarvestedDoc)],
-    resolver: &Resolver,
-) -> Array {
-    let mut documents = Array::new();
-    for (_, meta) in files {
-        documents.push(meta.to_dict().into_value());
-    }
-    for doc in resolver.documents() {
-        documents.push(harvested_from_discovered(ctx, doc).to_dict().into_value());
-    }
-    documents
-}
-
 /// The bundle content for the current loop iteration: each file body wrapped as
 /// its own routed document, plus each discovered document as a sibling.
 fn build_content(files: &[(Content, HarvestedDoc)], resolver: &Resolver) -> Content {
@@ -520,7 +550,7 @@ fn build_content(files: &[(Content, HarvestedDoc)], resolver: &Resolver) -> Cont
 /// Wrap a discovered document as a routed sibling, re-applying its metadata to
 /// the body as a style map so `#context document.*` resolves inside it exactly
 /// as on a full-file page.
-fn discovered_sibling(doc: &DiscoveredDoc) -> Content {
+fn discovered_sibling(doc: &DocumentReq) -> Content {
     let mut styles = Styles::new();
     styles.set(
         TwylaDocument::output,
@@ -537,7 +567,7 @@ fn discovered_sibling(doc: &DiscoveredDoc) -> Content {
 
 /// Build a [`HarvestedDoc`] (a `documents()` row + output meta) from a
 /// discovered document, deriving its URL from the configured base.
-fn harvested_from_discovered(ctx: &TwylaContext, doc: &DiscoveredDoc) -> HarvestedDoc {
+fn harvested_from_discovered(ctx: &TwylaContext, doc: &DocumentReq) -> HarvestedDoc {
     HarvestedDoc {
         url: ctx.document_url(&doc.output),
         output: doc.output.clone(),

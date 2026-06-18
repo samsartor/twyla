@@ -186,7 +186,7 @@ const LINK_RULE: ShowFn<LinkElem> = |elem, engine, _| {
 /// a path-backed one is a fingerprinted [`AssetSpec::File`] copy, a byte-source
 /// one a content-addressed [`AssetSpec::Raw`] with its extension sniffed from the
 /// bytes ([`image_ext`]).
-const IMAGE_RULE: ShowFn<ImageElem> = |elem, _engine, styles| {
+const IMAGE_RULE: ShowFn<ImageElem> = |elem, engine, styles| {
     let span = elem.span();
     let Derived {
         source,
@@ -212,7 +212,7 @@ const IMAGE_RULE: ShowFn<ImageElem> = |elem, _engine, styles| {
             None => ImageSource::Bytes(loaded.data.clone()),
         };
         let spec = image::spec_from_styles(img_source, styles).at(span)?;
-        let resolved = resolve_image_or_request(styles, &spec, span);
+        let resolved = resolve_image_or_request(engine, spec, span);
         (resolved.url, resolved.dimensions)
     } else {
         let spec = match file {
@@ -222,7 +222,7 @@ const IMAGE_RULE: ShowFn<ImageElem> = |elem, _engine, styles| {
                 ext: image_ext(&loaded.data),
             },
         };
-        (resolve_or_request(styles, &spec, span), None)
+        (resolve_or_request(engine, spec, span), None)
     };
 
     let mut img = HtmlElem::new(tag::img).with_attr(attr::src, src.as_str());
