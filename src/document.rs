@@ -189,7 +189,6 @@ pub fn request(styles: StyleChain, elem: &Packed<TwylaDocument>) -> SourceResult
         draft: elem.draft.get(styles),
         body: elem.body.clone(),
         source: elem.span().id(),
-        root: false,
     })
 }
 
@@ -225,10 +224,12 @@ pub const RENDER_INTROSPECTION: ShowFn<TwylaDocument> = |elem, engine, styles| {
     Ok(Content::empty())
 };
 
-/// A document discovered through the sink during realization — the shape of a
-/// [`documents`] row plus its body and originating source. Flows Rust-side
-/// through the discovery scan to [`crate::resolver::Resolver`], which collects
-/// it, dedups by `output`, and invalidates by `source` across warm rebuilds.
+/// One page of the site: its `document` metadata plus its body and originating
+/// source. The single page type, produced two ways — harvested from a
+/// `content/*.typ` file ([`crate::compile`]) or discovered from an inline
+/// `document(..)` (the discovery scan, which collects it into
+/// [`crate::resolver::Resolver`], dedups by `output`, and invalidates by
+/// `source` across warm rebuilds).
 #[derive(Clone, PartialEq, Hash, Debug)]
 pub struct DocumentReq {
     pub output: String,
@@ -239,12 +240,9 @@ pub struct DocumentReq {
     pub extra: Value,
     pub draft: bool,
     pub body: Content,
-    /// The file that is the source for this document. Twyla evicts this
-    /// document when that file changes. None if the document came
-    /// from a detached span.
+    /// The file this page came from. Twyla evicts the page when that file
+    /// changes; `None` for a document built from a detached span.
     pub source: Option<FileId>,
-    /// Was this document discovered as a *.typ file, or from document element.
-    pub root: bool,
 }
 
 impl DocumentReq {

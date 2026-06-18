@@ -387,13 +387,13 @@ impl Hash for Built {
 
 /// One processed asset: where it lives, how to emit it, and what it depends on.
 ///
-/// This is the value carried on the style chain (inside [`ResolvedAssets`]), so
-/// `asset.*().url()` / `.read()` read straight off it. Its `built.emit` is
-/// either in-memory bytes (Arc-shared, cheap to clone onto the chain) or a path
-/// the bytes are read from on demand — so injecting the whole record never pulls
-/// asset bytes into RAM.
+/// This is the value the introspector hands back ([`TwylaIntrospector::value`]),
+/// so `asset.*().url()` / `.read()` read straight off it. Its `built.emit` is
+/// either in-memory bytes (Arc-shared, cheap to clone) or a path the bytes are
+/// read from on demand — so handing the whole record around never pulls asset
+/// bytes into RAM.
 #[ty]
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[derive(Clone, Debug)]
 pub struct ResolvedAsset {
     /// The spec that produced it (its key).
     pub spec: AssetSpec,
@@ -404,6 +404,35 @@ pub struct ResolvedAsset {
     /// The public, root-relative URL `.url()` returns (`output_path` resolved
     /// through [`TwylaContext::asset_url`], so it folds in any `base_url`).
     pub url: String,
+    /// How this asset is used *this compile* — the union of [`OutputReq`]s over
+    /// its call sites, accumulated as requests are discovered. Drives emission
+    /// ([`Resolver::emittable_assets`](crate::resolver::Resolver::emittable_assets)):
+    /// only an asset with a [`OutputReq::Url`] is written as a file. Deliberately
+    /// *excluded* from [`Hash`]/[`PartialEq`] below — it's emission policy, not
+    /// part of the asset's resolved identity, and the resolved record flows
+    /// through introspection convergence, which must not churn as usage grows.
+    pub outputs: BTreeSet<OutputReq>,
+}
+
+// Identity is the resolved result (spec → built → path → url), *not* `outputs`
+// (see the field's doc): a spec resolves to one record regardless of how many
+// ways it's referenced, and convergence compares these records by value.
+impl PartialEq for ResolvedAsset {
+    fn eq(&self, other: &Self) -> bool {
+        self.spec == other.spec
+            && self.built == other.built
+            && self.output_path == other.output_path
+            && self.url == other.url
+    }
+}
+
+impl Hash for ResolvedAsset {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.spec.hash(state);
+        self.built.hash(state);
+        self.output_path.hash(state);
+        self.url.hash(state);
+    }
 }
 
 impl Repr for ResolvedAsset {

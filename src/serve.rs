@@ -258,10 +258,11 @@ fn run_watcher(
         // Asset upstreams (e.g. sass `@import` partials) are read by twyla's
         // own pass, not typst, so they're not in `world.dependencies()` — add
         // them explicitly or an edit to a partial wouldn't trigger a recompile.
-        if let Ok(site) = &*last_output.lock().unwrap() {
-            for asset in site.assets() {
-                paths.extend(asset.upstream_paths().map(Path::to_path_buf));
-            }
+        // Pulled from the resolver, not the published outputs, so that an asset
+        // that is only `.read()` (inlined, never emitted as a file) still has
+        // its source watched.
+        for asset in resolver.resolved_assets() {
+            paths.extend(asset.upstream_paths().map(Path::to_path_buf));
         }
         if let Err(e) = watcher.update(paths) {
             eprintln!(

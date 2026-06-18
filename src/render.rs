@@ -29,7 +29,7 @@ use typst_library::Feature;
 
 use crate::asset::ResolvedAsset;
 use crate::resolver::Resolver;
-use crate::compile::HarvestedDoc;
+use crate::document::DocumentReq;
 use crate::project::TwylaContext;
 
 /// The `type` attribute marking a raw-HTML carrier `<script>`. The builtin
@@ -89,10 +89,9 @@ impl std::error::Error for RenderError {}
 pub struct OutputDoc {
     pub output_path: String,
     pub html: String,
-    /// The metadata harvested from inside the document.
-    /// This only None if the user created a raw Typst document
-    /// without going through Twyla somehow.
-    pub meta: Option<HarvestedDoc>,
+    /// The page's twyla `document` metadata. Only `None` if the user produced a
+    /// raw Typst document without going through twyla somehow.
+    pub meta: Option<DocumentReq>,
 }
 
 /// Some data which can be emitted to the output directory.

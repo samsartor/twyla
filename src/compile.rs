@@ -11,8 +11,8 @@ use iddqd::IdHashMap;
 use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult, StrResult, Warned};
 use typst::foundations::{
-    BundlePath, Content, Datetime, Dict, Dynamic, IntoValue, Label, NativeElement, Output, Selector,
-    Smart, StyleChain, Styles, Target, TargetElem, Value,
+    BundlePath, Content, Dynamic, IntoValue, Label, NativeElement, Output, Selector, Smart,
+    StyleChain, Styles, Target, TargetElem, Value,
 };
 use typst::syntax::{FileId, Span, VirtualPath};
 use typst_bundle::Bundle;
@@ -32,43 +32,11 @@ use crate::document::{
 use crate::project::{TwylaContext, present_output};
 use crate::resolver::Resolver;
 
-/// One page's harvested twyla metadata — the row that becomes one
-/// `documents()` entry and feeds feeds/listings.
-#[derive(Debug, Clone)]
-pub struct HarvestedDoc {
-    /// User-facing URL (e.g. "/hello/").
-    pub url: String,
-    /// The written location of the document (e.g. "hello/index.html").
-    pub output: String,
-    pub title: Option<Content>,
-    pub date: Option<Datetime>,
-    pub description: Option<Content>,
-    pub draft: bool,
-    pub kind: EcoString,
-    pub extra: Value,
-}
-
-impl HarvestedDoc {
-    /// The `documents()` dictionary form of this row.
-    fn to_dict(&self) -> Dict {
-        let mut d = Dict::new();
-        d.insert("url".into(), self.url.clone().into_value());
-        // Shown in root-absolute form (user-presentation boundary); the stored
-        // `self.output` and every internal comparison stay no-slash.
-        d.insert("output".into(), present_output(&self.output).into_value());
-        d.insert("title".into(), self.title.clone().into_value());
-        d.insert("date".into(), self.date.into_value());
-        d.insert("description".into(), self.description.clone().into_value());
-        d.insert("draft".into(), self.draft.into_value());
-        d.insert("kind".into(), self.kind.clone().into_value());
-        d.insert("extra".into(), self.extra.clone());
-        d
-    }
-}
-
 /// The product of one bundle compile: the rendered [`Bundle`], each page's
-/// harvested twyla `document` metadata, and every asset resolved along the way.
-pub type CompiledBundle = (Bundle, Vec<HarvestedDoc>, Vec<ResolvedAsset>);
+/// twyla `document` metadata, and every asset resolved along the way. A page is
+/// a [`DocumentReq`] whether it came from a `content/*.typ` file or an inline
+/// `document(..)` — same shape, two discovery paths.
+pub type CompiledBundle = (Bundle, Vec<DocumentReq>, Vec<ResolvedAsset>);
 
 /// Compile `pages` into a [`Bundle`] *and* harvest each page's twyla
 /// `document` metadata. Each source is evaluated exactly once; that single
@@ -107,6 +75,9 @@ fn compile_bundle_impl(
     // Evict assets whose sources changed since the last compile (no-op on the
     // first compile / a fresh resolver). What survives seeds this compile.
     resolver.revalidate();
+    // Asset *usage* (which assets are linked vs only inlined) is recomputed from
+    // this compile's requests, so a dropped `.url()` stops emitting the file.
+    resolver.clear_asset_usage();
 
     let library = world.library();
     let empty = EmptyIntrospector;
@@ -126,10 +97,9 @@ fn compile_bundle_impl(
     // — not here (so they ride the same pass as asset resolution).
     let evaled = engine.parallelize(sources, |engine, id| {
         let body = eval_file(engine, *id)?;
-        let meta = harvest_metadata(ctx, engine, *id, &body)?;
-        SourceResult::Ok((body, meta))
+        harvest_metadata(ctx, engine, *id, body)
     });
-    let mut files: Vec<(Content, HarvestedDoc)> = Vec::new();
+    let mut files: Vec<DocumentReq> = Vec::new();
     for res in evaled {
         files.push(res?);
     }
@@ -138,12 +108,11 @@ fn compile_bundle_impl(
     // discovery all converge together (see [`compile_bundle_loop`]).
     let bundle = compile_bundle_loop(ctx, world, traced, sink, &files, resolver)?;
 
-    // Final metadata: each file page, then every discovered document.
-    let mut harvested: Vec<HarvestedDoc> = files.into_iter().map(|(_, meta)| meta).collect();
-    for doc in resolver.documents() {
-        harvested.push(harvested_from_discovered(ctx, doc));
-    }
-    Ok((bundle, harvested, resolver.resolved_assets().cloned().collect()))
+    // Final metadata: each file page, then every discovered document — both are
+    // already `DocumentReq`s.
+    let mut harvested: Vec<DocumentReq> = files;
+    harvested.extend(resolver.documents().cloned());
+    Ok((bundle, harvested, resolver.emittable_assets().cloned().collect()))
 }
 
 /// Evaluate a single content file into its body content. Mirrors the eval
@@ -310,7 +279,7 @@ fn compile_bundle_loop(
     world: Tracked<dyn World + '_>,
     traced: Tracked<Traced>,
     sink: &mut Sink,
-    files: &[(Content, HarvestedDoc)],
+    files: &[DocumentReq],
     resolver: &mut Resolver,
 ) -> SourceResult<Bundle> {
     let library = world.library();
@@ -322,8 +291,12 @@ fn compile_bundle_loop(
 
     // The file-page rows of `documents()` are constant across the compile;
     // build them once and share into every introspector wrapper.
-    let file_docs: Arc<Vec<Value>> =
-        Arc::new(files.iter().map(|(_, meta)| meta.to_dict().into_value()).collect());
+    let file_docs: Arc<Vec<Value>> = Arc::new(
+        files
+            .iter()
+            .map(|doc| doc.to_dict(ctx).into_value())
+            .collect(),
+    );
 
     // The first iteration realizes against an empty introspector; subsequent
     // ones against the previous iteration's output wrapper. We keep every output
@@ -438,8 +411,8 @@ fn harvest_metadata(
     ctx: &TwylaContext,
     engine: &mut Engine,
     id: FileId,
-    body: &Content,
-) -> SourceResult<HarvestedDoc> {
+    body: Content,
+) -> SourceResult<DocumentReq> {
     let base = StyleChain::new(&engine.library.styles);
     let target = TargetElem::target.set(Target::Bundle).wrap();
     let styles = base.chain(&target);
@@ -456,7 +429,7 @@ fn harvest_metadata(
         engine,
         &mut Locator::root().split(),
         &arenas,
-        body,
+        &body,
         styles,
     )?;
 
@@ -508,45 +481,45 @@ fn harvest_metadata(
     };
     let kind =
         kind.unwrap_or_else(|| EcoString::from(ctx.default_kind(id.vpath().get_with_slash())));
-    let url = ctx.document_url(&output);
 
-    Ok(HarvestedDoc {
+    Ok(DocumentReq {
         output,
-        url,
         title,
         date,
         description,
-        draft,
         kind,
         extra,
+        draft,
+        body,
+        source: Some(id),
     })
 }
 
 /// The bundle content for the current loop iteration: each file body wrapped as
 /// its own routed document, plus each discovered document as a sibling.
-fn build_content(files: &[(Content, HarvestedDoc)], resolver: &Resolver) -> Content {
+fn build_content(files: &[DocumentReq], resolver: &Resolver) -> Content {
     let mut bodies = Vec::new();
-    for (body, meta) in files {
+    for doc in files {
         // Re-apply the *derived* output onto the page body so the page can read
         // it back (`#context document.output`). Without this the page sees only
-        // the `auto` default — the derivation happens Rust-side in `harvest_doc`
-        // and never reaches the chain. (`discovered_sibling` does the same for
-        // inline documents; this keeps full-file pages consistent.) Idempotent
-        // when the user pinned `output` explicitly: `meta.output` already is it.
+        // the `auto` default — the derivation happens Rust-side in
+        // `harvest_metadata` and never reaches the chain. The page's other
+        // metadata is already on the chain (its own `#set document(..)`), so —
+        // unlike `discovered_sibling` — only `output` is re-applied.
         //
         // The field is shown in root-absolute (`/`-prefixed) form — the
         // user-presentation boundary — while routing (`wrap_document`) and dedup
-        // keep the no-slash `meta.output`. The slashed value still anchors
+        // keep the no-slash `doc.output`. The slashed value still anchors
         // relative child `document(output:)` paths: `resolve_output` skips the
         // empty leading segment.
         let mut styles = Styles::new();
         styles.set(
             TwylaDocument::output,
-            Smart::Custom(present_output(&meta.output).into()),
+            Smart::Custom(present_output(&doc.output).into()),
         );
         bodies.push(wrap_document(
-            &meta.output,
-            body.clone().styled_with_map(styles),
+            &doc.output,
+            doc.body.clone().styled_with_map(styles),
         ));
     }
     for doc in resolver.documents() {
@@ -574,21 +547,6 @@ fn discovered_sibling(doc: &DocumentReq) -> Content {
     styles.set(TwylaDocument::extra, doc.extra.clone());
     styles.set(TwylaDocument::draft, doc.draft);
     wrap_document(&doc.output, doc.body.clone().styled_with_map(styles))
-}
-
-/// Build a [`HarvestedDoc`] (a `documents()` row + output meta) from a
-/// discovered document, deriving its URL from the configured base.
-fn harvested_from_discovered(ctx: &TwylaContext, doc: &DocumentReq) -> HarvestedDoc {
-    HarvestedDoc {
-        url: ctx.document_url(&doc.output),
-        output: doc.output.clone(),
-        title: doc.title.clone(),
-        date: doc.date,
-        description: doc.description.clone(),
-        draft: doc.draft,
-        kind: doc.kind.clone(),
-        extra: doc.extra.clone(),
-    }
 }
 
 /// Wrap one page body in the native [`DocumentElem`] that typst-bundle routes to

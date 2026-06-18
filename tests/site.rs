@@ -489,7 +489,7 @@ fn context_generated_documents_are_discovered_and_routed() {
 /// without the redundant explicit-field metadata the old site needed.
 #[test]
 fn spike_harvest_reads_per_doc_extra() {
-    use twyla::compile::HarvestedDoc;
+    use twyla::document::DocumentReq;
     use twyla::render::RenderWorld;
     use twyla::resolver::Resolver;
 
@@ -500,10 +500,10 @@ fn spike_harvest_reads_per_doc_extra() {
     let outputs = world
         .compile_bundle(&mut Resolver::new(&ctx))
         .expect("compile+harvest");
-    let docs: Vec<&HarvestedDoc> = outputs.docs().filter_map(|d| d.meta.as_ref()).collect();
+    let docs: Vec<&DocumentReq> = outputs.docs().filter_map(|d| d.meta.as_ref()).collect();
     let spike = docs
         .iter()
-        .find(|d| d.url == "https://example.com/spike-doc/")
+        .find(|d| d.output == "spike-doc/index.html")
         .unwrap_or_else(|| panic!("spike-doc not harvested; got {docs:#?}"));
     let extra = format!("{:?}", spike.extra);
     assert!(
@@ -519,7 +519,7 @@ fn spike_harvest_reads_per_doc_extra() {
     // Per-doc isolation: a second page sets a different extra + draft:true.
     let spike2 = docs
         .iter()
-        .find(|d| d.url == "https://example.com/spike-doc-2/")
+        .find(|d| d.output == "spike-doc-2/index.html")
         .unwrap_or_else(|| panic!("spike-doc-2 not harvested; got {docs:#?}"));
     assert!(
         format!("{:?}", spike2.extra).contains("red"),
@@ -534,7 +534,7 @@ fn spike_harvest_reads_per_doc_extra() {
     // A post page harvests its standard fields + derived kind.
     let hello = docs
         .iter()
-        .find(|d| d.url == "https://example.com/hello/")
+        .find(|d| d.output == "hello/index.html")
         .unwrap_or_else(|| panic!("hello not harvested; got {docs:#?}"));
     assert_eq!(hello.kind, "post", "hello kind not harvested: {hello:#?}");
     assert!(hello.date.is_some(), "hello date not harvested: {hello:#?}");

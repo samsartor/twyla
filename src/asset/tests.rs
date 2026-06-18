@@ -298,10 +298,43 @@ fn read_inlines_asset_content_through_the_loop() {
         html.contains("a b"),
         "encoding:none sass bytes not inlined:\n{html}"
     );
-    assert_eq!(assets.len(), 2, "both assets still registered: {assets:?}");
+    // Both assets are *only* `.read()` (inlined above), never `.url()`'d, so
+    // neither is emitted as a file — the bytes already live in the HTML.
+    assert_eq!(
+        assets.len(),
+        0,
+        "read-only assets should be inlined, not written as files: {assets:?}"
+    );
     assert!(
         !html.contains("__twyla-asset-pending__"),
         "placeholder leaked:\n{html}"
+    );
+}
+
+/// An asset both linked (`.url()`) and inlined (`.read()`) is emitted exactly
+/// once: the URL usage makes it a file, and unioning the read usage neither
+/// suppresses nor duplicates it.
+#[test]
+fn asset_used_for_url_and_read_is_emitted_once() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context html.elem(\"link\", attrs: (href: asset.file(\"s.css\").url()))\n\
+             #context raw-html(asset.file(\"s.css\").read())",
+        ),
+        ("content/s.css", "a{b:c}"),
+    ]);
+    let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+
+    assert_eq!(
+        assets.len(),
+        1,
+        "url+read of one spec should emit exactly one file: {assets:?}"
+    );
+    assert!(html.contains("a{b:c}"), "read content not inlined:\n{html}");
+    assert!(
+        html.contains(&format!("href=\"{}\"", assets[0].url)),
+        "link did not point at the emitted asset URL:\n{html}"
     );
 }
 

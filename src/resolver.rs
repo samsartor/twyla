@@ -9,6 +9,7 @@
 //! land), whereas a document is 1:1 with its `output`, which is part of its own
 //! spec. So the design is one struct, two maps, shared helpers — not a generic.
 
+use std::collections::BTreeSet;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use typst::diag::SourceResult;
 use typst::syntax::VirtualRoot;
 use typst_utils::hash128;
 
-use crate::asset::{AssetReq, AssetSpec, ResolvedAsset, file, image, raw, sass, typst_doc};
+use crate::asset::{AssetReq, AssetSpec, OutputReq, ResolvedAsset, file, image, raw, sass, typst_doc};
 use crate::document::{DocumentReq, ResolvedDocument};
 use crate::project::TwylaContext;
 
@@ -67,9 +68,23 @@ impl Resolver {
 
     // -- accessors for emission and listings --------------------------------
 
-    /// Every currently-resolved asset (for emission).
+    /// Every currently-resolved asset, regardless of how it's used. This is the
+    /// set whose source files must be *watched* (a `.read()`-only asset is never
+    /// emitted but its source still affects the inlined output) — see
+    /// [`emittable_assets`](Self::emittable_assets) for the narrower set actually
+    /// written.
     pub fn resolved_assets(&self) -> impl Iterator<Item = &ResolvedAsset> {
         self.assets.iter()
+    }
+
+    /// The assets actually written as files: those some call site requested a
+    /// URL for ([`OutputReq::Url`]). An asset only ever `.read()` (inlined into
+    /// the HTML, never linked) is omitted — nothing references the file, so
+    /// writing it would just litter the output dir.
+    pub fn emittable_assets(&self) -> impl Iterator<Item = &ResolvedAsset> {
+        self.assets
+            .iter()
+            .filter(|asset| asset.outputs.contains(&OutputReq::Url))
     }
 
     /// Every collected document's request row, in deterministic (`output`-keyed)
@@ -78,21 +93,40 @@ impl Resolver {
         self.documents.iter().map(|stored| &stored.doc)
     }
 
+    /// Forget how assets were used (clears each asset's `outputs`). Called once
+    /// at the start of each compile: assets themselves persist across recompiles,
+    /// but their usage is rebuilt from scratch as this compile re-discovers
+    /// requests, so a call site that dropped its `.url()` stops emitting the file.
+    pub fn clear_asset_usage(&mut self) {
+        if self.assets.is_empty() {
+            return;
+        }
+        for mut asset in Arc::make_mut(&mut self.assets).iter_mut() {
+            asset.outputs.clear();
+        }
+    }
+
     // -- discovery: build/collect on demand, deduping by key ----------------
 
-    /// Ensure `req`'s spec is built and stored. A no-op if it already is, so
-    /// repeated requests for the same spec across iterations (or call sites)
-    /// resolve exactly once.
+    /// Ensure `req`'s spec is built and stored, and record how this request uses
+    /// it. The build is a no-op if the spec is already resolved (so repeated
+    /// requests across iterations or call sites build once); the usage
+    /// ([`outputs`](ResolvedAsset::outputs)) is unioned every time, so an asset
+    /// both `.url()` and `.read()` ends up carrying both.
     pub fn resolve_asset(
         &mut self,
         world: Tracked<dyn World + '_>,
         req: &AssetReq,
     ) -> SourceResult<()> {
-        if self.assets.contains_key(&req.spec) {
-            return Ok(());
+        if !self.assets.contains_key(&req.spec) {
+            let asset = self.build_asset(world, &req.spec, req.span)?;
+            Arc::make_mut(&mut self.assets).insert_overwrite(asset);
         }
-        let asset = self.build_asset(world, &req.spec, req.span)?;
-        Arc::make_mut(&mut self.assets).insert_overwrite(asset);
+        Arc::make_mut(&mut self.assets)
+            .get_mut(&req.spec)
+            .expect("just resolved")
+            .outputs
+            .extend(req.outputs.iter().cloned());
         Ok(())
     }
 
@@ -146,6 +180,8 @@ impl Resolver {
             built,
             output_path,
             url,
+            // Filled in by `resolve_asset` from the request(s) that reached it.
+            outputs: BTreeSet::new(),
         })
     }
 
