@@ -14,6 +14,7 @@ use typst_utils::hash128;
 use super::*;
 use crate::project::TwylaContext;
 use crate::render::{Emit, RenderWorld};
+use crate::resolver::Resolver;
 
 fn site(files: &[(&str, &str)]) -> (TwylaContext, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -28,7 +29,7 @@ fn site(files: &[(&str, &str)]) -> (TwylaContext, tempfile::TempDir) {
 /// First-page HTML + resolved assets from one compile of `world` (fresh
 /// resolver — for tests that don't exercise cross-compile persistence).
 fn compile(world: &RenderWorld) -> (String, Vec<ResolvedAsset>) {
-    let mut resolver = AssetResolver::new(&world.ctx);
+    let mut resolver = Resolver::new(&world.ctx);
     let outputs = world.compile_bundle(&mut resolver).unwrap();
     let html = outputs.docs().next().unwrap().html.clone();
     (html, outputs.assets().cloned().collect())
@@ -180,7 +181,7 @@ fn cover_requires_both_dimensions() {
 
     let err = RenderWorld::new(&ctx)
         .unwrap()
-        .compile_bundle(&mut AssetResolver::new(&ctx))
+        .compile_bundle(&mut Resolver::new(&ctx))
         .err()
         .expect("cover with one dimension should fail");
     assert!(
@@ -264,7 +265,7 @@ fn missing_asset_blames_the_call_site() {
         "#context asset.file(\"nope.svg\").url()",
     )]);
     let world = RenderWorld::new(&ctx).unwrap();
-    let mut resolver = AssetResolver::new(&world.ctx);
+    let mut resolver = Resolver::new(&world.ctx);
     let err = world
         .compile_bundle(&mut resolver)
         .err()
@@ -383,7 +384,7 @@ fn bare_asset_in_markup_is_refused() {
         ("content/logo.svg", "<svg/>"),
     ]);
     let world = RenderWorld::new(&ctx).unwrap();
-    let mut resolver = AssetResolver::new(&world.ctx);
+    let mut resolver = Resolver::new(&world.ctx);
     let err = world
         .compile_bundle(&mut resolver)
         .err()
@@ -437,7 +438,7 @@ fn editing_source_revalidates_to_new_fingerprint() {
     ]);
     let mut world = RenderWorld::new(&ctx).unwrap();
     // One resolver reused across both compiles — the persistent-store path.
-    let mut resolver = AssetResolver::new(&ctx);
+    let mut resolver = Resolver::new(&ctx);
 
     let outputs1 = world.compile_bundle(&mut resolver).unwrap();
     let url1 = outputs1.assets().next().unwrap().output_path.clone();
@@ -476,7 +477,7 @@ fn editing_source_revalidates_inline_document() {
     )]);
     let mut world = RenderWorld::new(&ctx).unwrap();
     // One resolver across both compiles — the persistent document-store path.
-    let mut resolver = AssetResolver::new(&ctx);
+    let mut resolver = Resolver::new(&ctx);
 
     let outputs1 = world.compile_bundle(&mut resolver).unwrap();
     let child1 = outputs1
@@ -610,7 +611,7 @@ fn bare_typst_asset_is_refused() {
     )]);
     let err = RenderWorld::new(&ctx)
         .unwrap()
-        .compile_bundle(&mut AssetResolver::new(&ctx))
+        .compile_bundle(&mut Resolver::new(&ctx))
         .err()
         .expect("a bare typst asset in markup should error")
         .to_string();
@@ -633,7 +634,7 @@ fn editing_typst_source_revalidates_to_new_fingerprint() {
         ("doc.typ", "= First Version"),
     ]);
     let mut world = RenderWorld::new(&ctx).unwrap();
-    let mut resolver = AssetResolver::new(&ctx);
+    let mut resolver = Resolver::new(&ctx);
 
     let url1 = world
         .compile_bundle(&mut resolver)

@@ -33,7 +33,8 @@ use typst_kit::watcher::Watcher;
 
 use owo_colors::{AnsiColors, OwoColorize, Stream, Style};
 
-use crate::asset::{AssetResolver, ResolvedAsset};
+use crate::asset::ResolvedAsset;
+use crate::resolver::Resolver;
 use crate::project::TwylaContext;
 use crate::render::{Emit, Output, Outputs, RenderError, RenderWorld};
 
@@ -160,7 +161,7 @@ pub fn run(serve: Serve) -> io::Result<()> {
     // The asset resolver persists across recompiles (its store seeds each
     // compile's map; `revalidate` evicts changed sources). Lives here, moves
     // into the watcher thread — the only place that compiles.
-    let mut resolver = AssetResolver::new(&serve.ctx);
+    let mut resolver = Resolver::new(&serve.ctx);
 
     let warm_start = Instant::now();
     let initial = world.lock().unwrap().compile_bundle(&mut resolver);
@@ -231,7 +232,7 @@ fn run_watcher(
     last_output: Arc<LastOutput>,
     content_dir: PathBuf,
     reload_clients: Arc<ReloadClients>,
-    mut resolver: AssetResolver,
+    mut resolver: Resolver,
 ) {
     let mut watcher = match Watcher::new(None) {
         Ok(w) => w,

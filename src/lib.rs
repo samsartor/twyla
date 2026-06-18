@@ -23,6 +23,7 @@ pub mod import;
 pub mod project;
 pub mod reflect;
 pub mod render;
+pub mod resolver;
 pub mod rules;
 pub mod serve;
 pub mod slug;

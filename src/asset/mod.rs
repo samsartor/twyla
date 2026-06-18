@@ -5,38 +5,29 @@
 
 pub(crate) mod file;
 pub(crate) mod image;
-mod raw;
+pub(crate) mod raw;
 pub(crate) mod sass;
 pub(crate) mod typst_doc;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fmt::{self, Debug, Formatter};
+use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
-use std::{fs, io};
+use std::path::Path;
 
 use comemo::Tracked;
-use crossbeam_channel::{Receiver, Sender, unbounded};
 use ecow::{EcoString, eco_format, eco_vec};
-use iddqd::{IdHashItem, IdHashMap};
-use typst::World;
+use iddqd::IdHashItem;
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{
-    Binding, Bytes, Content, Module, PathOrStr, Repr, Scope, Str, Style, StyleChain, Value, elem,
-    ty,
+    Binding, Bytes, Content, Module, PathOrStr, Repr, Scope, Str, StyleChain, Value, elem, ty,
 };
 use typst::introspection::{History, Introspect, Introspector};
 use typst::loading::{Encoding, Readable};
-use typst::syntax::{FileId, Span, VirtualRoot};
-use typst::utils::LazyHash;
+use typst::syntax::{FileId, Span};
 use typst_utils::hash128;
 
-use crate::document::{DiscoveredDoc, DocumentSink, ResolvedDocument, TwylaDocumentSink};
 use crate::project::TwylaContext;
 use crate::render::Emit;
+use crate::resolver::Upstream;
 
 // ---------------------------------------------------------------------------
 // Keys: AssetSpec -> AssetRequest -> Asset
@@ -355,57 +346,6 @@ impl Hash for Built {
     }
 }
 
-/// One on-disk file an asset depends on, with its mtime at resolve time (for
-/// [`AssetResolver::revalidate`]).
-#[derive(Clone, Debug, PartialEq, PartialOrd, Ord, Eq)]
-pub struct Upstream {
-    pub path: PathBuf,
-    pub mtime: Option<SystemTime>,
-}
-
-impl Upstream {
-    pub fn new_lazy(path: PathBuf) -> Self {
-        Upstream {
-            mtime: mtime(&path).ok(),
-            path,
-        }
-    }
-
-    pub fn new_read_string(path: PathBuf) -> io::Result<(Self, String)> {
-        let mut f = fs::File::open(&path).map_err(|e| annotate(&path, e))?;
-        let mtime = f
-            .metadata()
-            .map_err(|e| annotate(&path, e))?
-            .modified()
-            .ok();
-        let mut text = String::new();
-        f.read_to_string(&mut text)
-            .map_err(|e| annotate(&path, e))?;
-        Ok((Upstream { path, mtime }, text))
-    }
-
-    pub fn new_read_bytes(path: PathBuf) -> io::Result<(Self, Vec<u8>)> {
-        let mut f = fs::File::open(&path).map_err(|e| annotate(&path, e))?;
-        let mtime = f
-            .metadata()
-            .map_err(|e| annotate(&path, e))?
-            .modified()
-            .ok();
-        let mut bytes = Vec::new();
-        f.read_to_end(&mut bytes).map_err(|e| annotate(&path, e))?;
-        Ok((Upstream { path, mtime }, bytes))
-    }
-}
-
-/// Annotate an I/O error with the absolute path it concerns, so a failed asset
-/// read reports *which* file (`/abs/path: No such file or directory`) instead of
-/// a bare OS error. `std::path::absolute` resolves the path against the cwd
-/// without touching the filesystem (so it works even when the file is missing).
-fn annotate(path: &Path, err: io::Error) -> io::Error {
-    let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    io::Error::new(err.kind(), format!("{}: {err}", shown.display()))
-}
-
 /// One processed asset: where it lives, how to emit it, and what it depends on.
 ///
 /// This is the value carried on the style chain (inside [`ResolvedAssets`]), so
@@ -448,161 +388,6 @@ impl ResolvedAsset {
     pub fn upstream_paths(&self) -> impl Iterator<Item = &Path> {
         self.built.upstream.iter().map(|u| u.path.as_path())
     }
-}
-
-// ---------------------------------------------------------------------------
-// The resolver
-// ---------------------------------------------------------------------------
-
-pub struct AssetResolver {
-    epoch: u64,
-    ctx: TwylaContext,
-    tx: Sender<AssetReq>,
-    rx: Receiver<AssetReq>,
-    pub resolved: IdHashMap<ResolvedAsset>,
-    pub documents: IdHashMap<ResolvedDocument>,
-}
-
-impl AssetResolver {
-    /// A fresh, empty resolver. The asset and document stores fill as they're
-    /// discovered and persist for the resolver's lifetime.
-    pub fn new(ctx: &TwylaContext) -> Self {
-        let (tx, rx) = unbounded();
-        let (doc_tx, doc_rx) = unbounded();
-        Self {
-            epoch: EPOCH.fetch_add(1, Ordering::Relaxed),
-            ctx: ctx.clone(),
-            tx,
-            rx,
-            resolved: HashMap::new(),
-            doc_tx,
-            doc_rx,
-            documents: BTreeMap::new(),
-        }
-    }
-
-    /// Resolve a discovered document's source file to an on-disk path + mtime
-    /// for invalidation. Only project files have a watched path; package files
-    /// are immutable, so they need none (`None`).
-    fn doc_source(&self, doc: &DiscoveredDoc) -> (Option<PathBuf>, Option<SystemTime>) {
-        let Some(id) = doc.source else {
-            return (None, None);
-        };
-        match id.root() {
-            VirtualRoot::Project => {
-                let path = self.ctx.root.join(id.vpath().get_without_slash());
-                let mtime = mtime(&path).ok();
-                (Some(path), mtime)
-            }
-            VirtualRoot::Package(_) => (None, None),
-        }
-    }
-
-    /// Every collected document, in deterministic (`output`-keyed) order.
-    pub fn documents(&self) -> impl Iterator<Item = &DiscoveredDoc> {
-        self.documents.values().map(|stored| &stored.doc)
-    }
-
-    /// Process one spec into a [`ResolvedAsset`]: dispatch to the per-type
-    /// build, then add the shared fingerprinted name / output path / URL.
-    fn process(
-        &self,
-        world: Tracked<dyn World + '_>,
-        spec: &AssetSpec,
-        span: Span,
-    ) -> SourceResult<ResolvedAsset> {
-        let built = match spec {
-            AssetSpec::File { file } => file::build(world, *file, &self.ctx, span)?,
-            AssetSpec::Sass { file, minify } => {
-                sass::build(world, *file, *minify, &self.ctx, span)?
-            }
-            // `Raw` is in-memory bytes — it can't fail, so it needs no span.
-            AssetSpec::Raw { bytes, ext } => raw::build(bytes.clone(), ext.clone()),
-            AssetSpec::Image {
-                source,
-                width,
-                height,
-                fit,
-                filter,
-                format,
-                quality,
-            } => image::build(
-                source, *width, *height, *fit, *filter, *format, *quality, &self.ctx, span,
-            )?,
-            AssetSpec::Typst { input, format, ppi } => {
-                typst_doc::build(world, input, *format, *ppi, &self.ctx, span)?
-            }
-        };
-
-        let output_path = self.ctx.default_asset_output(&built);
-        let url = self.ctx.asset_url(&output_path);
-
-        Ok(ResolvedAsset {
-            spec: spec.clone(),
-            built,
-            output_path,
-            url,
-        })
-    }
-
-    /// Bump the discovery epoch, invalidating the comemo discovery generation so
-    /// the next compile re-discovers (re-sends on) both sinks cleanly. One epoch
-    /// covers assets and documents, so a change to either re-discovers both (see
-    /// [`AssetSink`] / [`DocumentSink`](crate::document::DocumentSink)).
-    fn bump_epoch(&mut self) {
-        self.epoch = EPOCH.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Evict every resolved asset matching `pred`. Returns whether anything was
-    /// removed (the caller bumps the epoch). The path-free invalidation seam:
-    /// when a path-aware watcher lands, add an `invalidate(&changed_paths)` that
-    /// calls this with an intersection predicate instead of stat'ing every
-    /// upstream.
-    fn evict_assets_where(&mut self, mut pred: impl FnMut(&ResolvedAsset) -> bool) -> bool {
-        let before = self.resolved.len();
-        self.resolved.retain(|_, asset| !pred(asset));
-        self.resolved.len() != before
-    }
-
-    /// Evict every collected document matching `pred`. Returns whether anything
-    /// was removed (the caller bumps the epoch).
-    fn evict_docs_where(&mut self, mut pred: impl FnMut(&StoredDoc) -> bool) -> bool {
-        let before = self.documents.len();
-        self.documents.retain(|_, stored| !pred(stored));
-        self.documents.len() != before
-    }
-
-    /// Evict assets *and* documents whose on-disk sources changed since they
-    /// were resolved (mtime check), bumping the discovery epoch once if anything
-    /// went. Called at the top of each compile; a no-op on the first compile
-    /// (empty stores). Returns whether anything was evicted.
-    pub fn revalidate(&mut self) -> bool {
-        let assets = self.evict_assets_where(|asset| {
-            asset
-                .built
-                .upstream
-                .iter()
-                .any(|u| mtime(&u.path).ok() != u.mtime)
-        });
-        let docs = self.evict_docs_where(|stored| match &stored.source {
-            Some(path) => mtime(path).ok() != stored.mtime,
-            None => false,
-        });
-        if assets || docs {
-            self.bump_epoch();
-        }
-        assets || docs
-    }
-
-    /// A snapshot of every currently-resolved asset (for emission).
-    pub fn resolved_assets(&self) -> impl Iterator<Item = &ResolvedAsset> {
-        self.resolved.iter()
-    }
-}
-
-/// Last-modified time of an on-disk path
-fn mtime(path: &Path) -> io::Result<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified())
 }
 
 #[cfg(test)]

@@ -15,8 +15,8 @@ use typst::foundations::{
 use typst::introspection::{History, Introspect, Introspector, Location};
 use typst::syntax::{FileId, Span};
 
-use crate::asset::Upstream;
 use crate::project::TwylaContext;
+use crate::resolver::Upstream;
 
 /// Defines a page of the website.
 ///
@@ -198,7 +198,7 @@ pub const RENDER_INTROSPECTION: ShowFn<TwylaDocument> = |elem, engine, styles| {
 
 /// A document discovered through the sink during realization — the shape of a
 /// [`documents`] row plus its body and originating source. Flows Rust-side
-/// through [`DocumentSink`] to [`crate::asset::AssetResolver`], which collects
+/// through the discovery scan to [`crate::resolver::Resolver`], which collects
 /// it, dedups by `output`, and invalidates by `source` across warm rebuilds.
 #[derive(Clone, PartialEq, Hash, Debug)]
 pub struct DocumentReq {
@@ -234,9 +234,12 @@ impl DocumentReq {
     }
 }
 
+#[derive(Clone)]
 pub struct ResolvedDocument {
     pub doc: DocumentReq,
-    pub upstream: Upstream,
+    /// The watched on-disk source, for invalidation. `None` for a document from
+    /// a package file (immutable) or a detached span (no file).
+    pub upstream: Option<Upstream>,
     pub content_hash: u128,
 }
 

@@ -21,7 +21,8 @@ use typst_library::model::{DocumentElem, DocumentInfo};
 use typst_library::routines::{Arenas, RealizationKind};
 use typst_utils::Protected;
 
-use crate::asset::{AssetReqIntrospect, AssetResolver, ResolvedAsset, hash_spec};
+use crate::asset::{AssetReqIntrospect, ResolvedAsset, hash_spec};
+use crate::resolver::Resolver;
 use crate::document::{DOCUMENTS_LIST_KEY, DocumentReqIntrospect, ResolvedDocument};
 use crate::project::TwylaContext;
 
@@ -68,7 +69,7 @@ pub fn compile_bundle(
     ctx: &TwylaContext,
     world: &dyn World,
     sources: &[FileId],
-    resolver: &mut AssetResolver,
+    resolver: &mut Resolver,
 ) -> Warned<SourceResult<CompiledBundle>> {
     let mut sink = Sink::new();
     let traced = Traced::default();
@@ -93,7 +94,7 @@ fn compile_bundle_impl(
     traced: Tracked<Traced>,
     sink: &mut Sink,
     sources: &[FileId],
-    resolver: &mut AssetResolver,
+    resolver: &mut Resolver,
 ) -> SourceResult<CompiledBundle> {
     // Evict assets whose sources changed since the last compile (no-op on the
     // first compile / a fresh resolver). What survives seeds this compile.
@@ -134,7 +135,7 @@ fn compile_bundle_impl(
     for doc in resolver.documents() {
         harvested.push(harvested_from_discovered(ctx, doc));
     }
-    Ok((bundle, harvested, resolver.resolved_assets()))
+    Ok((bundle, harvested, resolver.resolved_assets().cloned().collect()))
 }
 
 /// Evaluate a single content file into its body content. Mirrors the eval
@@ -159,7 +160,7 @@ fn eval_file(engine: &mut Engine, id: FileId) -> SourceResult<Content> {
 
 pub struct TwylaIntrospector {
     pub inner: Arc<BundleIntrospector>,
-    pub resolver: AssetResolver,
+    pub resolver: Resolver,
 }
 
 impl Introspector for TwylaIntrospector {
@@ -269,7 +270,7 @@ fn compile_bundle_loop(
     traced: Tracked<Traced>,
     sink: &mut Sink,
     files: &[(Content, HarvestedDoc)],
-    resolver: &mut AssetResolver,
+    resolver: &mut Resolver,
 ) -> SourceResult<Bundle> {
     let library = world.library();
     let base = StyleChain::new(&library.styles);
@@ -477,7 +478,7 @@ fn harvest_metadata(
 fn build_documents_array(
     ctx: &TwylaContext,
     files: &[(Content, HarvestedDoc)],
-    resolver: &AssetResolver,
+    resolver: &Resolver,
 ) -> Array {
     let mut documents = Array::new();
     for (_, meta) in files {
@@ -491,7 +492,7 @@ fn build_documents_array(
 
 /// The bundle content for the current loop iteration: each file body wrapped as
 /// its own routed document, plus each discovered document as a sibling.
-fn build_content(files: &[(Content, HarvestedDoc)], resolver: &AssetResolver) -> Content {
+fn build_content(files: &[(Content, HarvestedDoc)], resolver: &Resolver) -> Content {
     let mut bodies = Vec::new();
     for (body, meta) in files {
         // Re-apply the *derived* output onto the page body so the page can read
@@ -568,7 +569,7 @@ fn deduplicate(mut diags: EcoVec<SourceDiagnostic>) -> EcoVec<SourceDiagnostic> 
 
 #[cfg(test)]
 mod tests {
-    use crate::asset::AssetResolver;
+    use crate::resolver::Resolver;
     use crate::project::TwylaContext;
     use crate::render::RenderWorld;
 
@@ -580,7 +581,7 @@ mod tests {
         std::fs::write(dir.path().join("content/main.typ"), body).unwrap();
         let ctx = TwylaContext::new(dir.path(), Some("https://example.com".into())).unwrap();
         let world = RenderWorld::new(&ctx).unwrap();
-        let mut resolver = AssetResolver::new(&world.ctx);
+        let mut resolver = Resolver::new(&world.ctx);
         let outputs = world.compile_bundle(&mut resolver).unwrap();
         outputs.docs().next().unwrap().html.clone()
     }
@@ -606,7 +607,7 @@ mod tests {
         std::fs::write(dir.path().join("content/main.typ"), body).unwrap();
         let ctx = TwylaContext::new(dir.path(), Some("https://example.com".into())).unwrap();
         let world = RenderWorld::new(&ctx).unwrap();
-        let mut resolver = AssetResolver::new(&world.ctx);
+        let mut resolver = Resolver::new(&world.ctx);
         world.compile_bundle(&mut resolver).unwrap()
     }
 

@@ -27,7 +27,8 @@ use typst_kit::fonts::FontStore;
 use typst_kit::packages::SystemPackages;
 use typst_library::Feature;
 
-use crate::asset::{AssetResolver, ResolvedAsset};
+use crate::asset::ResolvedAsset;
+use crate::resolver::Resolver;
 use crate::compile::HarvestedDoc;
 use crate::project::TwylaContext;
 
@@ -226,7 +227,7 @@ impl Outputs {
 /// the comemo cache survives between requests.
 pub fn render_site(ctx: &TwylaContext) -> Result<Outputs, RenderError> {
     let world = RenderWorld::new(ctx)?;
-    world.compile_bundle(&mut AssetResolver::new(ctx))
+    world.compile_bundle(&mut Resolver::new(ctx))
 }
 
 /// Replace every `<script type="x-twyla-raw-html">..</script>` with its
@@ -416,7 +417,7 @@ impl RenderWorld {
     /// store persists. Passing it in keeps these methods `&self` — a field
     /// would force interior mutability, since `self` is also handed to typst as
     /// `&dyn World` for the duration of the compile.
-    pub fn compile_bundle(&self, resolver: &mut AssetResolver) -> Result<Outputs, RenderError> {
+    pub fn compile_bundle(&self, resolver: &mut Resolver) -> Result<Outputs, RenderError> {
         // Reads through `FileStore`, so repeated calls hit the comemo
         // cache. Between compiles, call [`reset`](Self::reset) and
         // `comemo::evict(..)` to invalidate; for content/ shape changes,
