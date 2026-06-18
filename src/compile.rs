@@ -29,7 +29,7 @@ use crate::asset::{AssetReqIntrospect, ResolvedAsset, hash_spec};
 use crate::document::{
     DOCUMENTS_LIST_KEY, DocumentReq, DocumentReqIntrospect, ResolvedDocument, TwylaDocument,
 };
-use crate::project::TwylaContext;
+use crate::project::{TwylaContext, present_output};
 use crate::resolver::Resolver;
 
 /// One page's harvested twyla metadata — the row that becomes one
@@ -53,7 +53,9 @@ impl HarvestedDoc {
     fn to_dict(&self) -> Dict {
         let mut d = Dict::new();
         d.insert("url".into(), self.url.clone().into_value());
-        d.insert("output".into(), self.output.clone().into_value());
+        // Shown in root-absolute form (user-presentation boundary); the stored
+        // `self.output` and every internal comparison stay no-slash.
+        d.insert("output".into(), present_output(&self.output).into_value());
         d.insert("title".into(), self.title.clone().into_value());
         d.insert("date".into(), self.date.into_value());
         d.insert("description".into(), self.description.clone().into_value());
@@ -531,10 +533,16 @@ fn build_content(files: &[(Content, HarvestedDoc)], resolver: &Resolver) -> Cont
         // and never reaches the chain. (`discovered_sibling` does the same for
         // inline documents; this keeps full-file pages consistent.) Idempotent
         // when the user pinned `output` explicitly: `meta.output` already is it.
+        //
+        // The field is shown in root-absolute (`/`-prefixed) form — the
+        // user-presentation boundary — while routing (`wrap_document`) and dedup
+        // keep the no-slash `meta.output`. The slashed value still anchors
+        // relative child `document(output:)` paths: `resolve_output` skips the
+        // empty leading segment.
         let mut styles = Styles::new();
         styles.set(
             TwylaDocument::output,
-            Smart::Custom(meta.output.as_str().into()),
+            Smart::Custom(present_output(&meta.output).into()),
         );
         bodies.push(wrap_document(
             &meta.output,
@@ -552,9 +560,12 @@ fn build_content(files: &[(Content, HarvestedDoc)], resolver: &Resolver) -> Cont
 /// as on a full-file page.
 fn discovered_sibling(doc: &DocumentReq) -> Content {
     let mut styles = Styles::new();
+    // Shown in root-absolute form (user-presentation boundary); routing and
+    // child-anchor resolution tolerate / strip the leading slash. See
+    // `build_content`.
     styles.set(
         TwylaDocument::output,
-        Smart::Custom(doc.output.as_str().into()),
+        Smart::Custom(present_output(&doc.output).into()),
     );
     styles.set(TwylaDocument::title, doc.title.clone());
     styles.set(TwylaDocument::date, doc.date);
@@ -704,5 +715,67 @@ mod tests {
             .filter(|d| d.output_path == "dup/index.html")
             .count();
         assert_eq!(dups, 1, "document emitted {dups} times, expected exactly 1");
+    }
+
+    /// The user-presentation boundary: a page reads its own output as a
+    /// root-absolute string (`/index.html`), and a `documents()` entry's
+    /// `output` field is likewise `/`-prefixed — while the file is still routed
+    /// and written under the no-slash key (`index.html`). Mirrors how a URL is
+    /// root-absolute; the slash exists only in user-facing values.
+    #[test]
+    fn output_is_presented_root_absolute() {
+        // `#context document.output` for the current page.
+        let html = compile_main("#context document.output");
+        assert!(
+            html.contains("/index.html"),
+            "document.output not shown root-absolute (`/index.html`):\n{html}"
+        );
+
+        // A `documents()` entry's `output` field, for the same page.
+        let listed = compile_main(
+            "#context {\n  \
+               for d in documents() [#d.output]\n\
+             }",
+        );
+        assert!(
+            listed.contains("/index.html"),
+            "documents() entry `output` not root-absolute:\n{listed}"
+        );
+
+        // The output is nonetheless routed/written under the no-slash key.
+        let outputs = compile_outputs("hello");
+        assert!(
+            outputs.get("index.html").is_some(),
+            "page not routed to the no-slash key `index.html`"
+        );
+        assert!(
+            outputs.get("/index.html").is_none(),
+            "page leaked a slash-prefixed key into the output map"
+        );
+    }
+
+    /// A *relative* inline `document(output:)` still anchors on the enclosing
+    /// page's output directory even though that anchor is now carried on the
+    /// chain in root-absolute form (`/blog/index.html`): `resolve_output` skips
+    /// the empty leading segment. `content/blog/main.typ` → `blog/` anchor, so
+    /// `output: "extra.html"` lands at the no-slash key `blog/extra.html`.
+    #[test]
+    fn relative_child_output_resolves_under_slashed_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("content/blog")).unwrap();
+        std::fs::write(
+            dir.path().join("content/blog/main.typ"),
+            "#document(output: \"extra.html\")[Extra body]",
+        )
+        .unwrap();
+        let ctx = TwylaContext::new(dir.path(), Some("https://example.com".into())).unwrap();
+        let world = RenderWorld::new(&ctx).unwrap();
+        let mut resolver = Resolver::new(&world.ctx);
+        let outputs = world.compile_bundle(&mut resolver).unwrap();
+
+        assert!(
+            outputs.get("blog/extra.html").is_some(),
+            "relative child output did not resolve under the slashed anchor"
+        );
     }
 }

@@ -57,6 +57,18 @@ pub(crate) fn build_document_url(base_url: Option<&str>, output: &str) -> String
     }
 }
 
+/// Present a stored (no-leading-slash) output path to user typst as a
+/// root-absolute string (`blog/index.html` → `/blog/index.html`). Internally
+/// every output path is stored, compared, routed, and written without a leading
+/// slash (a leading `/` makes `Path::join`/`strip_prefix` treat it as
+/// OS-absolute); the slash is re-attached *only* at the user-presentation
+/// boundary — the `document.output` field and the `output` field of each
+/// `documents()` entry — mirroring how a URL is root-absolute. Idempotent if a
+/// slash is already present.
+pub(crate) fn present_output(output: &str) -> String {
+    format!("/{}", output.trim_start_matches('/'))
+}
+
 /// Normalize a relative path into a `/`-separated, no-leading-slash manifest
 /// key — the form [`crate::html::resolve`] and the output manifests share.
 pub(crate) fn path_key(p: &Path) -> String {

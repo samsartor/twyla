@@ -15,7 +15,7 @@ use typst::foundations::{
 use typst::introspection::{History, Introspect, Introspector, Location};
 use typst::syntax::{FileId, Span};
 
-use crate::project::TwylaContext;
+use crate::project::{TwylaContext, present_output};
 use crate::resolver::Upstream;
 
 /// Defines a page of the website.
@@ -252,7 +252,9 @@ impl DocumentReq {
     pub fn to_dict(&self, ctx: &TwylaContext) -> Dict {
         let mut d = Dict::new();
         d.insert("url".into(), ctx.document_url(&self.output).into_value());
-        d.insert("output".into(), self.output.clone().into_value());
+        // Shown in root-absolute form (user-presentation boundary); the stored
+        // `self.output` and every internal comparison stay no-slash.
+        d.insert("output".into(), present_output(&self.output).into_value());
         d.insert("title".into(), self.title.clone().into_value());
         d.insert("date".into(), self.date.into_value());
         d.insert("description".into(), self.description.clone().into_value());
@@ -303,7 +305,9 @@ impl Introspect for DocumentReqIntrospect {
             let Ok(Value::Str(output)) = doc.get("output") else {
                 continue;
             };
-            if output.as_str() == self.0.output {
+            // The dict's `output` is shown root-absolute; compare in the
+            // no-slash internal form against the stored `DocumentReq.output`.
+            if output.trim_start_matches('/') == self.0.output {
                 return doc.clone();
             }
         }
@@ -330,7 +334,9 @@ impl Introspect for DocumentAtIntrospect {
         let Some(path) = introspector.path(self.0) else {
             return Dict::new();
         };
-        // Compare against the documents listing in the no-leading-slash key form.
+        // Compare against the documents listing in the no-leading-slash key
+        // form. The bundle path is already no-slash; the dict's `output` is
+        // shown root-absolute, so strip its leading slash before comparing.
         let at_output = path.get_without_slash();
         let Some(Value::Array(array)) = introspector.value(DOCUMENTS_LIST_KEY) else {
             return Dict::new();
@@ -340,7 +346,7 @@ impl Introspect for DocumentAtIntrospect {
             let Ok(Value::Str(doc_output)) = doc.get("output") else {
                 continue;
             };
-            if doc_output.as_str() == at_output {
+            if doc_output.trim_start_matches('/') == at_output {
                 return doc.clone();
             }
         }
