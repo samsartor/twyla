@@ -8,6 +8,7 @@
 //! compile once, and drop it.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::{fmt, fs, io};
 
 use iddqd::{IdHashItem, IdHashMap, id_upcast};
@@ -28,9 +29,10 @@ use typst_kit::packages::SystemPackages;
 use typst_library::Feature;
 
 use crate::asset::ResolvedAsset;
-use crate::resolver::Resolver;
-use crate::document::DocumentReq;
+use crate::compile::CompiledBundle;
+use crate::document::ResolvedDocument;
 use crate::project::TwylaContext;
+use crate::resolver::Resolver;
 
 /// The `type` attribute marking a raw-HTML carrier `<script>`. The builtin
 /// [`crate::content::raw_html`] produces an element with this type; the
@@ -91,7 +93,7 @@ pub struct OutputDoc {
     pub html: String,
     /// The page's twyla `document` metadata. Only `None` if the user produced a
     /// raw Typst document without going through twyla somehow.
-    pub meta: Option<DocumentReq>,
+    pub meta: Option<ResolvedDocument>,
 }
 
 /// Some data which can be emitted to the output directory.
@@ -126,7 +128,7 @@ impl Emit {
 #[derive(Debug)]
 pub enum Output {
     Doc(OutputDoc),
-    Asset(ResolvedAsset),
+    Asset(Arc<ResolvedAsset>),
     Static(String, PathBuf),
 }
 
@@ -192,7 +194,7 @@ impl Outputs {
     /// Just the processed assets.
     pub fn assets(&self) -> impl Iterator<Item = &ResolvedAsset> {
         self.all.iter().filter_map(|o| match o {
-            Output::Asset(a) => Some(a),
+            Output::Asset(a) => Some(Arc::as_ref(a)),
             _ => None,
         })
     }
@@ -437,7 +439,8 @@ impl RenderWorld {
             crate::compile::compile_bundle(&self.ctx, self, &fileids, resolver);
         emit_warnings(self, &warnings);
 
-        let (bundle, harvested, assets) = output.map_err(|errors| compile_err(self, &errors))?;
+        let CompiledBundle { bundle, pages, assets } =
+            output.map_err(|errors| compile_err(self, &errors))?;
 
         let mut all = IdHashMap::new();
         for (path, file) in bundle.files.iter() {
@@ -455,7 +458,7 @@ impl RenderWorld {
             }
         }
 
-        for doc in harvested {
+        for doc in pages {
             let mut out = all.get_mut(doc.output.as_str());
             let Some(Output::Doc(out)) = out.as_deref_mut() else {
                 panic!("missing document in bundle with path {}", &doc.output);

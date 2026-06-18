@@ -483,11 +483,11 @@ fn editing_source_revalidates_to_new_fingerprint() {
     );
 }
 
-/// The document half of the warm path: an inline `#document(..)` discovered via
-/// the sink persists across rebuilds, and is re-collected with a *fresh body*
-/// when its source file changes (resolver reused; FileStore reset + comemo aged,
-/// exactly as `serve` does). Guards the per-source document eviction in
-/// `revalidate`.
+/// The document half of the warm path: editing the source of an inline
+/// `#document(..)` and recompiling the *same* resolver (FileStore reset + comemo
+/// aged, exactly as `serve` does) re-discovers it with a *fresh body*. Documents
+/// are cleared and rediscovered each compile, so the stale v1 body neither
+/// lingers nor trips the duplicate-output conflict check against v2.
 #[test]
 fn editing_source_revalidates_inline_document() {
     let (ctx, dir) = site(&[(

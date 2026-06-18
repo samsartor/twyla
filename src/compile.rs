@@ -21,22 +21,29 @@ use typst_library::introspection::{
     DocumentPosition, EmptyIntrospector, Introspection, Introspector, Location, Locator, MAX_ITERS,
     analyze,
 };
-use typst_library::model::{DocumentInfo, DocumentElem, Numbering};
+use typst_library::model::{DocumentElem, DocumentInfo, Numbering};
 use typst_library::routines::{Arenas, RealizationKind};
 use typst_utils::Protected;
 
 use crate::asset::{AssetReqIntrospect, ResolvedAsset, hash_spec};
 use crate::document::{
-    DOCUMENTS_LIST_KEY, DocumentReq, DocumentReqIntrospect, ResolvedDocument, TwylaDocument,
+    DOCUMENTS_LIST_KEY, ResolvedDocument, ResolvedDocumentIntrospect, TwylaDocument,
 };
 use crate::project::{TwylaContext, present_output};
 use crate::resolver::Resolver;
 
-/// The product of one bundle compile: the rendered [`Bundle`], each page's
-/// twyla `document` metadata, and every asset resolved along the way. A page is
-/// a [`DocumentReq`] whether it came from a `content/*.typ` file or an inline
-/// `document(..)` — same shape, two discovery paths.
-pub type CompiledBundle = (Bundle, Vec<DocumentReq>, Vec<ResolvedAsset>);
+/// The product of one bundle compile, consumed by [`crate::render`] to assemble
+/// the output map. `pages` is every page's twyla `document` metadata — a
+/// [`ResolvedDocument`] whether it came from a `content/*.typ` file or an inline
+/// `document(..)`, same shape, two discovery paths — and `assets` is every
+/// emittable asset. Both are plain lists `render` iterates once (it keys its own
+/// output map); the element types let it move each entry into an `Output` with
+/// no clone.
+pub struct CompiledBundle {
+    pub bundle: Bundle,
+    pub pages: Vec<ResolvedDocument>,
+    pub assets: Vec<Arc<ResolvedAsset>>,
+}
 
 /// Compile `pages` into a [`Bundle`] *and* harvest each page's twyla
 /// `document` metadata. Each source is evaluated exactly once; that single
@@ -78,6 +85,10 @@ fn compile_bundle_impl(
     // Asset *usage* (which assets are linked vs only inlined) is recomputed from
     // this compile's requests, so a dropped `.url()` stops emitting the file.
     resolver.clear_asset_usage();
+    // Documents are re-discovered from scratch each compile (cheap; their
+    // sources are typst deps), so drop the previous compile's set — otherwise a
+    // since-edited inline document would look like a conflicting one.
+    resolver.clear_documents();
 
     let library = world.library();
     let empty = EmptyIntrospector;
@@ -99,7 +110,7 @@ fn compile_bundle_impl(
         let body = eval_file(engine, *id)?;
         harvest_metadata(ctx, engine, *id, body)
     });
-    let mut files: Vec<DocumentReq> = Vec::new();
+    let mut files: Vec<ResolvedDocument> = Vec::new();
     for res in evaled {
         files.push(res?);
     }
@@ -108,11 +119,17 @@ fn compile_bundle_impl(
     // discovery all converge together (see [`compile_bundle_loop`]).
     let bundle = compile_bundle_loop(ctx, world, traced, sink, &files, resolver)?;
 
-    // Final metadata: each file page, then every discovered document — both are
-    // already `DocumentReq`s.
-    let mut harvested: Vec<DocumentReq> = files;
-    harvested.extend(resolver.documents().cloned());
-    Ok((bundle, harvested, resolver.emittable_assets().cloned().collect()))
+    // Every page (file pages first, then discovered inline documents — both
+    // already `ResolvedDocument`s) and every emittable asset, as the flat lists
+    // render iterates.
+    let mut pages: Vec<ResolvedDocument> = files;
+    pages.extend(resolver.documents().cloned());
+    let assets: Vec<Arc<ResolvedAsset>> = resolver.emittable_assets().cloned().collect();
+    Ok(CompiledBundle {
+        bundle,
+        pages,
+        assets,
+    })
 }
 
 /// Evaluate a single content file into its body content. Mirrors the eval
@@ -151,8 +168,8 @@ fn eval_file(engine: &mut Engine, id: FileId) -> SourceResult<Content> {
 /// the per-iteration history for [`analyze`] — is nearly free.
 pub struct TwylaIntrospector {
     inner: Arc<dyn Introspector>,
-    assets: Arc<IdHashMap<ResolvedAsset>>,
-    documents: Arc<IdHashMap<ResolvedDocument>>,
+    assets: IdHashMap<Arc<ResolvedAsset>>,
+    documents: IdHashMap<Arc<ResolvedDocument>>,
     /// The file-page rows of the `documents()` listing, as ready-made dicts.
     /// Constant across the whole compile (derived from the eval'd files), so
     /// shared by `Arc`; the discovered inline documents are appended.
@@ -170,7 +187,7 @@ impl TwylaIntrospector {
         docs.extend(
             self.documents
                 .iter()
-                .map(|stored| stored.doc.to_dict(&self.ctx).into_value()),
+                .map(|stored| stored.to_dict(&self.ctx).into_value()),
         );
         Value::Array(docs.into_iter().collect())
     }
@@ -254,7 +271,7 @@ impl Introspector for TwylaIntrospector {
         self.assets
             .iter()
             .find(|asset| hash_spec(&asset.spec) == key)
-            .map(|asset| Value::Dyn(Dynamic::new(asset.clone())))
+            .map(|asset| Value::Dyn(Dynamic::from_arc(asset.clone())))
             .or_else(|| self.inner.value(key))
     }
 }
@@ -279,7 +296,7 @@ fn compile_bundle_loop(
     world: Tracked<dyn World + '_>,
     traced: Tracked<Traced>,
     sink: &mut Sink,
-    files: &[DocumentReq],
+    files: &[ResolvedDocument],
     resolver: &mut Resolver,
 ) -> SourceResult<Bundle> {
     let library = world.library();
@@ -304,8 +321,8 @@ fn compile_bundle_loop(
     // whole history on non-convergence.
     let empty = TwylaIntrospector {
         inner: Arc::new(EmptyIntrospector),
-        assets: Arc::new(IdHashMap::new()),
-        documents: Arc::new(IdHashMap::new()),
+        assets: IdHashMap::new(),
+        documents: IdHashMap::new(),
         file_docs: file_docs.clone(),
         ctx: ctx.clone(),
     };
@@ -398,8 +415,8 @@ fn discover(
     for introspection in introspections {
         if let Some(req) = introspection.downcast::<AssetReqIntrospect>() {
             resolver.resolve_asset(world, &req.0)?;
-        } else if let Some(req) = introspection.downcast::<DocumentReqIntrospect>() {
-            resolver.collect_document(&req.0);
+        } else if let Some(req) = introspection.downcast::<ResolvedDocumentIntrospect>() {
+            resolver.collect_document(&req.0)?;
         }
     }
     Ok(())
@@ -412,7 +429,7 @@ fn harvest_metadata(
     engine: &mut Engine,
     id: FileId,
     body: Content,
-) -> SourceResult<DocumentReq> {
+) -> SourceResult<ResolvedDocument> {
     let base = StyleChain::new(&engine.library.styles);
     let target = TargetElem::target.set(Target::Bundle).wrap();
     let styles = base.chain(&target);
@@ -482,7 +499,7 @@ fn harvest_metadata(
     let kind =
         kind.unwrap_or_else(|| EcoString::from(ctx.default_kind(id.vpath().get_with_slash())));
 
-    Ok(DocumentReq {
+    Ok(ResolvedDocument {
         output,
         title,
         date,
@@ -497,7 +514,7 @@ fn harvest_metadata(
 
 /// The bundle content for the current loop iteration: each file body wrapped as
 /// its own routed document, plus each discovered document as a sibling.
-fn build_content(files: &[DocumentReq], resolver: &Resolver) -> Content {
+fn build_content(files: &[ResolvedDocument], resolver: &Resolver) -> Content {
     let mut bodies = Vec::new();
     for doc in files {
         // Re-apply the *derived* output onto the page body so the page can read
@@ -531,7 +548,7 @@ fn build_content(files: &[DocumentReq], resolver: &Resolver) -> Content {
 /// Wrap a discovered document as a routed sibling, re-applying its metadata to
 /// the body as a style map so `#context document.*` resolves inside it exactly
 /// as on a full-file page.
-fn discovered_sibling(doc: &DocumentReq) -> Content {
+fn discovered_sibling(doc: &ResolvedDocument) -> Content {
     let mut styles = Styles::new();
     // Shown in root-absolute form (user-presentation boundary); routing and
     // child-anchor resolution tolerate / strip the leading slash. See
@@ -568,9 +585,9 @@ fn deduplicate(mut diags: EcoVec<SourceDiagnostic>) -> EcoVec<SourceDiagnostic> 
 
 #[cfg(test)]
 mod tests {
-    use crate::resolver::Resolver;
     use crate::project::TwylaContext;
     use crate::render::RenderWorld;
+    use crate::resolver::Resolver;
 
     /// First-page HTML from one compile of a one-file site (tempdir harness,
     /// mirrors `crate::asset::tests`).

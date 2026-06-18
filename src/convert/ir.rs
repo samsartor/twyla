@@ -14,7 +14,7 @@
 use std::fmt::Write as _;
 
 use crate::html::Node as HtmlNode;
-use crate::slug::{hugo_slugify, slugify};
+use crate::slug::hugo_slugify;
 
 /// Per-column table alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,7 +237,13 @@ fn indent_continuation(text: &str, pad: &str, out: &mut String) {
     }
 }
 
-fn render_table(align: &[Align], head: &[Content], rows: &[Vec<Content>], out: &mut String, prefix: &str) {
+fn render_table(
+    align: &[Align],
+    head: &[Content],
+    rows: &[Vec<Content>],
+    out: &mut String,
+    prefix: &str,
+) {
     out.push_str("\n// TODO twyla-convert: check table styling\n");
     writeln!(out, "#table(").unwrap();
     writeln!(out, "  columns: {},", align.len()).unwrap();
@@ -379,9 +385,7 @@ fn render_inline(i: &Inline, out: &mut String, prefix: &str) {
         }
         Inline::Image { src, alt } => {
             if src.starts_with("http://") || src.starts_with("https://") {
-                let dict = typst_attrs(
-                    [("src", src.as_str()), ("alt", alt.as_str())].into_iter(),
-                );
+                let dict = typst_attrs([("src", src.as_str()), ("alt", alt.as_str())].into_iter());
                 write!(out, "#html.elem(\"img\"{dict})").unwrap();
             } else if alt.is_empty() {
                 write!(out, "#image(\"{}\")", escape_typst_string(src)).unwrap();

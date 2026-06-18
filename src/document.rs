@@ -16,7 +16,6 @@ use typst::introspection::{History, Introspect, Introspector, Location};
 use typst::syntax::{FileId, Span};
 
 use crate::project::{TwylaContext, present_output};
-use crate::resolver::Upstream;
 
 /// Defines a page of the website.
 ///
@@ -135,7 +134,7 @@ impl TwylaDocument {
             // and then use it to look up the resolved url.
             Some(content) => {
                 let elem = content.to_packed::<TwylaDocument>().unwrap();
-                engine.introspect(DocumentReqIntrospect(request(styles, elem)?))
+                engine.introspect(ResolvedDocumentIntrospect(request(styles, elem)?))
             }
             // Static: the current page's url.
             None => engine.introspect(DocumentAtIntrospect(context.location().unwrap())),
@@ -147,7 +146,7 @@ impl TwylaDocument {
     }
 }
 
-pub fn request(styles: StyleChain, elem: &Packed<TwylaDocument>) -> SourceResult<DocumentReq> {
+pub fn request(styles: StyleChain, elem: &Packed<TwylaDocument>) -> SourceResult<ResolvedDocument> {
     let raw = match elem.output.get_cloned(styles) {
         Smart::Auto => {
             return Err(eco_vec![SourceDiagnostic::error(
@@ -175,7 +174,7 @@ pub fn request(styles: StyleChain, elem: &Packed<TwylaDocument>) -> SourceResult
             )]);
         }
     };
-    Ok(DocumentReq {
+    Ok(ResolvedDocument {
         output,
         title: elem.title.get_cloned(styles),
         date: elem.date.get_cloned(styles),
@@ -220,18 +219,23 @@ pub struct TwylaSite {
 }
 
 pub const RENDER_INTROSPECTION: ShowFn<TwylaDocument> = |elem, engine, styles| {
-    engine.introspect(DocumentReqIntrospect(request(styles, elem)?));
+    engine.introspect(ResolvedDocumentIntrospect(request(styles, elem)?));
     Ok(Content::empty())
 };
 
-/// One page of the site: its `document` metadata plus its body and originating
-/// source. The single page type, produced two ways — harvested from a
-/// `content/*.typ` file ([`crate::compile`]) or discovered from an inline
-/// `document(..)` (the discovery scan, which collects it into
-/// [`crate::resolver::Resolver`], dedups by `output`, and invalidates by
-/// `source` across warm rebuilds).
+/// One resolved page of the site: its `document` metadata plus its body and
+/// originating source. The single page type, produced two ways — harvested from
+/// a `content/*.typ` file ([`crate::compile`]) or discovered from an inline
+/// `document(..)` (the discovery scan collects it into the
+/// [`crate::resolver::Resolver`], deduped by `output`). A document is "resolved"
+/// the moment it is discovered (unlike an asset, which must first be built), so
+/// there is no separate request type — this *is* the resolved record. It still
+/// has to be compiled to HTML, which produces a `render::OutputDoc` wrapping it.
+///
+/// Keyed by `output` (its [`IdHashItem`] key), the same way a [`ResolvedAsset`]
+/// is keyed by its spec.
 #[derive(Clone, PartialEq, Hash, Debug)]
-pub struct DocumentReq {
+pub struct ResolvedDocument {
     pub output: String,
     pub title: Option<Content>,
     pub date: Option<Datetime>,
@@ -240,12 +244,25 @@ pub struct DocumentReq {
     pub extra: Value,
     pub draft: bool,
     pub body: Content,
-    /// The file this page came from. Twyla evicts the page when that file
-    /// changes; `None` for a document built from a detached span.
+    /// The file this page came from — for the duplicate-output diagnostic.
+    /// `None` for a document built from a detached span. Documents are
+    /// re-discovered every compile (cheap, unlike assets), and their source
+    /// `.typ` files are already typst dependencies, so no mtime tracking is
+    /// needed here.
     pub source: Option<FileId>,
 }
 
-impl DocumentReq {
+impl IdHashItem for ResolvedDocument {
+    type Key<'a> = &'a str;
+
+    fn key(&self) -> &str {
+        &self.output
+    }
+
+    iddqd::id_upcast!();
+}
+
+impl ResolvedDocument {
     /// The `documents()` dictionary form of this row.
     pub fn to_dict(&self, ctx: &TwylaContext) -> Dict {
         let mut d = Dict::new();
@@ -263,31 +280,12 @@ impl DocumentReq {
     }
 }
 
-#[derive(Clone)]
-pub struct ResolvedDocument {
-    pub doc: DocumentReq,
-    /// The watched on-disk source, for invalidation. `None` for a document from
-    /// a package file (immutable) or a detached span (no file).
-    pub upstream: Option<Upstream>,
-    pub content_hash: u128,
-}
-
-impl IdHashItem for ResolvedDocument {
-    type Key<'a> = &'a str;
-
-    fn key(&self) -> &str {
-        &self.doc.output
-    }
-
-    iddqd::id_upcast!();
-}
-
 pub const DOCUMENTS_LIST_KEY: u128 = 0xdb18a2675fe9365ff4f5e2734237ff5c;
 
 #[derive(Clone, PartialEq, Hash, Debug)]
-pub struct DocumentReqIntrospect(pub DocumentReq);
+pub struct ResolvedDocumentIntrospect(pub ResolvedDocument);
 
-impl Introspect for DocumentReqIntrospect {
+impl Introspect for ResolvedDocumentIntrospect {
     type Output = Dict;
 
     fn introspect(
@@ -304,7 +302,7 @@ impl Introspect for DocumentReqIntrospect {
                 continue;
             };
             // The dict's `output` is shown root-absolute; compare in the
-            // no-slash internal form against the stored `DocumentReq.output`.
+            // no-slash internal form against the stored `ResolvedDocument.output`.
             if output.trim_start_matches('/') == self.0.output {
                 return doc.clone();
             }
@@ -371,7 +369,7 @@ impl Introspect for DocumentsArrayIntrospect {
         let Some(Value::Array(array)) = introspector.value(DOCUMENTS_LIST_KEY) else {
             return Array::new();
         };
-        return array.clone();
+        array.clone()
     }
 
     fn diagnose(&self, _history: &History<Self::Output>) -> SourceDiagnostic {

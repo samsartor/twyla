@@ -1,13 +1,15 @@
 //! The shared resolver: one place that owns every built asset and discovered
 //! document for a compile, plus the on-disk dependency tracking ([`Upstream`] /
-//! [`mtime`]) and source-change revalidation both kinds share.
+//! [`mtime`]) assets use for source-change revalidation.
 //!
 //! Assets and documents are deliberately *not* unified behind a trait. They
-//! share a lot of bookkeeping — which lives here — but differ fundamentally in
-//! shape: an asset is content-addressed by its [`AssetSpec`] and its output
-//! path/URL is a *derived* naming layer (and 1:N once per-request output paths
-//! land), whereas a document is 1:1 with its `output`, which is part of its own
-//! spec. So the design is one struct, two maps, shared helpers — not a generic.
+//! share a lot of bookkeeping — which lives here — but differ fundamentally:
+//! an asset is content-addressed by its [`AssetSpec`], must be *built* (so it
+//! persists across recompiles and is revalidated by mtime), and its output
+//! path/URL is a derived naming layer. A document is "resolved" the moment it's
+//! discovered (no build), keyed 1:1 by its `output`, and is cheap enough to
+//! re-discover from scratch every compile — so it needs no caching or
+//! revalidation at all. One struct, two maps, shared helpers — not a generic.
 
 use std::collections::BTreeSet;
 use std::io::Read as _;
@@ -17,30 +19,31 @@ use std::time::SystemTime;
 use std::{fs, io};
 
 use comemo::Tracked;
+use ecow::eco_vec;
 use iddqd::IdHashMap;
 use typst::World;
-use typst::diag::SourceResult;
-use typst::syntax::VirtualRoot;
-use typst_utils::hash128;
+use typst::diag::{SourceDiagnostic, SourceResult};
 
-use crate::asset::{AssetReq, AssetSpec, OutputReq, ResolvedAsset, file, image, raw, sass, typst_doc};
-use crate::document::{DocumentReq, ResolvedDocument};
+use crate::asset::{
+    AssetReq, AssetSpec, OutputReq, ResolvedAsset, file, image, raw, sass, typst_doc,
+};
+use crate::document::ResolvedDocument;
 use crate::project::TwylaContext;
 
 /// Owns every resolved asset and discovered document for a build.
 ///
 /// The caller drives it: a one-shot build uses a fresh resolver; `serve` reuses
-/// one across recompiles so its stores persist (and [`revalidate`] evicts what
-/// changed). Both maps are `Arc`-backed so each fixed-point iteration can
-/// snapshot the whole set into a `TwylaIntrospector` (and the convergence
-/// history) with a cheap refcount bump — [`Arc::make_mut`] pays the copy only
-/// when a map actually grows.
+/// one across recompiles so the asset store persists (and [`revalidate`] evicts
+/// what changed). Each *entry* is `Arc`-wrapped, so a fixed-point iteration
+/// snapshots a whole map into a `TwylaIntrospector` (and the convergence
+/// history) by cloning the table over shared `Arc`s — cheap — and mutating one
+/// entry ([`Arc::make_mut`]) deep-copies just that entry, not the whole map.
 pub struct Resolver {
     ctx: TwylaContext,
     /// Every asset built so far, keyed by its [`AssetSpec`].
-    assets: Arc<IdHashMap<ResolvedAsset>>,
+    assets: IdHashMap<Arc<ResolvedAsset>>,
     /// Every document discovered so far, keyed by its `output` path.
-    documents: Arc<IdHashMap<ResolvedDocument>>,
+    documents: IdHashMap<Arc<ResolvedDocument>>,
 }
 
 impl Resolver {
@@ -49,21 +52,21 @@ impl Resolver {
     pub fn new(ctx: &TwylaContext) -> Self {
         Self {
             ctx: ctx.clone(),
-            assets: Arc::new(IdHashMap::new()),
-            documents: Arc::new(IdHashMap::new()),
+            assets: IdHashMap::new(),
+            documents: IdHashMap::new(),
         }
     }
 
     // -- snapshots: cheap Arc clones for the introspector + convergence history -
 
     /// A cheap snapshot of the current asset set (refcount bump).
-    pub fn assets_snapshot(&self) -> Arc<IdHashMap<ResolvedAsset>> {
-        Arc::clone(&self.assets)
+    pub fn assets_snapshot(&self) -> IdHashMap<Arc<ResolvedAsset>> {
+        self.assets.clone()
     }
 
     /// A cheap snapshot of the current document set (refcount bump).
-    pub fn documents_snapshot(&self) -> Arc<IdHashMap<ResolvedDocument>> {
-        Arc::clone(&self.documents)
+    pub fn documents_snapshot(&self) -> IdHashMap<Arc<ResolvedDocument>> {
+        self.documents.clone()
     }
 
     // -- accessors for emission and listings --------------------------------
@@ -73,7 +76,7 @@ impl Resolver {
     /// emitted but its source still affects the inlined output) — see
     /// [`emittable_assets`](Self::emittable_assets) for the narrower set actually
     /// written.
-    pub fn resolved_assets(&self) -> impl Iterator<Item = &ResolvedAsset> {
+    pub fn resolved_assets(&self) -> impl Iterator<Item = &Arc<ResolvedAsset>> {
         self.assets.iter()
     }
 
@@ -81,16 +84,25 @@ impl Resolver {
     /// URL for ([`OutputReq::Url`]). An asset only ever `.read()` (inlined into
     /// the HTML, never linked) is omitted — nothing references the file, so
     /// writing it would just litter the output dir.
-    pub fn emittable_assets(&self) -> impl Iterator<Item = &ResolvedAsset> {
+    pub fn emittable_assets(&self) -> impl Iterator<Item = &Arc<ResolvedAsset>> {
         self.assets
             .iter()
             .filter(|asset| asset.outputs.contains(&OutputReq::Url))
     }
 
-    /// Every collected document's request row, in deterministic (`output`-keyed)
-    /// order (for the `documents()` listing and final harvest).
-    pub fn documents(&self) -> impl Iterator<Item = &DocumentReq> {
-        self.documents.iter().map(|stored| &stored.doc)
+    /// Every collected document, in deterministic (`output`-keyed) order (for
+    /// the `documents()` listing and final harvest).
+    pub fn documents(&self) -> impl Iterator<Item = &ResolvedDocument> {
+        self.documents.iter().map(|stored| &**stored)
+    }
+
+    /// Forget every discovered document. Called once at the start of each
+    /// compile: unlike assets (expensive to build, cached across recompiles),
+    /// documents are cheap to re-discover and their source `.typ` files are
+    /// already typst dependencies, so there's no reason to persist them — each
+    /// compile rediscovers the full set fresh.
+    pub fn clear_documents(&mut self) {
+        self.documents = IdHashMap::new();
     }
 
     /// Forget how assets were used (clears each asset's `outputs`). Called once
@@ -101,8 +113,8 @@ impl Resolver {
         if self.assets.is_empty() {
             return;
         }
-        for mut asset in Arc::make_mut(&mut self.assets).iter_mut() {
-            asset.outputs.clear();
+        for mut asset in self.assets.iter_mut() {
+            Arc::make_mut(&mut *asset).outputs.clear();
         }
     }
 
@@ -120,25 +132,32 @@ impl Resolver {
     ) -> SourceResult<()> {
         if !self.assets.contains_key(&req.spec) {
             let asset = self.build_asset(world, &req.spec, req.span)?;
-            Arc::make_mut(&mut self.assets).insert_overwrite(asset);
+            self.assets.insert_overwrite(Arc::new(asset));
         }
-        Arc::make_mut(&mut self.assets)
-            .get_mut(&req.spec)
-            .expect("just resolved")
+        let mut asset = self.assets.get_mut(&req.spec).expect("just resolved");
+        Arc::make_mut(&mut *asset)
             .outputs
             .extend(req.outputs.iter().cloned());
         Ok(())
     }
 
-    /// Ensure `req`'s document is collected and stored, deduping by `output` —
-    /// so a document that is both shown inline and `.url()`'d, or `.url()`'d
-    /// repeatedly, is emitted exactly once.
-    pub fn collect_document(&mut self, req: &DocumentReq) {
-        if self.documents.contains_key(req.output.as_str()) {
-            return;
+    /// Collect a discovered document, keyed by `output`. The *same* document
+    /// reaching this twice — shown inline and `.url()`'d, or `.url()`'d
+    /// repeatedly — dedups silently to one. Two *different* documents claiming
+    /// one `output` is a conflict and errors.
+    pub fn collect_document(&mut self, doc: &ResolvedDocument) -> SourceResult<()> {
+        if let Some(existing) = self.documents.get(doc.output.as_str()) {
+            if **existing != *doc {
+                return Err(eco_vec![SourceDiagnostic::error(
+                    doc.body.span(),
+                    format!("two different documents target the output `{}`", doc.output),
+                )
+                .with_hint("each `document(..)` needs a distinct `output:`")]);
+            }
+            return Ok(());
         }
-        let resolved = self.resolve_document(req);
-        Arc::make_mut(&mut self.documents).insert_overwrite(resolved);
+        self.documents.insert_overwrite(Arc::new(doc.clone()));
+        Ok(())
     }
 
     /// Process one spec into a [`ResolvedAsset`]: dispatch to the per-type build,
@@ -185,48 +204,21 @@ impl Resolver {
         })
     }
 
-    /// Turn a discovered document request into a stored record: bolt on the
-    /// watched source ([`Upstream`], for invalidation) and a content hash.
-    fn resolve_document(&self, req: &DocumentReq) -> ResolvedDocument {
-        ResolvedDocument {
-            content_hash: hash128(&req.body),
-            upstream: self.doc_source(req),
-            doc: req.clone(),
-        }
-    }
-
-    /// The on-disk source of a discovered document, for invalidation. Only
-    /// project files have a watched path; package files are immutable and a
-    /// detached span has no file, so both yield `None`.
-    fn doc_source(&self, req: &DocumentReq) -> Option<Upstream> {
-        let id = req.source?;
-        match id.root() {
-            VirtualRoot::Project => {
-                Some(Upstream::new_lazy(self.ctx.root.join(id.vpath().get_without_slash())))
-            }
-            VirtualRoot::Package(_) => None,
-        }
-    }
-
     // -- invalidation -------------------------------------------------------
 
-    /// Evict assets *and* documents whose on-disk sources changed since they
-    /// were resolved (mtime check). Returns whether anything was evicted. A
-    /// no-op on the first compile (empty stores); called at the top of each
-    /// compile so what survives seeds the next one.
+    /// Evict assets whose on-disk sources changed since they were resolved
+    /// (mtime check). Returns whether anything was evicted. A no-op on the first
+    /// compile (empty store); called at the top of each compile so what survives
+    /// seeds the next one. Documents aren't revalidated — they're cleared and
+    /// re-discovered each compile ([`clear_documents`](Self::clear_documents)).
     pub fn revalidate(&mut self) -> bool {
-        let assets = self.evict_assets_where(|asset| {
+        self.evict_assets_where(|asset| {
             asset
                 .built
                 .upstream
                 .iter()
                 .any(|u| mtime(&u.path).ok() != u.mtime)
-        });
-        let docs = self.evict_docs_where(|stored| match &stored.upstream {
-            Some(u) => mtime(&u.path).ok() != u.mtime,
-            None => false,
-        });
-        assets || docs
+        })
     }
 
     /// Evict every resolved asset matching `pred`. Returns whether anything was
@@ -238,19 +230,8 @@ impl Resolver {
         if before == 0 {
             return false;
         }
-        Arc::make_mut(&mut self.assets).retain(|asset| !pred(&asset));
+        self.assets.retain(|asset| !pred(&asset));
         self.assets.len() != before
-    }
-
-    /// Evict every collected document matching `pred`. Returns whether anything
-    /// was removed.
-    fn evict_docs_where(&mut self, mut pred: impl FnMut(&ResolvedDocument) -> bool) -> bool {
-        let before = self.documents.len();
-        if before == 0 {
-            return false;
-        }
-        Arc::make_mut(&mut self.documents).retain(|stored| !pred(&stored));
-        self.documents.len() != before
     }
 }
 
@@ -278,7 +259,8 @@ impl Upstream {
             .modified()
             .ok();
         let mut text = String::new();
-        f.read_to_string(&mut text).map_err(|e| annotate(&path, e))?;
+        f.read_to_string(&mut text)
+            .map_err(|e| annotate(&path, e))?;
         Ok((Upstream { path, mtime }, text))
     }
 

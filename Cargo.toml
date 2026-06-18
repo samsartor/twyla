@@ -9,26 +9,26 @@ clap = { version = "4", features = ["derive", "env"] }
 # Pinned to typst main for the bundle export feature (multi-document output,
 # `#document(path)` + `#asset()`). Switch back to crates.io once 0.15 ships.
 # Bump deliberately; do not let `cargo update -p typst` move us.
-typst = { git = "https://github.com/samsartor/typst", rev = "c79c7850f916615ebd8fc1516c0713571ac4a16e" }
-typst-bundle = { git = "https://github.com/samsartor/typst", rev = "c79c7850f916615ebd8fc1516c0713571ac4a16e" }
+typst = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
+typst-bundle = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
 # We vendor typst's `compile_impl` fixed-point loop (see src/compile.rs) so
 # twyla can sit inside the relayout loop; that loop calls `typst_eval::eval`
 # directly, hence a direct dep at the same pinned rev.
-typst-eval = { git = "https://github.com/samsartor/typst", rev = "c79c7850f916615ebd8fc1516c0713571ac4a16e" }
-typst-html = { git = "https://github.com/samsartor/typst", rev = "c79c7850f916615ebd8fc1516c0713571ac4a16e" }
-typst-kit = { git = "https://github.com/samsartor/typst", rev = "c79c7850f916615ebd8fc1516c0713571ac4a16e", default-features = false, features = ["scan-fonts", "embedded-fonts", "watcher", "system-packages", "system-downloader", "emit-diagnostics"] }
-typst-library = { git = "https://github.com/samsartor/typst", rev = "c79c7850f916615ebd8fc1516c0713571ac4a16e" }
+typst-eval = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
+typst-html = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
+typst-kit = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358", default-features = false, features = ["scan-fonts", "embedded-fonts", "watcher", "system-packages", "system-downloader", "emit-diagnostics"] }
+typst-library = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
 # `asset.typst` compiles a stock-typst document in-process and serializes it to
 # the requested format: paged layout (`typst-layout`'s `PagedDocument`) feeds
 # the SVG/PDF/PNG encoders (`typst-svg`/`typst-pdf`/`typst-render`); the `html`
 # format reuses `typst-html` above. Same pinned rev as the rest of typst.
-typst-layout = { git = "https://github.com/samsartor/typst", rev = "c79c7850f916615ebd8fc1516c0713571ac4a16e" }
-typst-svg = { git = "https://github.com/samsartor/typst", rev = "c79c7850f916615ebd8fc1516c0713571ac4a16e" }
-typst-pdf = { git = "https://github.com/samsartor/typst", rev = "c79c7850f916615ebd8fc1516c0713571ac4a16e" }
-typst-render = { git = "https://github.com/samsartor/typst", rev = "c79c7850f916615ebd8fc1516c0713571ac4a16e" }
+typst-layout = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
+typst-svg = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
+typst-pdf = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
+typst-render = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
 # Referenced by the `#[func]` macro expansion (`typst_utils::Static`); a
 # direct dep so twyla can define native typst builtins. Same pinned rev.
-typst-utils = { git = "https://github.com/samsartor/typst", rev = "c79c7850f916615ebd8fc1516c0713571ac4a16e" }
+typst-utils = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
 comemo = "0.5"
 
 # Asset-discovery side-channel (spike): the contextual `asset.*` builtins

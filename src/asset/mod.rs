@@ -74,9 +74,7 @@ use ecow::{EcoString, eco_format, eco_vec};
 use iddqd::IdHashItem;
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::engine::Engine;
-use typst::foundations::{
-    Binding, Bytes, Content, Module, PathOrStr, Repr, Scope, Str, Value, ty,
-};
+use typst::foundations::{Binding, Bytes, Content, Module, PathOrStr, Repr, Scope, Str, Value, ty};
 use typst::introspection::{History, Introspect, Introspector};
 use typst::loading::{Encoding, Readable};
 use typst::syntax::{FileId, Span};
@@ -217,7 +215,11 @@ fn introspect_asset(
     span: Span,
     outputs: BTreeSet<OutputReq>,
 ) -> Option<ResolvedAsset> {
-    engine.introspect(AssetReqIntrospect(AssetReq { spec, span, outputs }))
+    engine.introspect(AssetReqIntrospect(AssetReq {
+        spec,
+        span,
+        outputs,
+    }))
 }
 
 /// The set for a caller that wants a URL.
@@ -423,6 +425,7 @@ impl PartialEq for ResolvedAsset {
             && self.built == other.built
             && self.output_path == other.output_path
             && self.url == other.url
+            && self.outputs == other.outputs
     }
 }
 
@@ -432,6 +435,7 @@ impl Hash for ResolvedAsset {
         self.built.hash(state);
         self.output_path.hash(state);
         self.url.hash(state);
+        self.outputs.hash(state);
     }
 }
 

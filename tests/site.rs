@@ -489,7 +489,7 @@ fn context_generated_documents_are_discovered_and_routed() {
 /// without the redundant explicit-field metadata the old site needed.
 #[test]
 fn spike_harvest_reads_per_doc_extra() {
-    use twyla::document::DocumentReq;
+    use twyla::document::ResolvedDocument;
     use twyla::render::RenderWorld;
     use twyla::resolver::Resolver;
 
@@ -500,7 +500,7 @@ fn spike_harvest_reads_per_doc_extra() {
     let outputs = world
         .compile_bundle(&mut Resolver::new(&ctx))
         .expect("compile+harvest");
-    let docs: Vec<&DocumentReq> = outputs.docs().filter_map(|d| d.meta.as_ref()).collect();
+    let docs: Vec<&ResolvedDocument> = outputs.docs().filter_map(|d| d.meta.as_ref()).collect();
     let spike = docs
         .iter()
         .find(|d| d.output == "spike-doc/index.html")
