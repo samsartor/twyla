@@ -3,10 +3,10 @@
 // chrome from `theme.typ` and the reference rendering from `components.typ`.
 
 #import "@preview/frame-it:2.0.0": *
-#import "@preview/dtree:0.1.1": dtree
 
 #import "theme.typ": *
 #import "components.typ": *
+#import "boxdraw.typ": boxdraw
 
 #let note = frame("Note", blue)
 #let horizontalrule = context { if target() == "html" { html.hr() } else { line(length: 100%) } }
@@ -20,8 +20,9 @@
 // once twyla ships its own CSS-class-based `raw` show rule.
 #let content-rules(body) = {
   show quote.where(block: true): it => note(it.body)
+  show raw.where(lang: "tree"): it => boxdraw(it.text)
+  show raw.where(lang: "boxdraw"): it => boxdraw(it.text)
   show: frame-style(styles.hint)
-  show raw.where(lang: "tree"): it => if target() == "html" { it } else { dtree(raw(it.text.replace("├", " ").replace("└", " "))) }
   // `--test-examples`: compile-check each `example` block and highlight as typst.
   show raw.where(lang: "example"): twyla-examples.compile-example
   set raw(theme: "/templates/Dracula.tmTheme")

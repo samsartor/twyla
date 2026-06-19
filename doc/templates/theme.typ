@@ -46,7 +46,7 @@ try {
       #let thing = grabber-canvas(
         theta: -40deg,
         phi: 40deg,
-        color: white,
+        color: grabber-grad,
         rad: 0.5,
         hw: 0.5,
         ht: 3mm,
@@ -55,7 +55,7 @@ try {
       )
       #context rect(fill: black, height: auto, width: auto, inset: 5mm, radius: 20mm, thing)
       
-    ], format: "svg").url(),
+    ], format: "svg", output: "/favicon.svg").url(),
   )
   html.elem("link", attrs: (rel: "stylesheet", href: "https://bin.samsartor.com/iosevka_27.3.3/iosevka.css"))
   html.elem("link", attrs: (rel: "stylesheet", href: "https://bin.samsartor.com/iosevka_27.3.3/iosevka-aile.css"))

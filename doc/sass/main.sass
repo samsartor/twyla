@@ -225,6 +225,48 @@ code, pre, .type, .signature, .param-name, .param-default
   font-size: inherit
   color: inherit
 
+.boxdraw
+  --boxdraw-pad-y: 1rem
+  --boxdraw-pad-x: 1.15rem
+  position: relative
+  display: block
+  max-width: 100%
+  overflow-x: auto
+  vertical-align: top
+  background: var(--code-bg)
+  color: var(--code-fg)
+  font-family: 'Iosevka Web', ui-monospace, monospace
+  padding: var(--boxdraw-pad-y) var(--boxdraw-pad-x)
+  border-radius: 0.6rem
+  line-height: var(--boxdraw-line-height)
+  font-size: 0.88rem
+  margin: 1rem 0
+
+  pre
+    margin: 0
+    padding: 0
+    background: transparent
+    color: inherit
+    border-radius: 0
+    overflow: visible
+    line-height: inherit
+    font-size: inherit
+
+  code
+    color: inherit
+    background: none
+    padding: 0
+    font: inherit
+
+.boxdraw-svg
+  position: absolute
+  left: var(--boxdraw-pad-x)
+  top: var(--boxdraw-pad-y)
+  width: calc(var(--boxdraw-cols) * 1ch)
+  height: calc(var(--boxdraw-rows) * var(--boxdraw-line-height) * 1em)
+  overflow: visible
+  pointer-events: none
+
 .prose hr
   border: none
   border-top: 1px solid var(--border)
@@ -394,7 +436,10 @@ code, pre, .type, .signature, .param-name, .param-default
   justify-content: center
   margin: 1rem
   gap: 3rem
+  overflow: hidden
+  flex-wrap: wrap
 
   svg
-    height: 10rem !important
+    height: 5rem !important
+    width: auto !important
 
