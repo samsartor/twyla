@@ -18,9 +18,7 @@ use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{Bytes, Packed, PathOrStr, ShowFn, StyleChain, elem, func, scope};
 use typst::loading::Encoding;
 use typst::syntax::{FileId, Span};
-use typst_utils::hash128;
-
-use super::{AssetSpec, Built, Upstream, resolve_path, show_unresolved};
+use super::{AssetSpec, Built, OutputReq, Upstream, emit_or_request, resolve_path, sha256};
 use crate::project::TwylaContext;
 use crate::render::Emit;
 
@@ -46,9 +44,13 @@ pub struct SassAsset {
     /// minified and expanded builds of one file resolve to distinct assets.
     #[default(true)]
     pub minify: bool,
+
+    /// Bundle-relative output path policy.
+    #[default(OutputReq::Auto)]
+    pub output: OutputReq,
 }
 
-asset_methods!(SassAsset, spec, Some(Encoding::Utf8));
+asset_methods!(SassAsset, spec, output, Some(Encoding::Utf8));
 
 /// Build a `asset.sass` element's [`AssetSpec`] from its (style-resolved)
 /// fields: the source path plus the `minify` flag (so the minified and expanded
@@ -60,10 +62,14 @@ fn spec(elem: &Packed<SassAsset>, styles: StyleChain) -> HintedStrResult<AssetSp
     })
 }
 
-/// Default show: a bare `asset.sass(..)` cannot be rendered — resolve it with
-/// `.url()`/`.read()`. Registered for the in-page targets in [`crate::rules`].
-pub const SHOW_RULE: ShowFn<SassAsset> =
-    |elem, _engine, _styles| show_unresolved(elem.span(), "sass");
+fn output(elem: &Packed<SassAsset>, styles: StyleChain) -> HintedStrResult<OutputReq> {
+    Ok(elem.output.get_cloned(styles))
+}
+
+/// Default show: a bare `asset.sass(..)` emits and renders nothing.
+pub const SHOW_RULE: ShowFn<SassAsset> = |elem, engine, styles| {
+    emit_or_request(engine, spec(&elem, styles), elem.span(), output(&elem, styles))
+};
 
 pub(crate) fn build(
     _world: Tracked<dyn World + '_>,
@@ -114,7 +120,7 @@ pub(crate) fn build(
 
     let css = Bytes::new(css.into_bytes());
     Ok(Built {
-        content_hash: hash128(&css),
+        sha256: sha256(&css),
         emit: Emit::Bytes(css),
         upstream,
         ext: Some("css".to_string()),

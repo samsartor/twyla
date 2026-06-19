@@ -56,9 +56,7 @@ use typst_html::HtmlDocument;
 use typst_layout::PagedDocument;
 use typst_library::Feature;
 use typst_pdf::PdfOptions;
-use typst_utils::hash128;
-
-use super::{AssetSpec, Built, Upstream, show_unresolved};
+use super::{AssetSpec, Built, OutputReq, Upstream, emit_or_request, sha256};
 use crate::project::TwylaContext;
 use crate::render::Emit;
 
@@ -91,9 +89,13 @@ pub struct TypstAsset {
     /// output).
     #[default(144)]
     pub ppi: i64,
+
+    /// Bundle-relative output path policy.
+    #[default(OutputReq::Auto)]
+    pub output: OutputReq,
 }
 
-asset_methods!(TypstAsset, spec, Some(Encoding::Utf8));
+asset_methods!(TypstAsset, spec, output, Some(Encoding::Utf8));
 
 /// Build a `asset.typst` element's [`AssetSpec`] from its (style-resolved)
 /// fields. A path source is resolved to its [`FileId`]; an inline content value
@@ -114,10 +116,14 @@ fn spec(elem: &Packed<TypstAsset>, styles: StyleChain) -> HintedStrResult<AssetS
     Ok(AssetSpec::Typst { input, format, ppi })
 }
 
-/// Default show: a bare `asset.typst(..)` cannot be rendered — resolve it with
-/// `.url()`/`.read()`. Registered for the in-page targets in [`crate::rules`].
-pub const SHOW_RULE: ShowFn<TypstAsset> =
-    |elem, _engine, _styles| show_unresolved(elem.span(), "typst");
+fn output(elem: &Packed<TypstAsset>, styles: StyleChain) -> HintedStrResult<OutputReq> {
+    Ok(elem.output.get_cloned(styles))
+}
+
+/// Default show: a bare `asset.typst(..)` emits and renders nothing.
+pub const SHOW_RULE: ShowFn<TypstAsset> = |elem, engine, styles| {
+    emit_or_request(engine, spec(&elem, styles), elem.span(), output(&elem, styles))
+};
 
 /// The `source` field's value: a path to a project `.typ` file, or an inline
 /// `content` value. A string casts to [`Path`](Self::Path) (a path, *not* text
@@ -261,7 +267,7 @@ pub(crate) fn build(
     let upstream = collect_upstream(subworld.reads.into_inner().unwrap_or_default(), ctx);
     let bytes = Bytes::new(bytes);
     Ok(Built {
-        content_hash: hash128(&bytes),
+        sha256: sha256(&bytes),
         emit: Emit::Bytes(bytes),
         upstream,
         ext: Some(format.ext().to_owned()),

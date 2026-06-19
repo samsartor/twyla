@@ -9,10 +9,10 @@ use comemo::{Track, Tracked, TrackedMut};
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
 use iddqd::IdHashMap;
 use typst::World;
-use typst::diag::{SourceDiagnostic, SourceResult, StrResult, Warned};
+use typst::diag::{HintedString, SourceDiagnostic, SourceResult, StrResult, Warned};
 use typst::foundations::{
-    BundlePath, Content, Dynamic, IntoValue, Label, NativeElement, Output, Selector, Smart,
-    StyleChain, Styles, Target, TargetElem, Value,
+    BundlePath, Content, Context, Dynamic, IntoValue, Label, NativeElement, Output, Selector,
+    Smart, Str, StyleChain, Styles, Target, TargetElem, Value,
 };
 use typst::syntax::{FileId, Span, VirtualPath};
 use typst_bundle::Bundle;
@@ -42,7 +42,7 @@ use crate::resolver::Resolver;
 pub struct CompiledBundle {
     pub bundle: Bundle,
     pub pages: Vec<ResolvedDocument>,
-    pub assets: Vec<Arc<ResolvedAsset>>,
+    pub assets: Vec<(String, Arc<ResolvedAsset>)>,
 }
 
 /// Compile `pages` into a [`Bundle`] *and* harvest each page's twyla
@@ -124,7 +124,7 @@ fn compile_bundle_impl(
     // render iterates.
     let mut pages: Vec<ResolvedDocument> = files;
     pages.extend(resolver.documents().cloned());
-    let assets: Vec<Arc<ResolvedAsset>> = resolver.emittable_assets().cloned().collect();
+    let assets: Vec<(String, Arc<ResolvedAsset>)> = resolver.emittable_assets().collect();
     Ok(CompiledBundle {
         bundle,
         pages,
@@ -338,20 +338,37 @@ fn compile_bundle_loop(
         let constraint = comemo::Constraint::new();
 
         let mut subsink = Sink::new();
-        let mut engine = Engine {
-            library,
-            world,
-            introspector: Protected::new((input as &dyn Introspector).track_with(&constraint)),
-            traced,
-            sink: subsink.track_mut(),
-            route: Route::default(),
-        };
+        {
+            let mut engine = Engine {
+                library,
+                world,
+                introspector: Protected::new((input as &dyn Introspector).track_with(&constraint)),
+                traced,
+                sink: subsink.track_mut(),
+                route: Route::default(),
+            };
 
-        document = Bundle::create(&mut engine, &content, styles)?;
+            document = Bundle::create(&mut engine, &content, styles)?;
+        }
 
         // Resolve every asset and collect every document this realization
         // requested (recorded as introspections), growing the resolver's stores.
-        discover(resolver, world, subsink.introspections())?;
+        discover_requests(resolver, world, subsink.introspections())?;
+
+        // Rebuild the engine after `subsink.introspections()`'s borrow ends, so
+        // output-derivation closures can run against the same world/library and
+        // warning sink without fighting the tracked `Sink` borrow.
+        {
+            let mut engine = Engine {
+                library,
+                world,
+                introspector: Protected::new((input as &dyn Introspector).track_with(&constraint)),
+                traced,
+                sink: subsink.track_mut(),
+                route: Route::default(),
+            };
+            resolve_outputs(resolver, &mut engine)?;
+        }
 
         // This iteration's output introspector: the fresh bundle introspector
         // wrapped with the *post-discovery* asset/document snapshot.
@@ -407,7 +424,7 @@ fn compile_bundle_loop(
 /// resolution. Because the records live in the comemo-tracked [`Sink`], a
 /// memoized (cached) realization still reports its assets/documents here, so
 /// discovery never misses a page just because it didn't re-run.
-fn discover(
+fn discover_requests(
     resolver: &mut Resolver,
     world: Tracked<dyn World + '_>,
     introspections: &[Introspection],
@@ -420,6 +437,30 @@ fn discover(
         }
     }
     Ok(())
+}
+
+fn resolve_outputs(resolver: &mut Resolver, engine: &mut Engine) -> SourceResult<()> {
+    resolver.resolve_outputs(|func, asset| {
+        let ext = Str::from(asset.built.ext.as_deref().unwrap_or("bin"));
+        let stem = Str::from(asset.built.stem.as_deref().unwrap_or(""));
+        let value = func.call(
+            engine,
+            Context::none().track(),
+            [Str::from(asset.built.sha256_hex().as_str()), ext, stem],
+        )?;
+        let path: Str = value
+            .cast()
+            .map_err(|err| hinted_error(typst::syntax::Span::detached(), err))?;
+        Ok(path.to_string())
+    })
+}
+
+fn hinted_error(span: Span, err: HintedString) -> EcoVec<SourceDiagnostic> {
+    let mut diag = SourceDiagnostic::error(span, err.message().clone());
+    for hint in err.hints() {
+        diag = diag.with_hint(hint.clone());
+    }
+    eco_vec![diag]
 }
 
 /// Harvest each page's twyla `document` fields from its body's resolved style

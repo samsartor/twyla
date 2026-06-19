@@ -11,7 +11,6 @@
 //! re-discover from scratch every compile — so it needs no caching or
 //! revalidation at all. One struct, two maps, shared helpers — not a generic.
 
-use std::collections::BTreeSet;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,7 +24,7 @@ use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult};
 
 use crate::asset::{
-    AssetReq, AssetSpec, OutputReq, ResolvedAsset, file, image, raw, sass, typst_doc,
+    AssetReq, AssetSpec, OutputReq, Resolution, ResolvedAsset, file, image, raw, sass, typst_doc,
 };
 use crate::document::ResolvedDocument;
 use crate::project::TwylaContext;
@@ -84,10 +83,19 @@ impl Resolver {
     /// URL for ([`OutputReq::Url`]). An asset only ever `.read()` (inlined into
     /// the HTML, never linked) is omitted — nothing references the file, so
     /// writing it would just litter the output dir.
-    pub fn emittable_assets(&self) -> impl Iterator<Item = &Arc<ResolvedAsset>> {
-        self.assets
-            .iter()
-            .filter(|asset| asset.outputs.contains(&OutputReq::Url))
+    pub fn emittable_assets(&self) -> impl Iterator<Item = (String, Arc<ResolvedAsset>)> + '_ {
+        self.assets.iter().flat_map(|asset| {
+            let mut paths = Vec::<String>::new();
+            for resolution in &asset.resolutions {
+                if matches!(resolution.policy, OutputReq::Read) {
+                    continue;
+                }
+                if !paths.contains(&resolution.output_path) {
+                    paths.push(resolution.output_path.clone());
+                }
+            }
+            paths.into_iter().map(|path| (path, Arc::clone(asset)))
+        })
     }
 
     /// Every collected document, in deterministic (`output`-keyed) order (for
@@ -114,7 +122,9 @@ impl Resolver {
             return;
         }
         for mut asset in self.assets.iter_mut() {
-            Arc::make_mut(&mut *asset).outputs.clear();
+            let asset = Arc::make_mut(&mut *asset);
+            asset.outputs.clear();
+            asset.resolutions.clear();
         }
     }
 
@@ -135,9 +145,78 @@ impl Resolver {
             self.assets.insert_overwrite(Arc::new(asset));
         }
         let mut asset = self.assets.get_mut(&req.spec).expect("just resolved");
-        Arc::make_mut(&mut *asset)
-            .outputs
-            .extend(req.outputs.iter().cloned());
+        let asset = Arc::make_mut(&mut *asset);
+        for output in &req.outputs {
+            if !asset.outputs.contains(output) {
+                asset.outputs.push(output.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve per-usage output policies into concrete bundle paths and URLs.
+    pub fn resolve_outputs(
+        &mut self,
+        mut eval_derive: impl FnMut(&typst::foundations::Func, &ResolvedAsset) -> SourceResult<String>,
+    ) -> SourceResult<()> {
+        let ctx = self.ctx.clone();
+        for mut stored in self.assets.iter_mut() {
+            let asset = Arc::make_mut(&mut *stored);
+            let default_path = ctx.default_asset_output(&asset.built);
+
+            let mut explicit = Vec::<(OutputReq, String)>::new();
+            for policy in &asset.outputs {
+                let path = match policy {
+                    OutputReq::Fixed(raw) => Some(ctx.resolve_asset_output(raw.as_str()).map_err(|err| {
+                        eco_vec![SourceDiagnostic::error(typst::syntax::Span::detached(), err)]
+                    })?),
+                    OutputReq::Derive(func) => {
+                        let raw = eval_derive(func, asset)?;
+                        Some(ctx.resolve_asset_output(&raw).map_err(|err| {
+                            eco_vec![SourceDiagnostic::error(typst::syntax::Span::detached(), err)]
+                        })?)
+                    }
+                    OutputReq::Read | OutputReq::Auto => None,
+                };
+                if let Some(path) = path {
+                    explicit.push((policy.clone(), path));
+                }
+            }
+
+            let mut distinct_explicit = Vec::<String>::new();
+            for (_, path) in &explicit {
+                if !distinct_explicit.contains(path) {
+                    distinct_explicit.push(path.clone());
+                }
+            }
+            let auto_path = match distinct_explicit.as_slice() {
+                [path] => path.clone(),
+                _ => default_path,
+            };
+
+            let mut resolutions = Vec::new();
+            for policy in &asset.outputs {
+                let path = explicit
+                    .iter()
+                    .find(|(p, _)| p == policy)
+                    .map(|(_, path)| path.clone())
+                    .unwrap_or_else(|| auto_path.clone());
+                let url = ctx.asset_url(&path);
+                resolutions.push(Resolution {
+                    policy: policy.clone(),
+                    output_path: path,
+                    url,
+                });
+            }
+            resolutions.sort_by(|a, b| {
+                a.output_path
+                    .cmp(&b.output_path)
+                    .then_with(|| format!("{:?}", a.policy).cmp(&format!("{:?}", b.policy)))
+            });
+            asset.output_path = auto_path.clone();
+            asset.url = ctx.asset_url(&auto_path);
+            asset.resolutions = resolutions;
+        }
         Ok(())
     }
 
@@ -199,8 +278,9 @@ impl Resolver {
             built,
             output_path,
             url,
+            resolutions: Vec::new(),
             // Filled in by `resolve_asset` from the request(s) that reached it.
-            outputs: BTreeSet::new(),
+            outputs: Vec::new(),
         })
     }
 

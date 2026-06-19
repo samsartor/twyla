@@ -5,9 +5,10 @@
 
 /// Generate the shared `.url()` / `.read()` contextual scope methods for an
 /// asset element. Every asset element behaves identically bar *how its spec is
-/// built*, so each module supplies only that: `$spec` is its
-/// `fn(&Packed<Elem>, StyleChain) -> HintedStrResult<AssetSpec>` (which folds in
-/// `#set` styles), and `$default_encoding` is its `.read()` default (`Some(..)`
+/// built* and how its `output` field is read, so each module supplies those:
+/// `$spec` is its `fn(&Packed<Elem>, StyleChain) -> HintedStrResult<AssetSpec>`
+/// (which folds in `#set` styles), `$output` is its output-field accessor, and
+/// `$default_encoding` is its `.read()` default (`Some(..)`
 /// for text-ish assets, `None` for binary like images).
 ///
 /// Both methods build the spec, then resolve it through the introspector —
@@ -17,7 +18,7 @@
 /// qualified so the macro needs nothing imported at its call site beyond the
 /// `func`/`scope` attributes the element already uses.
 macro_rules! asset_methods {
-    ($this:ty, $spec:path, $default_encoding:expr) => {
+    ($this:ty, $spec:path, $output:path, $default_encoding:expr) => {
         #[scope]
         impl $this {
             /// The resolved, fingerprinted URL of this asset. Contextual — call
@@ -33,8 +34,10 @@ macro_rules! asset_methods {
                 this: ::typst::foundations::Content,
             ) -> ::typst::diag::HintedStrResult<::typst::foundations::Str> {
                 let elem = this.into_packed::<$this>().unwrap();
-                let spec = $spec(&elem, context.styles()?)?;
-                Ok($crate::asset::resolve_or_request(engine, spec, elem.span()))
+                let styles = context.styles()?;
+                let spec = $spec(&elem, styles)?;
+                let output = $output(&elem, styles)?;
+                Ok($crate::asset::resolve_or_request(engine, spec, elem.span(), output))
             }
 
             /// This asset's bytes — for inlining instead of linking. Mirrors the
@@ -65,19 +68,22 @@ pub(crate) mod raw;
 pub(crate) mod sass;
 pub(crate) mod typst_doc;
 
-use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use comemo::Tracked;
-use ecow::{EcoString, eco_format, eco_vec};
+use ecow::{EcoString, EcoVec, eco_format, eco_vec};
 use iddqd::IdHashItem;
-use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
+use typst::diag::{HintedStrResult, HintedString, SourceDiagnostic, SourceResult};
 use typst::engine::Engine;
-use typst::foundations::{Binding, Bytes, Content, Module, PathOrStr, Repr, Scope, Str, Value, ty};
+use typst::foundations::{
+    AutoValue, Binding, Bytes, Content, Func, Module, PathOrStr, Repr, Scope, Str,
+    Value, cast, ty,
+};
 use typst::introspection::{History, Introspect, Introspector};
 use typst::loading::{Encoding, Readable};
 use typst::syntax::{FileId, Span};
+use sha2::{Digest, Sha256};
 use typst_utils::hash128;
 
 use crate::render::Emit;
@@ -134,26 +140,46 @@ pub enum ImageSource {
 
 impl Eq for AssetSpec {}
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Hash, Debug)]
 pub enum OutputReq {
-    /// The user wants a URL, but any URL will do.
-    Url,
     /// The user wants to read the asset bytes directly.
     Read,
+    /// The user wants a URL/emission path, using the default/reuse policy.
+    Auto,
+    /// The user wants a specific bundle-relative output path.
+    Fixed(EcoString),
+    /// The user derives a bundle-relative output path from hash/ext/stem.
+    Derive(Func),
+}
+
+cast! {
+    OutputReq,
+    self => match self {
+        Self::Read => Value::None,
+        Self::Auto => AutoValue.into_value(),
+        Self::Fixed(v) => v.into_value(),
+        Self::Derive(v) => v.into_value(),
+    },
+    v: AutoValue => {
+        let _ = v;
+        Self::Auto
+    },
+    v: EcoString => Self::Fixed(v),
+    v: Func => Self::Derive(v),
 }
 
 /// A spec plus the call site that requested it, and its future output policy.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Hash, Debug)]
 pub struct AssetReq {
     pub spec: AssetSpec,
     ///  carried so a failed [`build`](file::build) (missing file, sass error)
     /// can blame a real source location instead of `<detached>`
     pub span: Span,
     /// How the asset is going to be used.
-    pub outputs: BTreeSet<OutputReq>,
+    pub outputs: Vec<OutputReq>,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Hash, Debug)]
 pub struct AssetReqIntrospect(pub AssetReq);
 
 pub fn hash_spec(spec: &AssetSpec) -> u128 {
@@ -213,7 +239,7 @@ fn introspect_asset(
     engine: &mut Engine,
     spec: AssetSpec,
     span: Span,
-    outputs: BTreeSet<OutputReq>,
+    outputs: Vec<OutputReq>,
 ) -> Option<ResolvedAsset> {
     engine.introspect(AssetReqIntrospect(AssetReq {
         spec,
@@ -222,16 +248,16 @@ fn introspect_asset(
     }))
 }
 
-/// The set for a caller that wants a URL.
-fn want_url() -> BTreeSet<OutputReq> {
-    BTreeSet::from([OutputReq::Url])
-}
-
 /// Resolve a spec's URL, or request it (returns [`ASSET_PENDING`] on a miss).
 /// Shared by the asset elements' `.url()` and the native image rule.
-pub(crate) fn resolve_or_request(engine: &mut Engine, spec: AssetSpec, span: Span) -> Str {
-    match introspect_asset(engine, spec, span, want_url()) {
-        Some(asset) => Str::from(asset.url.as_str()),
+pub(crate) fn resolve_or_request(
+    engine: &mut Engine,
+    spec: AssetSpec,
+    span: Span,
+    output: OutputReq,
+) -> Str {
+    match introspect_asset(engine, spec, span, vec![output.clone()]) {
+        Some(asset) => Str::from(asset.url_for(&output)),
         None => Str::from(ASSET_PENDING),
     }
 }
@@ -251,7 +277,7 @@ pub(crate) fn resolve_image_or_request(
     spec: AssetSpec,
     span: Span,
 ) -> ResolvedImage {
-    match introspect_asset(engine, spec, span, want_url()) {
+    match introspect_asset(engine, spec, span, vec![OutputReq::Auto]) {
         Some(asset) => ResolvedImage {
             url: Str::from(asset.url.as_str()),
             dimensions: asset.built.dimensions,
@@ -261,6 +287,27 @@ pub(crate) fn resolve_image_or_request(
             dimensions: None,
         },
     }
+}
+
+/// Request emission of a bare asset element and render nothing.
+pub(crate) fn emit_or_request(
+    engine: &mut Engine,
+    spec: HintedStrResult<AssetSpec>,
+    span: Span,
+    output: HintedStrResult<OutputReq>,
+) -> SourceResult<Content> {
+    let spec = spec.map_err(|err| hinted_error(span, err))?;
+    let output = output.map_err(|err| hinted_error(span, err))?;
+    let _ = introspect_asset(engine, spec, span, vec![output]);
+    Ok(Content::empty())
+}
+
+fn hinted_error(span: Span, err: HintedString) -> EcoVec<SourceDiagnostic> {
+    let mut diag = SourceDiagnostic::error(span, err.message().clone());
+    for hint in err.hints() {
+        diag = diag.with_hint(hint.clone());
+    }
+    eco_vec![diag]
 }
 
 /// Resolve a spec's bytes, or request it (returns an empty value on a miss — the
@@ -274,7 +321,7 @@ fn read_or_request(
     span: Span,
     encoding: Option<Encoding>,
 ) -> HintedStrResult<Readable> {
-    match introspect_asset(engine, spec, span, BTreeSet::from([OutputReq::Read])) {
+    match introspect_asset(engine, spec, span, vec![OutputReq::Read]) {
         Some(asset) => {
             let bytes = asset
                 .built
@@ -321,19 +368,6 @@ pub(crate) fn resolve_path(path: &PathOrStr, span: Span) -> HintedStrResult<File
     Ok(path.resolve_if_some(span.id())?.intern())
 }
 
-/// Default show for a bare asset element: refuse to render. An asset exists to
-/// hand back a `url`/bytes; one that reaches realization was never resolved
-/// (`.url()`/`.read()` consume the element before it can be shown), so there is
-/// nothing meaningful to render. Per-element `ShowFn`s delegate here.
-pub(crate) fn show_unresolved(span: Span, name: &str) -> SourceResult<Content> {
-    Err(eco_vec![
-        SourceDiagnostic::error(span, eco_format!("`asset.{name}` cannot be shown directly"))
-            .with_hint(eco_format!(
-                "resolve it inside a `#context` block — `.url()` to link it, `.read()` to inline it"
-            ))
-    ])
-}
-
 /// Build the `asset` module (`asset.file`, `asset.sass`) for the global scope.
 /// Each name binds an *element* so `#set asset.sass(..)` works (see
 /// [`file::FileAsset`] / [`sass::SassAsset`]).
@@ -355,6 +389,11 @@ pub fn install(global: &mut Scope) {
 // Per-type build output + resolved record
 // ---------------------------------------------------------------------------
 
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+
 /// What a per-type `build` ([`file::build`], [`sass::build`]) produces. The
 /// resolver turns it into a [`ResolvedAsset`] by adding the fingerprinted name,
 /// output path, and URL (all shared logic).
@@ -365,8 +404,8 @@ pub struct Built {
     /// Every on-disk file the build read (entry + transitive imports). Drives
     /// invalidation and the watcher's dependency set.
     pub upstream: Vec<Upstream>,
-    /// Content hash of the *output* bytes (the fingerprint).
-    pub content_hash: u128,
+    /// SHA-256 of the *output* bytes (the fingerprint).
+    pub sha256: [u8; 32],
     /// Output extension (`css` for sass, the source ext for a copy)
     pub ext: Option<String>,
     /// The name of the original asset file, if any.
@@ -377,9 +416,16 @@ pub struct Built {
     pub dimensions: Option<(u32, u32)>,
 }
 
+impl Built {
+    /// Full lowercase hex SHA-256 of the emitted bytes.
+    pub fn sha256_hex(&self) -> EcoString {
+        EcoString::from(hex::encode(self.sha256))
+    }
+}
+
 impl Hash for Built {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.content_hash.hash(state);
+        self.sha256.hash(state);
         self.stem.hash(state);
         if let Emit::Copy(path) = &self.emit {
             path.hash(state);
@@ -394,6 +440,19 @@ impl Hash for Built {
 /// either in-memory bytes (Arc-shared, cheap to clone) or a path the bytes are
 /// read from on demand — so handing the whole record around never pulls asset
 /// bytes into RAM.
+#[derive(Clone, Debug, PartialEq, Hash)]
+pub struct Resolution {
+    pub policy: OutputReq,
+    pub output_path: String,
+    pub url: String,
+}
+
+impl Repr for Resolution {
+    fn repr(&self) -> EcoString {
+        eco_format!("{}", self.url)
+    }
+}
+
 #[ty]
 #[derive(Clone, Debug)]
 pub struct ResolvedAsset {
@@ -403,9 +462,11 @@ pub struct ResolvedAsset {
     pub built: Built,
     /// Bundle-relative output path, e.g. `assets/main-<hash>.css`.
     pub output_path: String,
-    /// The public, root-relative URL `.url()` returns (`output_path` resolved
+    /// The public, root-relative URL for the auto output (`output_path` resolved
     /// through [`TwylaContext::asset_url`], so it folds in any `base_url`).
     pub url: String,
+    /// Per-output-policy resolved paths/URLs for `.url()` usages.
+    pub resolutions: Vec<Resolution>,
     /// How this asset is used *this compile* — the union of [`OutputReq`]s over
     /// its call sites, accumulated as requests are discovered. Drives emission
     /// ([`Resolver::emittable_assets`](crate::resolver::Resolver::emittable_assets)):
@@ -413,7 +474,7 @@ pub struct ResolvedAsset {
     /// *excluded* from [`Hash`]/[`PartialEq`] below — it's emission policy, not
     /// part of the asset's resolved identity, and the resolved record flows
     /// through introspection convergence, which must not churn as usage grows.
-    pub outputs: BTreeSet<OutputReq>,
+    pub outputs: Vec<OutputReq>,
 }
 
 // Identity is the resolved result (spec → built → path → url), *not* `outputs`
@@ -425,6 +486,7 @@ impl PartialEq for ResolvedAsset {
             && self.built == other.built
             && self.output_path == other.output_path
             && self.url == other.url
+            && self.resolutions == other.resolutions
             && self.outputs == other.outputs
     }
 }
@@ -435,6 +497,7 @@ impl Hash for ResolvedAsset {
         self.built.hash(state);
         self.output_path.hash(state);
         self.url.hash(state);
+        self.resolutions.hash(state);
         self.outputs.hash(state);
     }
 }
@@ -456,6 +519,14 @@ impl IdHashItem for ResolvedAsset {
 }
 
 impl ResolvedAsset {
+    pub fn url_for(&self, policy: &OutputReq) -> &str {
+        self.resolutions
+            .iter()
+            .find(|resolution| &resolution.policy == policy)
+            .map(|resolution| resolution.url.as_str())
+            .unwrap_or(self.url.as_str())
+    }
+
     /// The on-disk source files this asset depends on — for the serve watcher.
     pub fn upstream_paths(&self) -> impl Iterator<Item = &Path> {
         self.built.upstream.iter().map(|u| u.path.as_path())

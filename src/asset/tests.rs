@@ -393,26 +393,18 @@ fn set_rule_toggles_sass_minify() {
     );
 }
 
-/// A bare asset element left in markup (never resolved via `.url()`/`.read()`)
-/// reaches realization and is refused by the default show rule with a helpful
-/// error, rather than mis-rendering.
+/// A bare asset element left in markup emits the asset and renders nothing.
 #[test]
-fn bare_asset_in_markup_is_refused() {
+fn bare_asset_in_markup_emits_and_vanishes() {
     let (ctx, _dir) = site(&[
-        ("content/main.typ", "#asset.file(\"logo.svg\")"),
+        ("content/main.typ", "before #asset.file(\"logo.svg\", output: \"logo.svg\") after"),
         ("content/logo.svg", "<svg/>"),
     ]);
-    let world = RenderWorld::new(&ctx).unwrap();
-    let mut resolver = Resolver::new(&world.ctx);
-    let err = world
-        .compile_bundle(&mut resolver)
-        .err()
-        .expect("a bare asset in markup should error")
-        .to_string();
-    assert!(
-        err.contains("cannot be shown directly"),
-        "expected a show-refusal error, got: {err}"
-    );
+    let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    assert_eq!(assets.len(), 1, "got {assets:?}");
+    assert_eq!(assets[0].output_path, "logo.svg");
+    assert!(html.contains("before") && html.contains("after"), "missing text: {html}");
+    assert!(!html.contains("logo.svg"), "bare asset should render nothing: {html}");
 }
 
 /// Two *separate* resolvers in one process (sharing comemo's global cache) must
@@ -620,24 +612,18 @@ fn typst_path_source_compiles_to_html() {
     assert!(body.contains("body text"), "html missing body:\n{body}");
 }
 
-/// A bare `asset.typst(..)` left in markup is refused by the default show rule
-/// (consumed via `.url()`/`.read()` in normal use), like the other assets.
+/// A bare `asset.typst(..)` left in markup emits and renders nothing.
 #[test]
-fn bare_typst_asset_is_refused() {
+fn bare_typst_asset_emits_and_vanishes() {
     let (ctx, _dir) = site(&[(
         "content/main.typ",
-        "#asset.typst(circle(), format: \"svg\")",
+        "before #asset.typst(circle(), format: \"svg\", output: \"icon.svg\") after",
     )]);
-    let err = RenderWorld::new(&ctx)
-        .unwrap()
-        .compile_bundle(&mut Resolver::new(&ctx))
-        .err()
-        .expect("a bare typst asset in markup should error")
-        .to_string();
-    assert!(
-        err.contains("cannot be shown directly"),
-        "expected a show-refusal error, got: {err}"
-    );
+    let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    assert_eq!(assets.len(), 1, "got {assets:?}");
+    assert_eq!(assets[0].output_path, "icon.svg");
+    assert!(html.contains("before") && html.contains("after"), "missing text: {html}");
+    assert!(!html.contains("icon.svg"), "bare asset should render nothing: {html}");
 }
 
 /// Editing a typst asset's source file (or an import) revalidates it to a new

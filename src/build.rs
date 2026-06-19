@@ -67,7 +67,7 @@ impl BuildSummary {
         for output in outputs.iter() {
             match output {
                 Output::Doc(_) => s.pages += 1,
-                Output::Asset(_) => s.assets += 1,
+                Output::Asset { .. } => s.assets += 1,
                 Output::Static(..) => s.static_files += 1,
             }
         }

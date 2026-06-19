@@ -582,7 +582,7 @@ fn dispatch(state: &ServeState, path: &str) -> Response {
     };
     match site.get(path).or_else(|| site.get(&index_key)) {
         Some(Output::Doc(d)) => return Response::html(200, d.html.clone()),
-        Some(Output::Asset(a)) => return serve_asset(a),
+        Some(Output::Asset { asset, .. }) => return serve_asset(asset),
         // `Output::Static` falls through to the live-disk read below, so a
         // freshly-added file (not yet in the recompiled map) still resolves.
         _ => {}

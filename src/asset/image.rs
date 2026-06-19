@@ -28,9 +28,7 @@ use image::{DynamicImage, ImageEncoder, ImageFormat};
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{Bytes, Cast, Packed, PathOrStr, ShowFn, StyleChain, elem, func, scope};
 use typst::syntax::Span;
-use typst_utils::hash128;
-
-use super::{AssetSpec, Built, ImageSource, Upstream, resolve_path, show_unresolved};
+use super::{AssetSpec, Built, ImageSource, OutputReq, Upstream, emit_or_request, resolve_path, sha256};
 use crate::project::TwylaContext;
 use crate::render::Emit;
 
@@ -83,11 +81,15 @@ pub struct ImageAsset {
     /// PNG and GIF.
     #[default(75)]
     pub quality: u8,
+
+    /// Bundle-relative output path policy.
+    #[default(OutputReq::Auto)]
+    pub output: OutputReq,
 }
 
 // Image bytes are binary, so `.read()` defaults to raw bytes (`None`) rather
 // than the UTF-8 default the text-ish assets use.
-asset_methods!(ImageAsset, spec, None);
+asset_methods!(ImageAsset, spec, output, None);
 
 /// Build an `asset.image` element's [`AssetSpec`] from its (style-resolved)
 /// fields. The element is always file-backed; per-call args override the
@@ -103,6 +105,10 @@ fn spec(elem: &Packed<ImageAsset>, styles: StyleChain) -> HintedStrResult<AssetS
         elem.format.get(styles),
         elem.quality.get(styles),
     )
+}
+
+fn output(elem: &Packed<ImageAsset>, styles: StyleChain) -> HintedStrResult<OutputReq> {
+    Ok(elem.output.get_cloned(styles))
 }
 
 /// Build an image [`AssetSpec`] for the native image rule ([`crate::rules`]):
@@ -156,10 +162,10 @@ fn dim(value: Option<i64>) -> HintedStrResult<Option<u32>> {
     }
 }
 
-/// Default show: a bare `asset.image(..)` cannot be rendered — resolve it with
-/// `.url()`/`.read()`. Registered for the in-page targets in [`crate::rules`].
-pub const SHOW_RULE: ShowFn<ImageAsset> =
-    |elem, _engine, _styles| show_unresolved(elem.span(), "image");
+/// Default show: a bare `asset.image(..)` emits and renders nothing.
+pub const SHOW_RULE: ShowFn<ImageAsset> = |elem, engine, styles| {
+    emit_or_request(engine, spec(&elem, styles), elem.span(), output(&elem, styles))
+};
 
 /// How an image is fit into the requested `width`×`height`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Cast)]
@@ -293,7 +299,7 @@ pub(crate) fn build(
 
     let bytes = Bytes::new(encoded);
     Ok(Built {
-        content_hash: hash128(&bytes),
+        sha256: sha256(&bytes),
         emit: Emit::Bytes(bytes),
         upstream,
         ext: Some(out_format.ext().to_owned()),

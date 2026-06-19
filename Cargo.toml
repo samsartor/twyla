@@ -31,6 +31,8 @@ typst-render = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a579
 typst-utils = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
 comemo = "0.5"
 ecow = "0.2"
+sha2 = "0.10"
+hex = "0.4"
 
 # Path-aware file watcher for `static/` (serve hot-reload). The typst
 # watcher only signals "something changed"; this one surfaces the changed

@@ -310,30 +310,32 @@ impl TwylaContext {
     /// `assets/main-<hash>.css`. Joined under the build output dir on disk and
     /// exposed at the matching root-relative URL ([`asset_url`](Self::asset_url)).
     pub fn default_asset_output(&self, built: &asset::Built) -> String {
+        let hex = built.sha256_hex();
+        let fingerprint = &hex[..32];
         match &built.stem {
             Some(stem) => format!(
-                "assets/{}-{:032x}.{}",
+                "assets/{}-{}.{}",
                 stem,
-                built.content_hash,
+                fingerprint,
                 built.ext.as_deref().unwrap_or("bin")
             ),
             None => format!(
-                "assets/{:032x}.{}",
-                built.content_hash,
+                "assets/{}.{}",
+                fingerprint,
                 built.ext.as_deref().unwrap_or("bin")
             ),
         }
     }
 
+    /// Resolve an explicit asset output path at the bundle root.
+    pub fn resolve_asset_output(&self, raw: &str) -> Result<String, String> {
+        Self::resolve_output(Some(""), raw)?.ok_or_else(|| {
+            format!("asset output path `{raw}` could not be resolved")
+        })
+    }
+
     pub fn asset_url(&self, output: &str) -> String {
-        match &self.base_url {
-            Some(base) => format!(
-                "{}/{}",
-                base.trim_end_matches('/'),
-                output.trim_start_matches('/')
-            ),
-            None => format!("/{}", output.trim_start_matches('/')),
-        }
+        build_document_url(self.base_url.as_deref(), output)
     }
 
     /// Whether `content/<slug>.typ` exists on disk. Used by the dev

@@ -128,7 +128,7 @@ impl Emit {
 #[derive(Debug)]
 pub enum Output {
     Doc(OutputDoc),
-    Asset(Arc<ResolvedAsset>),
+    Asset { path: String, asset: Arc<ResolvedAsset> },
     Static(String, PathBuf),
 }
 
@@ -138,7 +138,7 @@ impl Output {
     pub fn key(&self) -> &str {
         match self {
             Output::Doc(d) => d.output_path.as_str(),
-            Output::Asset(a) => &a.output_path,
+            Output::Asset { path, .. } => path,
             Output::Static(f, _) => f,
         }
     }
@@ -148,7 +148,7 @@ impl Output {
     pub fn write_to(&self, dest: &Path) -> io::Result<()> {
         match self {
             Output::Doc(d) => fs::write(dest, &d.html),
-            Output::Asset(a) => a.built.emit.write_to(dest),
+            Output::Asset { asset, .. } => asset.built.emit.write_to(dest),
             Output::Static(_, src) => fs::copy(src, dest).map(drop),
         }
     }
@@ -194,7 +194,7 @@ impl Outputs {
     /// Just the processed assets.
     pub fn assets(&self) -> impl Iterator<Item = &ResolvedAsset> {
         self.all.iter().filter_map(|o| match o {
-            Output::Asset(a) => Some(Arc::as_ref(a)),
+            Output::Asset { asset, .. } => Some(Arc::as_ref(asset)),
             _ => None,
         })
     }
@@ -466,8 +466,8 @@ impl RenderWorld {
             out.meta = Some(doc);
         }
 
-        for asset in assets {
-            if let Err(err) = all.insert_unique(Output::Asset(asset)) {
+        for (path, asset) in assets {
+            if let Err(err) = all.insert_unique(Output::Asset { path, asset }) {
                 return Err(duplication_error(err).0);
             }
         }
@@ -498,12 +498,12 @@ fn duplication_error(err: iddqd::errors::DuplicateItem<Output, &Output>) -> (Ren
     let (new, duplicates) = err.into_parts();
     let new_text = match &new {
         Output::Doc(_d) => format_args!("document"), // TODO: source location?
-        Output::Asset(a) => format_args!("asset {:?}", a.spec),
+        Output::Asset { asset, .. } => format_args!("asset {:?}", asset.spec),
         Output::Static(_, p) => format_args!("static file \"{}\"", p.display()),
     };
     let dup_text = match &duplicates[0] {
         Output::Doc(_d) => format_args!("a document"), // TODO: source location?
-        Output::Asset(a) => format_args!("an asset {:?}", a.spec),
+        Output::Asset { asset, .. } => format_args!("an asset {:?}", asset.spec),
         Output::Static(_, p) => format_args!("static file \"{}\"", p.display()),
     };
     (

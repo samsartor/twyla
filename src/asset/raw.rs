@@ -9,9 +9,7 @@
 
 use ecow::EcoString;
 use typst::foundations::Bytes;
-use typst_utils::hash128;
-
-use super::Built;
+use super::{Built, sha256};
 
 /// Wrap already-loaded bytes as a verbatim asset. No `upstream`: the bytes are
 /// inline in (or derived from) the source, which the typst `World` already
@@ -19,7 +17,7 @@ use super::Built;
 /// different spec rather than needing mtime invalidation.
 pub(crate) fn build(bytes: Bytes, ext: Option<EcoString>) -> Built {
     Built {
-        content_hash: hash128(&bytes),
+        sha256: sha256(&bytes),
         ext: ext.map(|e| e.to_string()),
         stem: None,
         upstream: Vec::new(),

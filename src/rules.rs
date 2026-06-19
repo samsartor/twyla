@@ -35,7 +35,7 @@ use typst_library::visualize::{
     ExchangeFormat, ImageElem, ImageFormat, RasterFormat, VectorFormat,
 };
 
-use crate::asset::{AssetSpec, ImageSource, image, resolve_image_or_request, resolve_or_request};
+use crate::asset::{AssetSpec, ImageSource, OutputReq, image, resolve_image_or_request, resolve_or_request};
 
 /// Install twyla's native HTML rules into a freshly built library's
 /// rule map. Call from [`crate::prelude::install`] after
@@ -222,7 +222,7 @@ const IMAGE_RULE: ShowFn<ImageElem> = |elem, engine, styles| {
                 ext: image_ext(&loaded.data),
             },
         };
-        (resolve_or_request(engine, spec, span), None)
+        (resolve_or_request(engine, spec, span, OutputReq::Auto), None)
     };
 
     let mut img = HtmlElem::new(tag::img).with_attr(attr::src, src.as_str());
