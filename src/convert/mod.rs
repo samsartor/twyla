@@ -106,10 +106,11 @@ pub fn run(opts: ConvertOptions) -> Result<Vec<Finding>, ConvertError> {
     // 3. Manifests — twyla's own (the compiled outputs) and the ground truth
     // (used to excuse links broken in both builds).
     let twyla_manifest = manifest::twyla(&outputs);
-    let gt_manifest = manifest::ground_truth(ctx, &opts.ground_truth).map_err(|e| ConvertError {
-        findings: std::mem::take(&mut findings),
-        message: format!("building ground-truth manifest: {e}"),
-    })?;
+    let gt_manifest =
+        manifest::ground_truth(ctx, &opts.ground_truth).map_err(|e| ConvertError {
+            findings: std::mem::take(&mut findings),
+            message: format!("building ground-truth manifest: {e}"),
+        })?;
 
     // 4. Per-page diff against the ground truth.
     let preset = convert_preset();
@@ -345,10 +346,19 @@ mod tests {
     #[test]
     fn route_slug_and_matches() {
         assert_eq!(route_slug("guis-1/index.html"), "guis-1");
-        assert_eq!(route_slug("what-is-color/ai-cut/index.html"), "what-is-color/ai-cut");
+        assert_eq!(
+            route_slug("what-is-color/ai-cut/index.html"),
+            "what-is-color/ai-cut"
+        );
         assert_eq!(route_slug("index.html"), "");
-        assert!(route_matches("guis-1/index.html", &Some("guis-1".to_string())));
+        assert!(route_matches(
+            "guis-1/index.html",
+            &Some("guis-1".to_string())
+        ));
         assert!(route_matches("guis-1/index.html", &None));
-        assert!(!route_matches("guis-2/index.html", &Some("guis-1".to_string())));
+        assert!(!route_matches(
+            "guis-2/index.html",
+            &Some("guis-1".to_string())
+        ));
     }
 }

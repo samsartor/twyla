@@ -329,9 +329,8 @@ impl TwylaContext {
 
     /// Resolve an explicit asset output path at the bundle root.
     pub fn resolve_asset_output(&self, raw: &str) -> Result<String, String> {
-        Self::resolve_output(Some(""), raw)?.ok_or_else(|| {
-            format!("asset output path `{raw}` could not be resolved")
-        })
+        Self::resolve_output(Some(""), raw)?
+            .ok_or_else(|| format!("asset output path `{raw}` could not be resolved"))
     }
 
     pub fn asset_url(&self, output: &str) -> String {

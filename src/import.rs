@@ -54,7 +54,13 @@ pub fn import_md(input: &str, kind: &str, output: Option<&str>) -> Result<String
     let (summary_md, body) = split_summary(body);
     let summary = summary_md.map(|md| ir::render(&parse_blocks(&preprocess_shortcodes(md))));
     let blocks = parse_blocks(&preprocess_shortcodes(&body));
-    Ok(assemble(&meta, &ir::render(&blocks), summary.as_deref(), kind, output))
+    Ok(assemble(
+        &meta,
+        &ir::render(&blocks),
+        summary.as_deref(),
+        kind,
+        output,
+    ))
 }
 
 /// Convert a Hugo markdown source into a typst draft.
@@ -244,7 +250,13 @@ fn toml_to_typst(v: &toml::Value, indent: usize) -> String {
         toml::Value::Table(t) => {
             let items: Vec<_> = t
                 .iter()
-                .map(|(k, val)| format!("{pad1}{}: {}", typst_dict_key(k), toml_to_typst(val, indent + 1)))
+                .map(|(k, val)| {
+                    format!(
+                        "{pad1}{}: {}",
+                        typst_dict_key(k),
+                        toml_to_typst(val, indent + 1)
+                    )
+                })
                 .collect();
             format!("(\n{},\n{pad})", items.join(",\n"))
         }
@@ -256,7 +268,8 @@ fn toml_to_typst(v: &toml::Value, indent: usize) -> String {
 fn typst_dict_key(k: &str) -> String {
     let is_ident = !k.is_empty()
         && k.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     if is_ident {
         k.to_string()
     } else {
@@ -285,7 +298,10 @@ fn yaml_to_typst(v: &serde_yaml::Value, indent: usize) -> String {
         serde_yaml::Value::Sequence(arr) if arr.is_empty() => "()".to_string(),
         serde_yaml::Value::Sequence(arr) => {
             let nested = arr.iter().any(|x| {
-                matches!(x, serde_yaml::Value::Sequence(_) | serde_yaml::Value::Mapping(_))
+                matches!(
+                    x,
+                    serde_yaml::Value::Sequence(_) | serde_yaml::Value::Mapping(_)
+                )
             });
             if !nested {
                 let items: Vec<_> = arr.iter().map(|x| yaml_to_typst(x, indent)).collect();
@@ -381,7 +397,13 @@ fn parse_yaml_frontmatter(fm: &str) -> Result<Meta, String> {
         Some(yaml_to_typst(&serde_yaml::Value::Mapping(extra_map), 1))
     };
 
-    Ok(Meta { title, description, date, draft, extra })
+    Ok(Meta {
+        title,
+        description,
+        date,
+        draft,
+        extra,
+    })
 }
 
 // ---- shortcode preprocessing --------------------------------------------
@@ -646,9 +668,10 @@ impl<'a> Builder<'a> {
             Frame::Strong(c) => self.push_inline(Inline::Strong(c)),
             Frame::Strike(c) => self.push_inline(Inline::Strike(c)),
             Frame::Link { dest, content } => self.push_inline(Inline::Link { dest, content }),
-            Frame::Image { src, alt } => {
-                self.push_inline(Inline::Image { src, alt: plain_alt(&alt) })
-            }
+            Frame::Image { src, alt } => self.push_inline(Inline::Image {
+                src,
+                alt: plain_alt(&alt),
+            }),
             Frame::ShortcodeInline {
                 name,
                 args,
@@ -819,7 +842,10 @@ impl<'a> Builder<'a> {
             }
             TagEnd::Image => {
                 if let Some(Frame::Image { src, alt }) = self.stack.pop() {
-                    self.push_inline(Inline::Image { src, alt: plain_alt(&alt) });
+                    self.push_inline(Inline::Image {
+                        src,
+                        alt: plain_alt(&alt),
+                    });
                 }
             }
             TagEnd::Table => {
@@ -1356,7 +1382,10 @@ mod tests {
         assert!(out.contains("tags: (\"a\", \"b\")"), "got: {out}");
         assert!(out.contains("weight: 2"), "got: {out}");
         assert!(out.contains("\"odd key\": \"v\""), "got: {out}");
-        assert!(out.contains("nested: (") && out.contains("x: 1"), "got: {out}");
+        assert!(
+            out.contains("nested: (") && out.contains("x: 1"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -1365,10 +1394,19 @@ mod tests {
                    The **lead** paragraph.\n\n<!-- more -->\n\nRest of the body.\n";
         let out = import_md(src, "page", None).unwrap();
         // Summary above `<!-- more -->` becomes a rich description, overriding fm.
-        assert!(out.contains("description: [The *lead* paragraph.],"), "got:\n{out}");
-        assert!(!out.contains("description: \"fm\""), "fm desc should be overridden:\n{out}");
+        assert!(
+            out.contains("description: [The *lead* paragraph.],"),
+            "got:\n{out}"
+        );
+        assert!(
+            !out.contains("description: \"fm\""),
+            "fm desc should be overridden:\n{out}"
+        );
         // Marker is gone; the lead still appears in the body.
-        assert!(!out.contains("<!-- more -->"), "marker should be stripped:\n{out}");
+        assert!(
+            !out.contains("<!-- more -->"),
+            "marker should be stripped:\n{out}"
+        );
         assert!(out.contains("Rest of the body."), "got:\n{out}");
     }
 
@@ -1385,8 +1423,14 @@ mod tests {
         // under the marker, or typst splits the <li> out of the list.
         let out = body("- first para\n\n  second para\n");
         assert!(out.contains("- first para"), "got:\n{out}");
-        assert!(out.contains("\n  second para"), "continuation not indented:\n{out}");
-        assert!(!out.contains("\nsecond para"), "continuation at column 0:\n{out}");
+        assert!(
+            out.contains("\n  second para"),
+            "continuation not indented:\n{out}"
+        );
+        assert!(
+            !out.contains("\nsecond para"),
+            "continuation at column 0:\n{out}"
+        );
     }
 
     #[test]

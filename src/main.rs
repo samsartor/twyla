@@ -172,7 +172,12 @@ enum FromFormat {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Serve { ctx, host, port, bind } => cmd_serve(ctx, host, port, bind),
+        Cmd::Serve {
+            ctx,
+            host,
+            port,
+            bind,
+        } => cmd_serve(ctx, host, port, bind),
         Cmd::Build { ctx, output_dir } => cmd_build(ctx, output_dir),
         Cmd::Convert {
             ctx,

@@ -25,8 +25,8 @@
 //! string is enough to render a complete reference; live reload is a follow-up.
 
 use typst::foundations::{
-    Array, CastInfo, Dict, Func, IntoValue, Module, NativeParamInfo, Scope, Symbol,
-    Type, Value, dict, func,
+    Array, CastInfo, Dict, Func, IntoValue, Module, NativeParamInfo, Scope, Symbol, Type, Value,
+    dict, func,
 };
 
 /// Describe a twyla builtin (function, type, or symbol) as a dict the docs

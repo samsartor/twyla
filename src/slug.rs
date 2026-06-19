@@ -76,6 +76,9 @@ mod tests {
         assert_eq!(hugo_slugify("1.1 Higher Salaries"), "11-higher-salaries");
         assert_eq!(hugo_slugify("CI/CD"), "cicd");
         assert_eq!(hugo_slugify("Walking Tour"), "walking-tour");
-        assert_eq!(hugo_slugify("1.2 Increased Employability"), "12-increased-employability");
+        assert_eq!(
+            hugo_slugify("1.2 Increased Employability"),
+            "12-increased-employability"
+        );
     }
 }

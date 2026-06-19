@@ -70,7 +70,11 @@ impl fmt::Display for DivergenceReason {
         use DivergenceReason::*;
         match self {
             NodeKindMismatch { expected, actual } => {
-                write!(f, "node kind differs: expected {}, got {}", expected, actual)
+                write!(
+                    f,
+                    "node kind differs: expected {}, got {}",
+                    expected, actual
+                )
             }
             TagMismatch { expected, actual } => {
                 write!(f, "tag differs: expected <{}>, got <{}>", expected, actual)
@@ -327,23 +331,20 @@ mod tests {
     /// Apply a relaxation config (normalize both sides) then diff — the path the
     /// convert harness uses.
     fn diff_relaxed(left: &str, right: &str, cfg: &RelaxConfig) -> Result<(), Divergence> {
-        diff(&cfg.normalize(&parse_html(left)), &cfg.normalize(&parse_html(right)))
+        diff(
+            &cfg.normalize(&parse_html(left)),
+            &cfg.normalize(&parse_html(right)),
+        )
     }
 
     #[test]
     fn identical_matches() {
-        assert_match(
-            "<p class=\"a\">hi</p>",
-            "<p class=\"a\">hi</p>",
-        );
+        assert_match("<p class=\"a\">hi</p>", "<p class=\"a\">hi</p>");
     }
 
     #[test]
     fn whitespace_collapsed() {
-        assert_match(
-            "<p>hello   world</p>",
-            "<p>hello world</p>",
-        );
+        assert_match("<p>hello   world</p>", "<p>hello world</p>");
     }
 
     #[test]
@@ -390,10 +391,7 @@ mod tests {
 
     #[test]
     fn tag_drift_detected_with_path() {
-        let d = assert_diff(
-            "<div><p>hi</p></div>",
-            "<div><span>hi</span></div>",
-        );
+        let d = assert_diff("<div><p>hi</p></div>", "<div><span>hi</span></div>");
         assert!(matches!(d.reason, DivergenceReason::TagMismatch { .. }));
         let p = format_path(&d.path);
         assert!(p.contains("/body[0]/div[0]"), "path was {}", p);
@@ -401,10 +399,7 @@ mod tests {
 
     #[test]
     fn attribute_value_drift_detected() {
-        let d = assert_diff(
-            "<a href=\"x\">hi</a>",
-            "<a href=\"y\">hi</a>",
-        );
+        let d = assert_diff("<a href=\"x\">hi</a>", "<a href=\"y\">hi</a>");
         match d.reason {
             DivergenceReason::AttrValueMismatch {
                 name,
@@ -421,19 +416,13 @@ mod tests {
 
     #[test]
     fn missing_attribute_detected() {
-        let d = assert_diff(
-            "<a href=\"x\" id=\"q\">hi</a>",
-            "<a href=\"x\">hi</a>",
-        );
+        let d = assert_diff("<a href=\"x\" id=\"q\">hi</a>", "<a href=\"x\">hi</a>");
         assert!(matches!(d.reason, DivergenceReason::AttrMissing { .. }));
     }
 
     #[test]
     fn extra_attribute_detected() {
-        let d = assert_diff(
-            "<a href=\"x\">hi</a>",
-            "<a href=\"x\" id=\"q\">hi</a>",
-        );
+        let d = assert_diff("<a href=\"x\">hi</a>", "<a href=\"x\" id=\"q\">hi</a>");
         assert!(matches!(d.reason, DivergenceReason::AttrExtra { .. }));
     }
 
@@ -445,20 +434,17 @@ mod tests {
 
     #[test]
     fn child_count_drift_detected() {
-        let d = assert_diff(
-            "<div><p>a</p><p>b</p></div>",
-            "<div><p>a</p></div>",
-        );
-        assert!(matches!(d.reason, DivergenceReason::ChildCountMismatch { .. }));
+        let d = assert_diff("<div><p>a</p><p>b</p></div>", "<div><p>a</p></div>");
+        assert!(matches!(
+            d.reason,
+            DivergenceReason::ChildCountMismatch { .. }
+        ));
     }
 
     #[test]
     fn comments_ignored_by_default() {
         // Comments on the expected side, none on the actual side: should still match.
-        assert_match(
-            "<div><!-- note --><p>hi</p></div>",
-            "<div><p>hi</p></div>",
-        );
+        assert_match("<div><!-- note --><p>hi</p></div>", "<div><p>hi</p></div>");
     }
 
     #[test]
@@ -497,8 +483,12 @@ mod tests {
             },
             RelaxationRule::IgnoreAttributeValue("src".to_string()),
         );
-        diff_relaxed("<img src=\"/foo.png\">", "<img src=\"/assets/foo-abc123.png\">", &cfg)
-            .expect("differing src value should match under IgnoreAttributeValue");
+        diff_relaxed(
+            "<img src=\"/foo.png\">",
+            "<img src=\"/assets/foo-abc123.png\">",
+            &cfg,
+        )
+        .expect("differing src value should match under IgnoreAttributeValue");
     }
 
     #[test]
@@ -542,8 +532,10 @@ mod tests {
     #[test]
     fn relax_ignore_entirely() {
         // Differing nav widgets, but we don't care about their contents.
-        let cfg = RelaxConfig::new()
-            .relax(Matcher::Tag("nav".to_string()), RelaxationRule::IgnoreEntirely);
+        let cfg = RelaxConfig::new().relax(
+            Matcher::Tag("nav".to_string()),
+            RelaxationRule::IgnoreEntirely,
+        );
         diff_relaxed(
             "<nav class=\"x\"><a href=\"/a\">a</a></nav>",
             "<nav class=\"y\"><span>completely different</span></nav>",

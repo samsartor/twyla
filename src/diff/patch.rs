@@ -273,8 +273,12 @@ fn format_ops(ops: &[Op], above: usize, below: usize) -> Vec<String> {
         }
         out.push(match &ops[i] {
             Op::Eq(l) => dim(&format!("  {l}")),
-            Op::Del(l) => format!("- {l}").if_supports_color(OUT, |t| t.red()).to_string(),
-            Op::Ins(l) => format!("+ {l}").if_supports_color(OUT, |t| t.green()).to_string(),
+            Op::Del(l) => format!("- {l}")
+                .if_supports_color(OUT, |t| t.red())
+                .to_string(),
+            Op::Ins(l) => format!("+ {l}")
+                .if_supports_color(OUT, |t| t.green())
+                .to_string(),
         });
     }
     if gap > 0 {
@@ -310,7 +314,9 @@ mod tests {
     /// Is there a `-`/`+`/context line (whole-document render is deeply indented,
     /// so match on the prefix + content, not exact columns)?
     fn has(patch: &str, prefix: &str, needle: &str) -> bool {
-        patch.lines().any(|l| l.starts_with(prefix) && l.contains(needle))
+        patch
+            .lines()
+            .any(|l| l.starts_with(prefix) && l.contains(needle))
     }
 
     #[test]
@@ -346,7 +352,10 @@ mod tests {
     #[test]
     fn whole_page_shows_every_change() {
         // Both paragraphs differ; one patch covers them all (no per-file cap).
-        let p = patch("<div><p>aaa</p><p>bbb</p></div>", "<div><p>XXX</p><p>YYY</p></div>");
+        let p = patch(
+            "<div><p>aaa</p><p>bbb</p></div>",
+            "<div><p>XXX</p><p>YYY</p></div>",
+        );
         assert!(has(&p, "- ", "aaa") && has(&p, "+ ", "XXX"), "got:\n{p}");
         assert!(has(&p, "- ", "bbb") && has(&p, "+ ", "YYY"), "got:\n{p}");
     }
@@ -357,7 +366,10 @@ mod tests {
         let act = "<ul><li>a</li><li>b</li><li>Z</li><li>d</li><li>e</li></ul>";
         // 1 line of context each side of the changed <li>c → <li>Z.
         let p = patch_ctx(exp, act, 1, 1);
-        assert!(has(&p, "- ", "<li>c</li>") && has(&p, "+ ", "<li>Z</li>"), "got:\n{p}");
+        assert!(
+            has(&p, "- ", "<li>c</li>") && has(&p, "+ ", "<li>Z</li>"),
+            "got:\n{p}"
+        );
         assert!(p.contains("<li>b</li>"), "1 line above should show:\n{p}");
         assert!(p.contains("<li>d</li>"), "1 line below should show:\n{p}");
         assert!(!p.contains("<li>a</li>"), "2 above should collapse:\n{p}");
@@ -372,7 +384,10 @@ mod tests {
         let p = patch_ctx(exp, act, 2, 0);
         assert!(p.contains("<li>a</li>"), "2 above should show:\n{p}");
         assert!(p.contains("<li>b</li>"), "1 above should show:\n{p}");
-        assert!(!p.contains("<li>d</li>"), "below=0 should hide the next line:\n{p}");
+        assert!(
+            !p.contains("<li>d</li>"),
+            "below=0 should hide the next line:\n{p}"
+        );
     }
 
     #[test]
@@ -394,7 +409,10 @@ mod tests {
         let d = diff(&exp, &act).expect_err("expected a divergence");
         let out = d.render_patch(&exp, &act, 1, 1);
         assert!(!out.trim().is_empty(), "fallback must not be empty");
-        assert!(out.contains("child count"), "should show the reason, got:\n{out}");
+        assert!(
+            out.contains("child count"),
+            "should show the reason, got:\n{out}"
+        );
     }
 
     #[test]
@@ -403,12 +421,12 @@ mod tests {
         let act = "<ul><li>a</li><li>Z</li><li>c</li></ul>";
         // 0/0: the change shows, no surrounding context, elided lines marked.
         let p = patch_ctx(exp, act, 0, 0);
-        assert!(has(&p, "- ", "<li>b</li>") && has(&p, "+ ", "<li>Z</li>"), "got:\n{p}");
+        assert!(
+            has(&p, "- ", "<li>b</li>") && has(&p, "+ ", "<li>Z</li>"),
+            "got:\n{p}"
+        );
         assert!(!p.contains("<li>a</li>"), "no context expected, got:\n{p}");
         assert!(!p.contains("<li>c</li>"), "no context expected, got:\n{p}");
         assert!(p.contains("⋮"), "elision marker missing, got:\n{p}");
     }
 }
-
-
-

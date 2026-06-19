@@ -79,10 +79,10 @@ impl Resolver {
         self.assets.iter()
     }
 
-    /// The assets actually written as files: those some call site requested a
-    /// URL for ([`OutputReq::Url`]). An asset only ever `.read()` (inlined into
-    /// the HTML, never linked) is omitted — nothing references the file, so
-    /// writing it would just litter the output dir.
+    /// The assets actually written as files: one item per distinct resolved
+    /// non-read output path. An asset only ever `.read()` (inlined into the HTML,
+    /// never linked or explicitly emitted) is omitted — nothing references the
+    /// file, so writing it would just litter the output dir.
     pub fn emittable_assets(&self) -> impl Iterator<Item = (String, Arc<ResolvedAsset>)> + '_ {
         self.assets.iter().flat_map(|asset| {
             let mut paths = Vec::<String>::new();
@@ -167,14 +167,17 @@ impl Resolver {
             let mut explicit = Vec::<(OutputReq, String)>::new();
             for policy in &asset.outputs {
                 let path = match policy {
-                    OutputReq::Fixed(raw) => Some(ctx.resolve_asset_output(raw.as_str()).map_err(|err| {
-                        eco_vec![SourceDiagnostic::error(typst::syntax::Span::detached(), err)]
-                    })?),
+                    OutputReq::Fixed(raw) => Some(
+                        ctx.resolve_asset_output(raw.as_str())
+                            .map_err(|err| eco_vec![SourceDiagnostic::error(asset.span, err)])?,
+                    ),
                     OutputReq::Derive(func) => {
                         let raw = eval_derive(func, asset)?;
-                        Some(ctx.resolve_asset_output(&raw).map_err(|err| {
-                            eco_vec![SourceDiagnostic::error(typst::syntax::Span::detached(), err)]
-                        })?)
+                        Some(
+                            ctx.resolve_asset_output(&raw).map_err(|err| {
+                                eco_vec![SourceDiagnostic::error(asset.span, err)]
+                            })?,
+                        )
                     }
                     OutputReq::Read | OutputReq::Auto => None,
                 };
@@ -227,11 +230,13 @@ impl Resolver {
     pub fn collect_document(&mut self, doc: &ResolvedDocument) -> SourceResult<()> {
         if let Some(existing) = self.documents.get(doc.output.as_str()) {
             if **existing != *doc {
-                return Err(eco_vec![SourceDiagnostic::error(
-                    doc.body.span(),
-                    format!("two different documents target the output `{}`", doc.output),
-                )
-                .with_hint("each `document(..)` needs a distinct `output:`")]);
+                return Err(eco_vec![
+                    SourceDiagnostic::error(
+                        doc.body.span(),
+                        format!("two different documents target the output `{}`", doc.output),
+                    )
+                    .with_hint("each `document(..)` needs a distinct `output:`")
+                ]);
             }
             return Ok(());
         }
@@ -275,6 +280,7 @@ impl Resolver {
 
         Ok(ResolvedAsset {
             spec: spec.clone(),
+            span,
             built,
             output_path,
             url,

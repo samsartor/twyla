@@ -37,7 +37,12 @@ macro_rules! asset_methods {
                 let styles = context.styles()?;
                 let spec = $spec(&elem, styles)?;
                 let output = $output(&elem, styles)?;
-                Ok($crate::asset::resolve_or_request(engine, spec, elem.span(), output))
+                Ok($crate::asset::resolve_or_request(
+                    engine,
+                    spec,
+                    elem.span(),
+                    output,
+                ))
             }
 
             /// This asset's bytes — for inlining instead of linking. Mirrors the
@@ -74,16 +79,15 @@ use std::path::Path;
 use comemo::Tracked;
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
 use iddqd::IdHashItem;
+use sha2::{Digest, Sha256};
 use typst::diag::{HintedStrResult, HintedString, SourceDiagnostic, SourceResult};
 use typst::engine::Engine;
 use typst::foundations::{
-    AutoValue, Binding, Bytes, Content, Func, Module, PathOrStr, Repr, Scope, Str,
-    Value, cast, ty,
+    AutoValue, Binding, Bytes, Content, Func, Module, PathOrStr, Repr, Scope, Str, Value, cast, ty,
 };
 use typst::introspection::{History, Introspect, Introspector};
 use typst::loading::{Encoding, Readable};
 use typst::syntax::{FileId, Span};
-use sha2::{Digest, Sha256};
 use typst_utils::hash128;
 
 use crate::render::Emit;
@@ -218,10 +222,10 @@ impl Introspect for AssetReqIntrospect {
 // scope methods — `.url()` and `.read()` — that build an [`AssetSpec`] from
 // those fields and resolve it through the introspector. The element→spec→resolve
 // machinery they share lives here: [`resolve_or_request`] / [`read_or_request`]
-// (the introspect-or-request protocol) and [`show_unresolved`] (the default
-// show rule, which refuses to render a bare asset). Discovery is *lazy*: it
-// happens only when `.url()`/`.read()` actually run, so an asset that's never
-// used is never built. See the module docs and
+// (the introspect-or-request protocol) and [`emit_or_request`] (the default
+// show rule, which emits and vanishes for a bare asset). Discovery is *lazy*: it
+// happens only when `.url()`/`.read()` or a bare shown asset actually runs, so an
+// asset that's never used is never built. See the module docs and
 // [[twyla_element_scope_methods_spike]].
 
 /// The resolve-or-request protocol every `asset.*` consumer obeys, in one
@@ -393,7 +397,6 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-
 /// What a per-type `build` ([`file::build`], [`sass::build`]) produces. The
 /// resolver turns it into a [`ResolvedAsset`] by adding the fingerprinted name,
 /// output path, and URL (all shared logic).
@@ -458,6 +461,8 @@ impl Repr for Resolution {
 pub struct ResolvedAsset {
     /// The spec that produced it (its key).
     pub spec: AssetSpec,
+    /// Span of a source usage, for diagnostics while resolving output policies.
+    pub span: Span,
     /// The built asset
     pub built: Built,
     /// Bundle-relative output path, e.g. `assets/main-<hash>.css`.
@@ -470,7 +475,7 @@ pub struct ResolvedAsset {
     /// How this asset is used *this compile* — the union of [`OutputReq`]s over
     /// its call sites, accumulated as requests are discovered. Drives emission
     /// ([`Resolver::emittable_assets`](crate::resolver::Resolver::emittable_assets)):
-    /// only an asset with a [`OutputReq::Url`] is written as a file. Deliberately
+    /// any non-[`OutputReq::Read`] usage is written as a file. Deliberately
     /// *excluded* from [`Hash`]/[`PartialEq`] below — it's emission policy, not
     /// part of the asset's resolved identity, and the resolved record flows
     /// through introspection convergence, which must not churn as usage grows.

@@ -72,9 +72,7 @@ mod tests {
 
     #[test]
     fn class_match_returns_inner() {
-        let n = parse_html(
-            "<div><section class=\"a b\"><p>hi</p></section></div>",
-        );
+        let n = parse_html("<div><section class=\"a b\"><p>hi</p></section></div>");
         let inner = find_inner(&n, &Selector::Class("b".into())).unwrap();
         assert_eq!(inner.len(), 1);
         assert!(matches!(&inner[0], Node::Element(e) if e.name == "p"));

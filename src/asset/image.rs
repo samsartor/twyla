@@ -20,6 +20,11 @@
 
 use std::io::Cursor;
 
+use super::{
+    AssetSpec, Built, ImageSource, OutputReq, Upstream, emit_or_request, resolve_path, sha256,
+};
+use crate::project::TwylaContext;
+use crate::render::Emit;
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
 use image::codecs::avif::AvifEncoder;
 use image::codecs::jpeg::JpegEncoder;
@@ -28,9 +33,6 @@ use image::{DynamicImage, ImageEncoder, ImageFormat};
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{Bytes, Cast, Packed, PathOrStr, ShowFn, StyleChain, elem, func, scope};
 use typst::syntax::Span;
-use super::{AssetSpec, Built, ImageSource, OutputReq, Upstream, emit_or_request, resolve_path, sha256};
-use crate::project::TwylaContext;
-use crate::render::Emit;
 
 /// Decode, resize, and re-encode a raster image asset.
 ///
@@ -116,7 +118,10 @@ fn output(elem: &Packed<ImageAsset>, styles: StyleChain) -> HintedStrResult<Outp
 /// style chain, so a plain `![](photo.png)` behaves like
 /// `asset.image("photo.png")` under the same set rules. `source` is whatever the
 /// rule resolved the image to (path- or bytes-backed).
-pub(crate) fn spec_from_styles(source: ImageSource, styles: StyleChain) -> HintedStrResult<AssetSpec> {
+pub(crate) fn spec_from_styles(
+    source: ImageSource,
+    styles: StyleChain,
+) -> HintedStrResult<AssetSpec> {
     image_spec(
         source,
         styles.get(ImageAsset::width),
@@ -164,7 +169,12 @@ fn dim(value: Option<i64>) -> HintedStrResult<Option<u32>> {
 
 /// Default show: a bare `asset.image(..)` emits and renders nothing.
 pub const SHOW_RULE: ShowFn<ImageAsset> = |elem, engine, styles| {
-    emit_or_request(engine, spec(&elem, styles), elem.span(), output(&elem, styles))
+    emit_or_request(
+        engine,
+        spec(elem, styles),
+        elem.span(),
+        output(elem, styles),
+    )
 };
 
 /// How an image is fit into the requested `width`×`height`.
@@ -281,13 +291,15 @@ pub(crate) fn build(
 
     // Detect the source format up front: it drives both decoding and the
     // "keep source format" default.
-    let detected = image::guess_format(&bytes).map_err(|err| {
-        err_at(span, format_args!("not a recognized image: {err}"))
-    })?;
+    let detected = image::guess_format(&bytes)
+        .map_err(|err| err_at(span, format_args!("not a recognized image: {err}")))?;
     let out_format = match format {
         Some(f) => f,
         None => Format::from_detected(detected).ok_or_else(|| {
-            err_at(span, format_args!("cannot re-encode {detected:?} images; set an explicit `format`"))
+            err_at(
+                span,
+                format_args!("cannot re-encode {detected:?} images; set an explicit `format`"),
+            )
         })?,
     };
 
@@ -342,7 +354,12 @@ fn resize(
 }
 
 /// Require both dimensions for a fit mode that crops/stretches.
-fn both(width: Option<u32>, height: Option<u32>, mode: &str, span: Span) -> SourceResult<(u32, u32)> {
+fn both(
+    width: Option<u32>,
+    height: Option<u32>,
+    mode: &str,
+    span: Span,
+) -> SourceResult<(u32, u32)> {
     match (width, height) {
         (Some(w), Some(h)) => Ok((w, h)),
         _ => Err(err_at(
@@ -368,7 +385,12 @@ fn encode(img: &DynamicImage, format: Format, quality: u8) -> Result<Vec<u8>, Ec
             .encode_image(img)
             .map_err(|e| eco_format!("JPEG encode failed: {e}"))?,
         Format::Avif => AvifEncoder::new_with_speed_quality(&mut buf, 4, quality)
-            .write_image(img.as_bytes(), img.width(), img.height(), img.color().into())
+            .write_image(
+                img.as_bytes(),
+                img.width(),
+                img.height(),
+                img.color().into(),
+            )
             .map_err(|e| eco_format!("AVIF encode failed: {e}"))?,
         // `image`'s WebP encoder is lossless-only; libwebp does lossy at the
         // requested quality. `from_image` handles the RGB/RGBA conversion.
@@ -383,5 +405,8 @@ fn encode(img: &DynamicImage, format: Format, quality: u8) -> Result<Vec<u8>, Ec
 
 /// A spanned image error from any `Display` payload.
 fn err_at(span: Span, msg: impl std::fmt::Display) -> EcoVec<SourceDiagnostic> {
-    eco_vec![SourceDiagnostic::error(span, EcoString::from(msg.to_string()))]
+    eco_vec![SourceDiagnostic::error(
+        span,
+        EcoString::from(msg.to_string())
+    )]
 }

@@ -128,7 +128,10 @@ impl Emit {
 #[derive(Debug)]
 pub enum Output {
     Doc(OutputDoc),
-    Asset { path: String, asset: Arc<ResolvedAsset> },
+    Asset {
+        path: String,
+        asset: Arc<ResolvedAsset>,
+    },
     Static(String, PathBuf),
 }
 
@@ -439,8 +442,11 @@ impl RenderWorld {
             crate::compile::compile_bundle(&self.ctx, self, &fileids, resolver);
         emit_warnings(self, &warnings);
 
-        let CompiledBundle { bundle, pages, assets } =
-            output.map_err(|errors| compile_err(self, &errors))?;
+        let CompiledBundle {
+            bundle,
+            pages,
+            assets,
+        } = output.map_err(|errors| compile_err(self, &errors))?;
 
         let mut all = IdHashMap::new();
         for (path, file) in bundle.files.iter() {

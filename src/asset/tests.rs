@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::project::TwylaContext;
-use crate::render::RenderWorld;
+use crate::render::{Output, RenderWorld};
 use crate::resolver::Resolver;
 
 fn site(files: &[(&str, &str)]) -> (TwylaContext, tempfile::TempDir) {
@@ -26,6 +26,21 @@ fn compile(world: &RenderWorld) -> (String, Vec<ResolvedAsset>) {
     let outputs = world.compile_bundle(&mut resolver).unwrap();
     let html = outputs.docs().next().unwrap().html.clone();
     (html, outputs.assets().cloned().collect())
+}
+
+fn compile_asset_keys(world: &RenderWorld) -> (String, Vec<String>) {
+    let mut resolver = Resolver::new(&world.ctx);
+    let outputs = world.compile_bundle(&mut resolver).unwrap();
+    let html = outputs.docs().next().unwrap().html.clone();
+    let mut keys: Vec<String> = outputs
+        .iter()
+        .filter_map(|out| match out {
+            Output::Asset { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    keys.sort();
+    (html, keys)
 }
 
 /// The core of Phase 0/1: an `asset.*().url()` call resolves to a fingerprinted
@@ -59,6 +74,123 @@ fn cold_build_resolves_asset_url_through_the_loop() {
         !html.contains("__twyla-asset-pending__"),
         "placeholder leaked into output:\n{html}",
     );
+}
+
+#[test]
+fn explicit_output_path_controls_url_and_emission() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context asset.sass(\"site.scss\", output: \"css/site.css\").url()",
+        ),
+        ("content/site.scss", "a{b:c}"),
+    ]);
+    let (html, keys) = compile_asset_keys(&RenderWorld::new(&ctx).unwrap());
+
+    assert_eq!(keys, vec!["css/site.css"]);
+    assert!(
+        html.contains("https://example.com/css/site.css"),
+        "page missing explicit asset URL:\n{html}"
+    );
+}
+
+#[test]
+fn asset_output_index_html_uses_document_url_convention() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context asset.file(\"thing.txt\", output: \"stuff/index.html\").url()",
+        ),
+        ("content/thing.txt", "hello"),
+    ]);
+    let (html, keys) = compile_asset_keys(&RenderWorld::new(&ctx).unwrap());
+
+    assert_eq!(keys, vec!["stuff/index.html"]);
+    assert!(
+        html.contains("https://example.com/stuff/"),
+        "index.html output should strip to directory URL:\n{html}"
+    );
+}
+
+#[test]
+fn closure_output_path_controls_url_and_emission() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context asset.file(\"thing.txt\", output: (hash, ext, stem) => \"derived/\" + stem + \".\" + ext).url()",
+        ),
+        ("content/thing.txt", "hello"),
+    ]);
+    let (html, keys) = compile_asset_keys(&RenderWorld::new(&ctx).unwrap());
+
+    assert_eq!(keys, vec!["derived/thing.txt"]);
+    assert!(
+        html.contains("https://example.com/derived/thing.txt"),
+        "page missing closure-derived asset URL:\n{html}"
+    );
+}
+
+#[test]
+fn auto_reuses_single_explicit_output_path() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context asset.file(\"logo.svg\", output: \"logo.svg\").url()\n\
+             #context asset.file(\"logo.svg\").url()",
+        ),
+        ("content/logo.svg", "<svg/>"),
+    ]);
+    let (html, keys) = compile_asset_keys(&RenderWorld::new(&ctx).unwrap());
+
+    assert_eq!(keys, vec!["logo.svg"]);
+    assert_eq!(
+        html.matches("https://example.com/logo.svg").count(),
+        2,
+        "auto URL should reuse the one explicit path:\n{html}"
+    );
+}
+
+#[test]
+fn auto_falls_back_when_two_explicit_paths_exist() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context asset.file(\"logo.svg\", output: \"a.svg\").url()\n\
+             #context asset.file(\"logo.svg\", output: \"b.svg\").url()\n\
+             #context asset.file(\"logo.svg\").url()",
+        ),
+        ("content/logo.svg", "<svg/>"),
+    ]);
+    let (html, keys) = compile_asset_keys(&RenderWorld::new(&ctx).unwrap());
+
+    assert_eq!(keys.len(), 3, "got keys {keys:?}");
+    assert!(keys.contains(&"a.svg".to_string()), "got keys {keys:?}");
+    assert!(keys.contains(&"b.svg".to_string()), "got keys {keys:?}");
+    let default = keys
+        .iter()
+        .find(|key| key.starts_with("assets/logo-") && key.ends_with(".svg"))
+        .expect("missing default auto path");
+    assert!(html.contains("https://example.com/a.svg"), "{html}");
+    assert!(html.contains("https://example.com/b.svg"), "{html}");
+    assert!(
+        html.contains(&format!("https://example.com/{default}")),
+        "{html}"
+    );
+}
+
+#[test]
+fn two_explicit_outputs_emit_two_copies() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context asset.file(\"logo.svg\", output: \"a.svg\").url()\n\
+             #context asset.file(\"logo.svg\", output: \"b.svg\").url()",
+        ),
+        ("content/logo.svg", "<svg/>"),
+    ]);
+    let (_html, keys) = compile_asset_keys(&RenderWorld::new(&ctx).unwrap());
+
+    assert_eq!(keys, vec!["a.svg", "b.svg"]);
 }
 
 /// Two assets on one page both resolve, and `sass` fingerprints to `.css`.
@@ -98,7 +230,10 @@ fn png(width: u32, height: u32) -> Vec<u8> {
     let img = ::image::RgbImage::from_pixel(width, height, ::image::Rgb([10, 120, 200]));
     let mut buf = Vec::new();
     ::image::DynamicImage::ImageRgb8(img)
-        .write_to(&mut std::io::Cursor::new(&mut buf), ::image::ImageFormat::Png)
+        .write_to(
+            &mut std::io::Cursor::new(&mut buf),
+            ::image::ImageFormat::Png,
+        )
         .unwrap();
     buf
 }
@@ -122,7 +257,10 @@ fn image_resizes_and_transcodes() {
         "unexpected output path: {}",
         asset.output_path,
     );
-    assert!(html.contains(&asset.url), "page missing resolved url:\n{html}");
+    assert!(
+        html.contains(&asset.url),
+        "page missing resolved url:\n{html}"
+    );
 
     let bytes = asset.built.emit.read().unwrap();
     assert_eq!(
@@ -150,7 +288,11 @@ fn image_keeps_source_format_when_unspecified() {
 
     let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
     let asset = &assets[0];
-    assert!(asset.output_path.ends_with(".png"), "kept source format: {}", asset.output_path);
+    assert!(
+        asset.output_path.ends_with(".png"),
+        "kept source format: {}",
+        asset.output_path
+    );
     let decoded = ::image::load_from_memory(&asset.built.emit.read().unwrap()).unwrap();
     assert_eq!((decoded.width(), decoded.height()), (30, 30));
 }
@@ -196,7 +338,10 @@ fn native_image_routes_through_pipeline_with_dimensions() {
         html.contains("width=\"80\"") && html.contains("height=\"40\""),
         "expected intrinsic dimensions on <img>:\n{html}"
     );
-    assert!(html.contains(&assets[0].url), "page missing resolved url:\n{html}");
+    assert!(
+        html.contains(&assets[0].url),
+        "page missing resolved url:\n{html}"
+    );
 }
 
 /// `#set asset.image(format: "webp")` reaches *native* images too: the rule
@@ -397,14 +542,23 @@ fn set_rule_toggles_sass_minify() {
 #[test]
 fn bare_asset_in_markup_emits_and_vanishes() {
     let (ctx, _dir) = site(&[
-        ("content/main.typ", "before #asset.file(\"logo.svg\", output: \"logo.svg\") after"),
+        (
+            "content/main.typ",
+            "before #asset.file(\"logo.svg\", output: \"logo.svg\") after",
+        ),
         ("content/logo.svg", "<svg/>"),
     ]);
     let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
     assert_eq!(assets.len(), 1, "got {assets:?}");
     assert_eq!(assets[0].output_path, "logo.svg");
-    assert!(html.contains("before") && html.contains("after"), "missing text: {html}");
-    assert!(!html.contains("logo.svg"), "bare asset should render nothing: {html}");
+    assert!(
+        html.contains("before") && html.contains("after"),
+        "missing text: {html}"
+    );
+    assert!(
+        !html.contains("logo.svg"),
+        "bare asset should render nothing: {html}"
+    );
 }
 
 /// Two *separate* resolvers in one process (sharing comemo's global cache) must
@@ -497,7 +651,10 @@ fn editing_source_revalidates_inline_document() {
         .expect("inline child emitted on first compile")
         .html
         .clone();
-    assert!(child1.contains("v1-body"), "first child body missing:\n{child1}");
+    assert!(
+        child1.contains("v1-body"),
+        "first child body missing:\n{child1}"
+    );
 
     // Edit the source (distinct mtime), then recompile the same world like serve.
     std::thread::sleep(Duration::from_millis(10));
@@ -537,7 +694,10 @@ fn typst_inline_content_compiles_to_svg() {
     )]);
     let (html, _assets) = compile(&RenderWorld::new(&ctx).unwrap());
 
-    assert!(html.contains("<svg"), "inline content not rendered to svg:\n{html}");
+    assert!(
+        html.contains("<svg"),
+        "inline content not rendered to svg:\n{html}"
+    );
     assert!(
         !html.contains("__twyla-asset-pending__"),
         "placeholder leaked:\n{html}"
@@ -555,7 +715,10 @@ fn typst_path_source_compiles_to_pdf() {
             "content/main.typ",
             "#context asset.typst(\"/doc.typ\", format: \"pdf\").url()",
         ),
-        ("doc.typ", "= A Standalone Document\n\nWith a paragraph of text."),
+        (
+            "doc.typ",
+            "= A Standalone Document\n\nWith a paragraph of text.",
+        ),
     ]);
     let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
 
@@ -566,7 +729,10 @@ fn typst_path_source_compiles_to_pdf() {
         "unexpected output path: {}",
         asset.output_path,
     );
-    assert!(html.contains(&asset.url), "page missing resolved url:\n{html}");
+    assert!(
+        html.contains(&asset.url),
+        "page missing resolved url:\n{html}"
+    );
     let bytes = asset.built.emit.read().unwrap();
     assert!(
         bytes.starts_with(b"%PDF"),
@@ -585,7 +751,11 @@ fn typst_inline_content_compiles_to_png() {
     let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
 
     let asset = &assets[0];
-    assert!(asset.output_path.ends_with(".png"), "not png: {}", asset.output_path);
+    assert!(
+        asset.output_path.ends_with(".png"),
+        "not png: {}",
+        asset.output_path
+    );
     assert_eq!(
         ::image::guess_format(&asset.built.emit.read().unwrap()).unwrap(),
         ::image::ImageFormat::Png,
@@ -607,7 +777,11 @@ fn typst_path_source_compiles_to_html() {
     let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
 
     let asset = &assets[0];
-    assert!(asset.output_path.ends_with(".html"), "not html: {}", asset.output_path);
+    assert!(
+        asset.output_path.ends_with(".html"),
+        "not html: {}",
+        asset.output_path
+    );
     let body = String::from_utf8(asset.built.emit.read().unwrap().to_vec()).unwrap();
     assert!(body.contains("body text"), "html missing body:\n{body}");
 }
@@ -622,8 +796,14 @@ fn bare_typst_asset_emits_and_vanishes() {
     let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
     assert_eq!(assets.len(), 1, "got {assets:?}");
     assert_eq!(assets[0].output_path, "icon.svg");
-    assert!(html.contains("before") && html.contains("after"), "missing text: {html}");
-    assert!(!html.contains("icon.svg"), "bare asset should render nothing: {html}");
+    assert!(
+        html.contains("before") && html.contains("after"),
+        "missing text: {html}"
+    );
+    assert!(
+        !html.contains("icon.svg"),
+        "bare asset should render nothing: {html}"
+    );
 }
 
 /// Editing a typst asset's source file (or an import) revalidates it to a new
@@ -659,7 +839,10 @@ fn editing_typst_source_revalidates_to_new_fingerprint() {
     let url2 = outputs2.assets().next().unwrap().output_path.clone();
     let html2 = outputs2.docs().next().unwrap().html.clone();
 
-    assert_ne!(url1, url2, "fingerprint did not change after editing the typst source");
+    assert_ne!(
+        url1, url2,
+        "fingerprint did not change after editing the typst source"
+    );
     assert!(
         !html2.contains("__twyla-asset-pending__"),
         "placeholder leaked after edit:\n{html2}"

@@ -448,9 +448,7 @@ fn resolve_outputs(resolver: &mut Resolver, engine: &mut Engine) -> SourceResult
             Context::none().track(),
             [Str::from(asset.built.sha256_hex().as_str()), ext, stem],
         )?;
-        let path: Str = value
-            .cast()
-            .map_err(|err| hinted_error(typst::syntax::Span::detached(), err))?;
+        let path: Str = value.cast().map_err(|err| hinted_error(asset.span, err))?;
         Ok(path.to_string())
     })
 }

@@ -278,7 +278,9 @@ fn build_emits_fingerprinted_sass_and_file_assets() {
     );
 
     assert!(
-        files.iter().any(|f| f.starts_with("robots-") && f.ends_with(".txt")),
+        files
+            .iter()
+            .any(|f| f.starts_with("robots-") && f.ends_with(".txt")),
         "verbatim file asset not emitted: {files:?}",
     );
 }
@@ -344,7 +346,9 @@ fn referenced_image_is_fingerprinted() {
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect();
     assert!(
-        files.iter().any(|f| f.starts_with("pic-") && f.ends_with(".svg")),
+        files
+            .iter()
+            .any(|f| f.starts_with("pic-") && f.ends_with(".svg")),
         "no fingerprinted pic-*.svg emitted: {files:?}",
     );
 
@@ -355,8 +359,14 @@ fn referenced_image_is_fingerprinted() {
         html.contains(&format!("{BASE_URL}/assets/pic-")) && html.contains(".svg\""),
         "img src not rewritten to a fingerprinted asset URL:\n{html}",
     );
-    assert!(html.contains("alt=\"a red square\""), "alt not passed through:\n{html}");
-    assert!(!html.contains("data:image"), "image was base64-inlined:\n{html}");
+    assert!(
+        html.contains("alt=\"a red square\""),
+        "alt not passed through:\n{html}"
+    );
+    assert!(
+        !html.contains("data:image"),
+        "image was base64-inlined:\n{html}"
+    );
     assert!(
         !html.contains("__twyla-asset-pending__"),
         "asset placeholder leaked (non-convergence):\n{html}",

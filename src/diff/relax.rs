@@ -63,7 +63,10 @@ impl RelaxConfig {
 
         // IgnoreEntirely: collapse to an empty placeholder (tag kept so a
         // genuine tag mismatch at this position still shows).
-        if rules.iter().any(|r| matches!(r, RelaxationRule::IgnoreEntirely)) {
+        if rules
+            .iter()
+            .any(|r| matches!(r, RelaxationRule::IgnoreEntirely))
+        {
             return Element {
                 name: el.name.clone(),
                 attrs: BTreeMap::new(),
@@ -143,9 +146,7 @@ impl Matcher {
             Matcher::TagAttr { tag, attr, value } => {
                 &el.name == tag && el.attrs.get(attr) == Some(value)
             }
-            Matcher::TagAttrExists { tag, attr } => {
-                &el.name == tag && el.attrs.contains_key(attr)
-            }
+            Matcher::TagAttrExists { tag, attr } => &el.name == tag && el.attrs.contains_key(attr),
             Matcher::AnyTagAttrExists { attr } => el.attrs.contains_key(attr),
         }
     }

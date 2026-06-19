@@ -236,10 +236,7 @@ mod tests {
     fn file_links_keep_extension() {
         assert_eq!(r("/resume.pdf").as_deref(), Some("resume.pdf"));
         assert_eq!(r("/site.css").as_deref(), Some("site.css"));
-        assert_eq!(
-            r("/scripts/site.js").as_deref(),
-            Some("scripts/site.js")
-        );
+        assert_eq!(r("/scripts/site.js").as_deref(), Some("scripts/site.js"));
     }
 
     #[test]

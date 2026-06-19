@@ -38,6 +38,9 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 
+use super::{AssetSpec, Built, OutputReq, Upstream, emit_or_request, sha256};
+use crate::project::TwylaContext;
+use crate::render::Emit;
 use comemo::Tracked;
 use ecow::{EcoString, eco_format, eco_vec};
 use typst::diag::{FileResult, HintedStrResult, SourceDiagnostic, SourceResult, Warned};
@@ -56,9 +59,6 @@ use typst_html::HtmlDocument;
 use typst_layout::PagedDocument;
 use typst_library::Feature;
 use typst_pdf::PdfOptions;
-use super::{AssetSpec, Built, OutputReq, Upstream, emit_or_request, sha256};
-use crate::project::TwylaContext;
-use crate::render::Emit;
 
 /// Compile a typst document (content or a project `.typ` file) to a
 /// fingerprinted asset.
@@ -122,7 +122,12 @@ fn output(elem: &Packed<TypstAsset>, styles: StyleChain) -> HintedStrResult<Outp
 
 /// Default show: a bare `asset.typst(..)` emits and renders nothing.
 pub const SHOW_RULE: ShowFn<TypstAsset> = |elem, engine, styles| {
-    emit_or_request(engine, spec(&elem, styles), elem.span(), output(&elem, styles))
+    emit_or_request(
+        engine,
+        spec(elem, styles),
+        elem.span(),
+        output(elem, styles),
+    )
 };
 
 /// The `source` field's value: a path to a project `.typ` file, or an inline
@@ -279,13 +284,19 @@ pub(crate) fn build(
 /// Compile the sub-document to a [`PagedDocument`] (svg/png/pdf), discarding
 /// warnings (there is no engine sink to route them to from an asset build).
 fn compile_paged(world: &TypstWorld) -> SourceResult<PagedDocument> {
-    let Warned { output, warnings: _ } = typst::compile::<PagedDocument>(world);
+    let Warned {
+        output,
+        warnings: _,
+    } = typst::compile::<PagedDocument>(world);
     output
 }
 
 /// Compile the sub-document to an [`HtmlDocument`] (html format).
 fn compile_html(world: &TypstWorld) -> SourceResult<HtmlDocument> {
-    let Warned { output, warnings: _ } = typst::compile::<HtmlDocument>(world);
+    let Warned {
+        output,
+        warnings: _,
+    } = typst::compile::<HtmlDocument>(world);
     output
 }
 
@@ -296,9 +307,9 @@ fn collect_upstream(reads: HashSet<FileId>, ctx: &TwylaContext) -> Vec<Upstream>
     reads
         .into_iter()
         .filter_map(|id| match id.root() {
-            VirtualRoot::Project => {
-                Some(Upstream::new_lazy(ctx.root.join(id.vpath().get_without_slash())))
-            }
+            VirtualRoot::Project => Some(Upstream::new_lazy(
+                ctx.root.join(id.vpath().get_without_slash()),
+            )),
             VirtualRoot::Package(_) => None,
         })
         .collect()
@@ -306,7 +317,10 @@ fn collect_upstream(reads: HashSet<FileId>, ctx: &TwylaContext) -> Vec<Upstream>
 
 /// A spanned error from any `Display` payload.
 fn err_at(span: Span, msg: impl std::fmt::Display) -> ecow::EcoVec<SourceDiagnostic> {
-    eco_vec![SourceDiagnostic::error(span, EcoString::from(msg.to_string()))]
+    eco_vec![SourceDiagnostic::error(
+        span,
+        EcoString::from(msg.to_string())
+    )]
 }
 
 /// A [`World`] for an `asset.typst` sub-compile: serves a stock library + a

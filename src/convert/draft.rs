@@ -8,9 +8,9 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 
-use crate::convert::{ConvertMode, SourceFormat};
 use crate::convert::report::Finding;
 use crate::convert::zola::MappedPage;
+use crate::convert::{ConvertMode, SourceFormat};
 use crate::import::{import_hugo_md, import_md};
 use crate::project::TwylaContext;
 
@@ -75,9 +75,12 @@ fn write_draft(page: &MappedPage, source: SourceFormat) -> io::Result<()> {
     let src = fs::read_to_string(&page.md_path)?;
     let import = match source {
         SourceFormat::Zola => import_md(&src, &page.kind, page.output_override.as_deref()),
-        SourceFormat::Hugo => {
-            import_hugo_md(&src, &page.kind, page.output_override.as_deref(), &page.route)
-        }
+        SourceFormat::Hugo => import_hugo_md(
+            &src,
+            &page.kind,
+            page.output_override.as_deref(),
+            &page.route,
+        ),
     };
     let draft = import.map_err(|e| {
         io::Error::new(
@@ -171,7 +174,8 @@ mod tests {
         let typ = dir.path().join("foo.typ");
         let pages = vec![page(md, typ.clone(), None)];
 
-        let findings = ensure_drafts(&ctx, &pages, ConvertMode::Generate, SourceFormat::Zola).unwrap();
+        let findings =
+            ensure_drafts(&ctx, &pages, ConvertMode::Generate, SourceFormat::Zola).unwrap();
         assert!(typ.exists());
         assert!(matches!(findings[0], Finding::DraftWritten { .. }));
         assert!(matches!(findings[1], Finding::Note { .. }));
@@ -188,7 +192,8 @@ mod tests {
         let typ = dir.path().join("foo.typ");
         let pages = vec![page(md, typ.clone(), None)];
 
-        let findings = ensure_drafts(&ctx, &pages, ConvertMode::Verify, SourceFormat::Zola).unwrap();
+        let findings =
+            ensure_drafts(&ctx, &pages, ConvertMode::Verify, SourceFormat::Zola).unwrap();
         assert!(!typ.exists());
         assert!(!ctx.root.join("templates/lib.typ").exists()); // verify writes nothing
         assert!(matches!(&findings[0], Finding::DraftMissing { .. }));
@@ -204,7 +209,8 @@ mod tests {
         std::fs::write(&typ, "// hand-written\n").unwrap();
         let pages = vec![page(md, typ.clone(), None)];
 
-        let findings = ensure_drafts(&ctx, &pages, ConvertMode::Generate, SourceFormat::Zola).unwrap();
+        let findings =
+            ensure_drafts(&ctx, &pages, ConvertMode::Generate, SourceFormat::Zola).unwrap();
         assert!(findings.is_empty());
         assert_eq!(std::fs::read_to_string(&typ).unwrap(), "// hand-written\n");
     }
@@ -217,9 +223,14 @@ mod tests {
         let md = write_md(dir.path(), "foo.md");
         let typ = dir.path().join("foo.typ");
         std::fs::write(&typ, "// hand-written\n").unwrap();
-        let pages = vec![page(md, typ.clone(), Some("foo-bar/index.html".to_string()))];
+        let pages = vec![page(
+            md,
+            typ.clone(),
+            Some("foo-bar/index.html".to_string()),
+        )];
 
-        let findings = ensure_drafts(&ctx, &pages, ConvertMode::Overwrite, SourceFormat::Zola).unwrap();
+        let findings =
+            ensure_drafts(&ctx, &pages, ConvertMode::Overwrite, SourceFormat::Zola).unwrap();
         assert!(matches!(findings[0], Finding::DraftWritten { .. }));
         let written = std::fs::read_to_string(&typ).unwrap();
         assert!(written.contains(r#"output: "foo-bar/index.html","#));

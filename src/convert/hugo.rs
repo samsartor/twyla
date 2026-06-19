@@ -32,8 +32,8 @@ fn collect_md(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     for entry in entries {
         let entry = entry.map_err(|e| format!("scan error: {e}"))?;
         let path = entry.path();
-        let meta = std::fs::metadata(&path)
-            .map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
+        let meta =
+            std::fs::metadata(&path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
         if meta.is_dir() {
             // Skip directories starting with `_`: Hugo treats these as page-resource
             // containers (e.g. `_downloads/`, `_images/`), not routed sections.
@@ -49,7 +49,11 @@ fn collect_md(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-fn map_page(ctx: &TwylaContext, content_dir: &Path, md_path: PathBuf) -> Result<MappedPage, String> {
+fn map_page(
+    ctx: &TwylaContext,
+    content_dir: &Path,
+    md_path: PathBuf,
+) -> Result<MappedPage, String> {
     let rel = md_path
         .strip_prefix(content_dir)
         .map_err(|_| format!("{} is not under content/", md_path.display()))?;
@@ -74,9 +78,7 @@ fn map_page(ctx: &TwylaContext, content_dir: &Path, md_path: PathBuf) -> Result<
         format!("{stem}.typ")
     };
     let typ_path = match rel.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => {
-            content_dir.join(parent).join(&typ_name)
-        }
+        Some(parent) if !parent.as_os_str().is_empty() => content_dir.join(parent).join(&typ_name),
         _ => content_dir.join(&typ_name),
     };
 

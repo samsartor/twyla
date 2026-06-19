@@ -6,6 +6,9 @@
 //! drive it through the asset system. Showing a bare `FileAsset` emits the asset
 //! and renders nothing.
 
+use super::{AssetSpec, Built, OutputReq, Upstream, emit_or_request, resolve_path, sha256};
+use crate::project::TwylaContext;
+use crate::render::Emit;
 use comemo::Tracked;
 use ecow::{EcoString, eco_vec};
 use typst::World;
@@ -13,9 +16,6 @@ use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{Packed, PathOrStr, ShowFn, StyleChain, elem, func, scope};
 use typst::loading::Encoding;
 use typst::syntax::{FileId, Span};
-use super::{AssetSpec, Built, OutputReq, Upstream, emit_or_request, resolve_path, sha256};
-use crate::project::TwylaContext;
-use crate::render::Emit;
 
 /// Reference a project file as an asset, copied verbatim and fingerprinted.
 ///
@@ -50,7 +50,12 @@ fn output(elem: &Packed<FileAsset>, styles: StyleChain) -> HintedStrResult<Outpu
 
 /// Default show: a bare `asset.file(..)` emits and renders nothing.
 pub const SHOW_RULE: ShowFn<FileAsset> = |elem, engine, styles| {
-    emit_or_request(engine, spec(&elem, styles), elem.span(), output(&elem, styles))
+    emit_or_request(
+        engine,
+        spec(elem, styles),
+        elem.span(),
+        output(elem, styles),
+    )
 };
 
 pub(crate) fn build(

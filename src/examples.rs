@@ -24,7 +24,9 @@ use comemo::Tracked;
 use ecow::EcoString;
 use typst::diag::{FileResult, SourceResult, Trace, Tracepoint};
 use typst::engine::Engine;
-use typst::foundations::{Bytes, Content, Datetime, Duration, Module, NativeElement, Packed, Scope, func};
+use typst::foundations::{
+    Bytes, Content, Datetime, Duration, Module, NativeElement, Packed, Scope, func,
+};
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook, RawContent, RawElem};
 use typst::utils::LazyHash;

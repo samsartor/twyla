@@ -34,9 +34,9 @@ use typst_kit::watcher::Watcher;
 use owo_colors::{AnsiColors, OwoColorize, Stream, Style};
 
 use crate::asset::ResolvedAsset;
-use crate::resolver::Resolver;
 use crate::project::TwylaContext;
 use crate::render::{Emit, Output, Outputs, RenderError, RenderWorld};
+use crate::resolver::Resolver;
 
 /// All of serve's own logging goes to stderr; color follows that stream's tty.
 const OUT: Stream = Stream::Stderr;

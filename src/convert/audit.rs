@@ -213,7 +213,13 @@ fn attr_diff_detail(exp: &BTreeMap<String, String>, act: &BTreeMap<String, Strin
     keys.dedup();
     keys.into_iter()
         .filter(|k| exp.get(*k) != act.get(*k))
-        .map(|k| format!("{k}: {} vs {}", show_attr(exp.get(k)), show_attr(act.get(k))))
+        .map(|k| {
+            format!(
+                "{k}: {} vs {}",
+                show_attr(exp.get(k)),
+                show_attr(act.get(k))
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -259,7 +265,14 @@ mod tests {
             tree: parse_html(r#"<a href="/resume.pdf">resume</a><a href="/guis-1">self</a>"#),
         }];
 
-        let findings = run(&ctx, &twyla_pages, &gt_pages, &twyla_manifest, &gt_manifest, None);
+        let findings = run(
+            &ctx,
+            &twyla_pages,
+            &gt_pages,
+            &twyla_manifest,
+            &gt_manifest,
+            None,
+        );
 
         // One broken twyla link (guis-4), one dropped navigable (resume.pdf).
         let unreachable: Vec<_> = findings
@@ -306,7 +319,14 @@ mod tests {
             tree: parse_html(r#"<a href="/dissertation.pdf">thesis</a>"#),
         }];
 
-        let findings = run(&ctx, &twyla_pages, &gt_pages, &twyla_manifest, &gt_manifest, None);
+        let findings = run(
+            &ctx,
+            &twyla_pages,
+            &gt_pages,
+            &twyla_manifest,
+            &gt_manifest,
+            None,
+        );
 
         // Broken in both builds → neither a self-containment nor a dropped-URL
         // finding.
@@ -339,7 +359,14 @@ mod tests {
             tree: parse_html(r#"<a href="/atom.xml">feed</a>"#),
         }];
 
-        let findings = run(&ctx, &twyla_pages, &gt_pages, &twyla_manifest, &gt_manifest, None);
+        let findings = run(
+            &ctx,
+            &twyla_pages,
+            &gt_pages,
+            &twyla_manifest,
+            &gt_manifest,
+            None,
+        );
 
         // Exactly one feed finding (deduped across both checks), and it's a Warn.
         let feeds: Vec<_> = findings

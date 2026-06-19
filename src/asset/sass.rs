@@ -11,6 +11,9 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 
+use super::{AssetSpec, Built, OutputReq, Upstream, emit_or_request, resolve_path, sha256};
+use crate::project::TwylaContext;
+use crate::render::Emit;
 use comemo::Tracked;
 use ecow::{EcoString, eco_format, eco_vec};
 use typst::World;
@@ -18,9 +21,6 @@ use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{Bytes, Packed, PathOrStr, ShowFn, StyleChain, elem, func, scope};
 use typst::loading::Encoding;
 use typst::syntax::{FileId, Span};
-use super::{AssetSpec, Built, OutputReq, Upstream, emit_or_request, resolve_path, sha256};
-use crate::project::TwylaContext;
-use crate::render::Emit;
 
 /// Compile a Sass/SCSS file to a fingerprinted CSS asset.
 ///
@@ -68,7 +68,12 @@ fn output(elem: &Packed<SassAsset>, styles: StyleChain) -> HintedStrResult<Outpu
 
 /// Default show: a bare `asset.sass(..)` emits and renders nothing.
 pub const SHOW_RULE: ShowFn<SassAsset> = |elem, engine, styles| {
-    emit_or_request(engine, spec(&elem, styles), elem.span(), output(&elem, styles))
+    emit_or_request(
+        engine,
+        spec(elem, styles),
+        elem.span(),
+        output(elem, styles),
+    )
 };
 
 pub(crate) fn build(
@@ -80,7 +85,10 @@ pub(crate) fn build(
 ) -> SourceResult<Built> {
     let on_disk = ctx.root.join(file.vpath().get_without_slash());
     let (on_disk, src) = Upstream::new_read_string(on_disk).map_err(|err| {
-        eco_vec![SourceDiagnostic::error(span, EcoString::from(err.to_string()))]
+        eco_vec![SourceDiagnostic::error(
+            span,
+            EcoString::from(err.to_string())
+        )]
     })?;
     let stem = on_disk
         .path
@@ -109,9 +117,8 @@ pub(crate) fn build(
     if let Some(parent) = on_disk.path.parent() {
         options = options.load_path(parent);
     }
-    let css = grass::from_string(src.to_string(), &options).map_err(|e| {
-        eco_vec![SourceDiagnostic::error(span, eco_format!("sass: {e}"))]
-    })?;
+    let css = grass::from_string(src.to_string(), &options)
+        .map_err(|e| eco_vec![SourceDiagnostic::error(span, eco_format!("sass: {e}"))])?;
 
     // Upstream = the imports grass read + the entry (read via the World, so not
     // seen by the recording fs).

@@ -35,7 +35,9 @@ use typst_library::visualize::{
     ExchangeFormat, ImageElem, ImageFormat, RasterFormat, VectorFormat,
 };
 
-use crate::asset::{AssetSpec, ImageSource, OutputReq, image, resolve_image_or_request, resolve_or_request};
+use crate::asset::{
+    AssetSpec, ImageSource, OutputReq, image, resolve_image_or_request, resolve_or_request,
+};
 
 /// Install twyla's native HTML rules into a freshly built library's
 /// rule map. Call from [`crate::prelude::install`] after
@@ -52,10 +54,9 @@ pub fn install(rules: &mut NativeRuleMap) {
     rules.register(Target::Html, crate::document::RENDER_INTROSPECTION);
     rules.register(Target::Paged, crate::document::RENDER_INTROSPECTION);
 
-    // Assets are consumed via `.url()`/`.read()` (which discard the element), so
-    // they never reach realization in normal use. A bare `#asset.file(..)` left
-    // in markup *does* — these rules turn that into a helpful error instead of a
-    // silent mis-render. `register`: twyla owns these elements.
+    // Assets are usually consumed via `.url()`/`.read()` (which discard the
+    // element). A bare `#asset.file(..)` left in markup still requests emission
+    // and vanishes, document-style. `register`: twyla owns these elements.
     rules.register(Target::Html, crate::asset::file::SHOW_RULE);
     rules.register(Target::Paged, crate::asset::file::SHOW_RULE);
     rules.register(Target::Html, crate::asset::sass::SHOW_RULE);
@@ -222,7 +223,10 @@ const IMAGE_RULE: ShowFn<ImageElem> = |elem, engine, styles| {
                 ext: image_ext(&loaded.data),
             },
         };
-        (resolve_or_request(engine, spec, span, OutputReq::Auto), None)
+        (
+            resolve_or_request(engine, spec, span, OutputReq::Auto),
+            None,
+        )
     };
 
     let mut img = HtmlElem::new(tag::img).with_attr(attr::src, src.as_str());

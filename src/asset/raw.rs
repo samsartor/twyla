@@ -7,9 +7,9 @@
 //! already in memory (typst loaded them), so this just fingerprints and wraps
 //! them — no World, no disk read.
 
+use super::{Built, sha256};
 use ecow::EcoString;
 use typst::foundations::Bytes;
-use super::{Built, sha256};
 
 /// Wrap already-loaded bytes as a verbatim asset. No `upstream`: the bytes are
 /// inline in (or derived from) the source, which the typst `World` already
