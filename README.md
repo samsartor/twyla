@@ -152,7 +152,7 @@ Check out this pretty #context html.img(src: asset.file("icon.svg").url()) icon.
 
 Ok, so what is happening there in that last example? Twyla is rendering a `circle()` as an SVG, writing that SVG to a generated path in your `public/` folder, and then providing the URL to reference as the src of an image _OR_ inline as an `<svg>` element.
 
-You can find an even cooler example here on Twyla’s own website. See little fireplace tongs we use as an icon? Those are drawn procedurally in a [Cetz](https://cetz-package.github.io) canvas, and then rendered by Twyla as part of the theme, in order to generate the actual favicon URL!
+You can find an even cooler example here on Twyla’s own website. See the little fireplace tongs we use as an icon? Those are drawn procedurally in a [Cetz](https://cetz-package.github.io) canvas, and then rendered by Twyla as part of the theme, in order to generate the actual favicon URL!
 
 ## Customization
 

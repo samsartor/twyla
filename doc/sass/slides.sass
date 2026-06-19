@@ -1,9 +1,154 @@
-img
-	width: 100%
+// Twyla slide deck. Full-screen, projector-first: one slide visible at a time
+// (JS toggles `.is-active`; see templates/slides.js), big type that scales with
+// the viewport, and a progress bar pinned to the bottom edge. Loaded on top of
+// main.sass, so it inherits the theme variables and prose rules.
+
+html, body
+	height: 100%
+
+body
+	overflow: hidden
+
+.deck
+	position: fixed
+	inset: 0
+	display: flex
+	flex-direction: column
+	background: var(--bg)
+	// Projector typography: scale with the viewport so it reads from the back
+	// of the room. Every `em` below is relative to this.
+	font-size: clamp(18px, 2.4vw, 34px)
+
+// ── Stage & slides ──────────────────────────────────────────────────────────
+
+.deck-stage
+	position: relative
+	flex: 1
+	min-height: 0
+
+.slide
+	position: absolute
+	inset: 0
+	display: flex
+	flex-direction: column
+	padding: 5vmin 8vmin 8vmin
+	overflow: hidden
+	// Hidden by default; the active slide fades in. All slides are stacked, so
+	// this is a crossfade rather than a reflow.
+	opacity: 0
+	visibility: hidden
+	transition: opacity 0.25s ease
+
+.slide.is-active
+	opacity: 1
+	visibility: visible
+
+.deck .slide h1
+	font-family: 'Iosevka Web', monospace
+	font-size: 2.4em
+	letter-spacing: -0.02em
+	line-height: 1.1
+	margin: 0 0 0.35em
+	padding: 0
+	border: none
+
+.deck .slide h2
+	font-size: 1.6em
+	line-height: 1.2
+	margin: 0 0 0.4em
+	padding: 0
+	border: none
+
+.deck .slide h3
+	font-size: 1.2em
+	margin: 0 0 0.3em
+
+.deck .slide p
+	margin: 0.3em 0
+
+.deck .slide ul, .deck .slide ol
+	margin: 0.3em 0
+	padding-left: 1.1em
+
+.deck .slide li
+	margin: 0.25em 0
+
+.deck .slide img
+	display: block
+	width: auto
 	height: auto
+	max-width: 100%
+	max-height: 58vh
+	margin: 0.5em auto
+	border-radius: 0.4rem
+
+.deck .slide pre, .deck .slide .boxdraw
+	font-size: 0.7em
+	max-height: 60vh
+	overflow: auto
+	margin: 0.5em 0
+
+// ── Progress bar ──────────────────────────────────────────────────────────────
+
+.deck-progress
+	position: absolute
+	left: 0
+	right: 0
+	bottom: 0
+	height: 0.5vh
+	min-height: 3px
+	background: var(--border)
+
+.deck-progress-fill
+	height: 100%
+	width: 0
+	background: var(--accent)
+	transition: width 0.25s ease
+
+// ── HUD: counter + nav buttons ────────────────────────────────────────────────
+
+.deck-hud
+	position: absolute
+	right: 1.6vmin
+	bottom: 1.8vh
+	display: flex
+	align-items: center
+	gap: 0.6rem
+	font-size: 0.8rem
+	color: var(--muted)
+	opacity: 0.45
+	transition: opacity 0.2s ease
+
+.deck-hud:hover
+	opacity: 1
+
+.deck-counter
+	font-family: 'Iosevka Web', monospace
+	font-variant-numeric: tabular-nums
+
+.deck-nav
+	background: none
+	border: 1px solid var(--border)
+	border-radius: 0.35rem
+	color: var(--fg)
+	cursor: pointer
+	font-size: 1rem
+	line-height: 1
+	padding: 0.1rem 0.55rem
+	&:hover
+		border-color: var(--accent)
+		color: var(--accent)
+
+// ── Layout helpers (from slides.typ) ──────────────────────────────────────────
 
 .side-by-side
 	display: grid
+	gap: 1.5em
+	align-items: start
+	width: 100%
+
+.side-by-side h1
+	font-size: 1.5em
 
 .centering
 	display: flex
@@ -12,6 +157,35 @@ img
 	align-items: center
 	justify-content: center
 
+// Pinned to the bottom of the slide (margin-top: auto in the flex column),
+// small and muted — for sources and attributions.
+.postscript
+	margin-top: auto
+	padding-top: 1em
+	font-size: 0.6em
+	color: var(--muted)
+
 .thought
-	// Looks terrible
-	border-left: solid 4px blue
+	font-size: 1.5em
+	font-style: italic
+	line-height: 1.4
+	max-width: 18em
+	padding-left: 0.8em
+	border-left: 4px solid var(--accent)
+
+.rendered
+	background: var(--code-bg)
+	color: var(--code-fg)
+	// background: #e4e4e4
+	padding: 1rem 1.15rem
+	border-radius: 0.6rem
+	overflow-x: auto
+	line-height: 1.55
+	font-size: 0.6em
+	margin: 1rem 0
+
+	th
+		color: var(--fg)
+
+	code
+		color: var(--fg)
