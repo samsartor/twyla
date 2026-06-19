@@ -1,3 +1,7 @@
+#import "@preview/frame-it:2.0.0": *
+#import "/grabber.typ": grabber-canvas, grabber-grad
+#import "boxdraw.typ": boxdraw
+
 // Site chrome for the Twyla docs: the `<head>`, the top header bar (brand +
 // nav + theme toggle), the footer, and the home-page hero. The page templates
 // in `lib.typ` stitch these around a body.
@@ -24,12 +28,10 @@ try {
   if (saved) document.documentElement.style.colorScheme = saved;
 } catch (e) {}"
 
-#import "/grabber.typ": grabber-canvas, grabber-grad
-
 // The `<head>`: charset/viewport, title + description from this page's
 // `document` metadata, the Iosevka fonts, the compiled stylesheet, and the
 // theme script.
-#let site-head = context html.elem("head", {
+#let site-head(slides: false) = context html.elem("head", {
   html.elem("meta", attrs: (charset: "utf-8"))
   html.elem("meta", attrs: (name: "viewport", content: "width=device-width, initial-scale=1"))
 
@@ -60,6 +62,9 @@ try {
   html.elem("link", attrs: (rel: "stylesheet", href: "https://bin.samsartor.com/iosevka_27.3.3/iosevka.css"))
   html.elem("link", attrs: (rel: "stylesheet", href: "https://bin.samsartor.com/iosevka_27.3.3/iosevka-aile.css"))
   html.elem("link", attrs: (rel: "stylesheet", href: asset.sass("/sass/main.sass").url()))
+  if slides {
+    html.elem("link", attrs: (rel: "stylesheet", href: asset.sass("/sass/slides.sass").url()))
+  }
   html.elem("script", theme-script)
   html.elem("script", attrs: (data-goatcounter: "https://twyla.goatcounter.com/count", async: "", src: "//gc.zgo.at/count.js"))
 })
@@ -103,3 +108,23 @@ try {
   html.elem("h1", attrs: (class: "hero-title"), "Twyla")
   html.elem("p", attrs: (class: "hero-tagline"), [The static site generator where everything is Typst.])
 })
+
+#let note = frame("Note", blue)
+
+// Content show rules shared by every page: callout quotes, the `tree` and
+// `example` code fences, and the (always-dark) syntax theme for code blocks.
+//
+// TODO: code-block colors are baked in as inline `<span style="color:…">` by
+// typst's HTML export (see typst-html html_span_filled), so they can't follow
+// the light/dark toggle. We pin code panels to a dark theme for now; revisit
+// once twyla ships its own CSS-class-based `raw` show rule.
+#let content-rules(body) = {
+  show quote.where(block: true): it => note(it.body)
+  show raw.where(lang: "tree"): it => boxdraw(it.text)
+  show raw.where(lang: "boxdraw"): it => boxdraw(it.text)
+  show: frame-style(styles.hint)
+  // `--test-examples`: compile-check each `example` block and highlight as typst.
+  show raw.where(lang: "example"): twyla-examples.compile-example
+  set raw(theme: "/templates/Dracula.tmTheme")
+  body
+}
