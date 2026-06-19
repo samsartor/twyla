@@ -38,6 +38,15 @@ fn native_asset_builtin_resolves_with_zero_imports() {
         page.contains("href=\"/assets/logo-") && page.contains(".svg\""),
         "native asset builtin did not resolve; got:\n{page}",
     );
+    // Twyla extends Typst's existing `sys` module so templates can detect that
+    // they are running inside Twyla and inspect the Twyla version.
+    assert!(
+        page.contains("Twyla runtime detected:")
+            && page.contains(">true<")
+            && page.contains(env!("CARGO_PKG_VERSION")),
+        "sys.twyla_version was not visible through sys; got:\n{page}",
+    );
+
     // And a bare content file still produced a full document shell.
     assert!(page.contains("<html"), "no document shell for bare content");
     assert!(page.contains("<body>"), "no body for bare content");

@@ -99,13 +99,6 @@
     if "default" in p {
       html.span(class: "param-default", "= " + repr(p.default))
     }
-    let flags = ()
-    if p.required { flags.push("required") }
-    if p.positional { flags.push("positional") }
-    if p.named { flags.push("named") }
-    if p.variadic { flags.push("variadic") }
-    if p.settable { flags.push("settable") }
-    for f in flags { html.span(class: "param-flag", f) }
   })
   // The baked `///` docs are twyla's own builtin comments, authored as typst
   // markup — eval as markup so prose, lists, inline code, fenced blocks, and
@@ -148,7 +141,21 @@
   receiver: receiver,
 )
 
-#let render-item(name, value, depth: 2, prefix: "", recurse-scope: true, display: none, receiver: "") = {
+// `twyla-reflect.describe` only knows about native functions, types, and
+// symbols. A few reference entries are plain values (currently
+// `sys.twyla_version`), so render those explicitly instead of silently dropping
+// them when `describe` returns `none`.
+#let is-reference-value(value) = type(value) == version
+
+#let render-value-signature(name, value) = html.elem("pre", attrs: (class: "signature"), {
+  html.span(class: "sig-fn", name)
+  ": "
+  type-pill(repr(type(value)))
+  " = "
+  repr(value)
+})
+
+#let render-item(name, value, depth: 2, prefix: "", recurse-scope: true, display: none, receiver: "", docs: none) = {
   let anchor = item-anchor(name, prefix)
   let head-label = if display == none { name } else { display }
 
@@ -174,7 +181,14 @@
   }
 
   let d = describe(value)
-  if d == none { return }
+  if d == none {
+    if is-reference-value(value) {
+      ref-heading(head-label, anchor, depth)
+      render-value-signature(head-label, value)
+      if docs != none { docs } else { render-value-docs(name, value) }
+    }
+    return
+  }
 
   ref-heading(head-label, anchor, depth)
   render-signature(d, receiver: receiver)
@@ -230,8 +244,8 @@
     }
   } else {
     let d = describe(value)
-    if d == none { return () }
-    if recurse-scope and d.at("scope", default: none) != none {
+    if d == none and not is-reference-value(value) { return () }
+    if d != none and recurse-scope and d.at("scope", default: none) != none {
       for (member-name, member) in dictionary(d.scope) {
         children += toc-entries(member-name, member, prefix: anchor, ..method-style(member-name, d.name + "."))
       }
@@ -249,15 +263,15 @@
   }
 })
 
-// `items` is an array of (name, value) pairs — the binding name plus the
-// reflected builtin.
+// `items` is an array of (name, value[, docs]) entries — the binding name plus
+// the reflected builtin, with optional prose for plain value entries.
 #let reference-toc(items) = {
   html.div(class: "toc-title", "Reference")
-  toc-list(items.map(((name, value)) => toc-entries(name, value)).join())
+  toc-list(items.map(item => toc-entries(item.at(0), item.at(1))).join())
 }
 
 #let reference-body(items) = {
   html.elem("h1", attrs: (id: "reference"), "Reference")
   [The functions and types Twyla adds to Typst's standard library.]
-  for (name, value) in items { render-item(name, value) }
+  for item in items { render-item(item.at(0), item.at(1), docs: item.at(2, default: none)) }
 }

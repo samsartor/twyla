@@ -23,6 +23,13 @@
   ("asset", asset),
   ("raw-html", raw-html),
   ("plain-text", plain-text),
+  ("sys.twyla-version", sys.twyla-version, [
+    The version of Twyla currently compiling the document, as a `version` value. The
+    field can be used to detect if Twyla is being used:
+    ```example
+    #if "twyla-version" in dictionary(sys) [ Hello from Twyla ] else [ Hello from Typst ]
+    ```
+  ]),
 )
 
 #page-shell(

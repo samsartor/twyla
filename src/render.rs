@@ -14,7 +14,9 @@ use std::{fmt, fs, io};
 use iddqd::{IdHashItem, IdHashMap, id_upcast};
 
 use typst::diag::{FileError, FileResult, SourceDiagnostic, Warned};
-use typst::foundations::{Bytes, Datetime, Dict, Duration, IntoValue};
+use typst::foundations::{
+    Binding, Bytes, Datetime, Dict, Duration, IntoValue, Module, Scope, Value, Version,
+};
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
@@ -530,6 +532,7 @@ fn duplication_error(err: iddqd::errors::DuplicateItem<Output, &Output>) -> (Ren
 pub fn install_stdlib(library: &mut Library, reflect: bool, test_examples: bool) {
     crate::rules::install(&mut library.rules);
     let global = library.global.scope_mut();
+    install_sys(global);
     crate::document::install(global);
     crate::asset::install(global);
     crate::content::install(global);
@@ -539,6 +542,22 @@ pub fn install_stdlib(library: &mut Library, reflect: bool, test_examples: bool)
     if test_examples {
         crate::examples::install(global);
     }
+}
+
+/// Add Twyla-specific metadata to Typst's existing `sys` module.
+fn install_sys(global: &mut Scope) {
+    let version = Version::from_iter([
+        env!("CARGO_PKG_VERSION_MAJOR").parse::<u32>().unwrap(),
+        env!("CARGO_PKG_VERSION_MINOR").parse::<u32>().unwrap(),
+        env!("CARGO_PKG_VERSION_PATCH").parse::<u32>().unwrap(),
+    ]);
+
+    let mut sys = match global.get("sys").map(|binding| binding.read()) {
+        Some(Value::Module(module)) => module.clone(),
+        _ => Module::new("sys", Scope::new()),
+    };
+    sys.scope_mut().define("twyla-version", version);
+    global.bind("sys".into(), Binding::detached(sys));
 }
 
 /// FileLoader for [`FileStore`]. Serves the (empty) virtual main from

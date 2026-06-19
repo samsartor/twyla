@@ -13,3 +13,6 @@ builtin (no import needed). `.url()` is contextual, so it sits in `#context`:
 
 An #link("https://typst.app")[external link] gets `rel`/`target` from
 twyla's native link rule, with no `#show` rule in sight.
+
+#let is-twyla = "twyla_version" in dictionary(sys)
+Twyla runtime detected: #is-twyla (#sys.twyla_version)
