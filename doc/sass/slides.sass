@@ -82,11 +82,29 @@ body
 	margin: 0.5em auto
 	border-radius: 0.4rem
 
-.deck .slide pre, .deck .slide .boxdraw
+.deck .slide pre
 	font-size: 0.7em
 	max-height: 60vh
 	overflow: auto
 	margin: 0.5em 0
+
+// Boxdraw overlays an SVG (sized in `1ch`/`1em`) on top of a <pre>. Scale the
+// font on the *container* so both track together; the inner <pre> must inherit
+// that size rather than take the generic code-block rule above, or the text and
+// the lines drift apart.
+.deck .slide .boxdraw
+	font-size: 0.7em
+	max-height: 60vh
+	margin: 0.5em 0
+
+.deck .slide .boxdraw pre
+	font-size: inherit
+	max-height: none
+	overflow: visible
+	margin: 0 0
+
+.deck .hero
+	font-size: 2rem
 
 // ── Progress bar ──────────────────────────────────────────────────────────────
 
@@ -156,6 +174,15 @@ body
 	height: 100%
 	align-items: center
 	justify-content: center
+	flex-direction: column
+
+.thought
+	font-size: 1.5em
+	font-style: italic
+	line-height: 1.4
+	max-width: 18em
+	padding-left: 0.8em
+	border-left: 4px solid var(--accent)
 
 // Pinned to the bottom of the slide (margin-top: auto in the flex column),
 // small and muted — for sources and attributions.
@@ -165,13 +192,22 @@ body
 	font-size: 0.6em
 	color: var(--muted)
 
-.thought
-	font-size: 1.5em
-	font-style: italic
-	line-height: 1.4
-	max-width: 18em
-	padding-left: 0.8em
-	border-left: 4px solid var(--accent)
+// Section divider: large, centered title underlined by an accent rule. Eats
+// the default h1 margin/border so the helper's own underline is the only one.
+.section-header
+	font-family: 'Iosevka Web', monospace
+	font-size: 3em
+	line-height: 1.1
+	letter-spacing: -0.02em
+	text-align: center
+	padding-bottom: 0.25em
+	border-bottom: 4px solid var(--accent)
+
+	h1, h2, h3
+		font-size: inherit
+		margin: 0
+		padding: 0
+		border: none
 
 .rendered
 	background: var(--code-bg)

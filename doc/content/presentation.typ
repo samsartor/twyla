@@ -11,18 +11,24 @@
 
 #slide[
   #hero
+
+  #html.div(class: "centering")[
+    Sam Sartor
+
+    Show & Tell -- June 20th, 2026
+  ]
 ]
 
 #slide(n: 3)[
   = Zola
 
   #context if frame.get() == 1 [
-    My website was written in Zola.
+    My website was built using Zola.
 
     #image("presentation/samsartorcom_color_screenshot.png")
   ]
   #context if frame.get() >= 2 [
-    ... which means it was written in markdown
+    ... which means it was written in Markdown
 
     ```md
       +++
@@ -38,7 +44,7 @@
     ```
   ]
   #context if frame.get() >= 3 [
-    ... and using Tera templates
+    ... and templated/themed using Tera
 
     ```html
     <div class="image --{{ size }}">
@@ -57,12 +63,12 @@
   = Twyla
 
   #context if frame.get() == 1 [
-    Now my website is written in Typst
+    Now my website is built using Twyla
 
     #image("presentation/samsartorcom_color_screenshot.png")
   ]
   #context if frame.get() >= 2 [
-    ... which means it was written in Typst
+    ... which means it is written in Typst
 
     ```typst
     #set document(
@@ -79,7 +85,7 @@
     ```
   ]
   #context if frame.get() >= 3 [
-    ... and using Typst templates
+    ... and templated/themed using Typst
 
     ```typst
     #let svg(asset, size: "m", caption: none) = html.div(
@@ -337,19 +343,190 @@
       "Typst" + "Zola" = "Tyla" #if i >= 2 [ #sym.approx "Twyla" ]
       #if i == 2 [ #image("presentation/hogfather_twyla.jpg") ]
     ]
-    if i >= 3 { list.item[Compiles all `*.typ` files in your website source] }
+    if i >= 3 { list.item[Compiles all `*.typ` files in your website source
+      #if i== 3 [  
+      ```tree
+      content/
+      ├ main.typ
+      ├ rewriting-my-blog.typ
+      ├ oops-i-vibecoded-my-blog.typ
+      └ how-to-bake-bread.typ
+      sass/
+      └ main.sass
+      templates/
+      ├ theme.typ
+      └ components.typ
+      ```
+      ]
+    ] }
     if i >= 4 { list.item[Built on the `typst-*` crates, published by the Typst compiler team
+      #if i == 4 [ #image("presentation/typst_html_crate.png") ]
       #if i >= 5 { list.item[Also used by the Typst Language Server and VS Code plugin] }
+      #if i == 5 [ #image("presentation/helix_lsp_workflow.png") ]
     ] }
-    if i >= 6 { list.item[Adds some stdlib features to the Typst language:
-      #if i >= 7 { list.item[List all the pages/posts/documents with the `documents()` function] }
-      #if i >= 8 { list.item[Declare new pages inside other pages with `#document[Hello!]`] }
-      #if i >= 9 { list.item[`asset.file` -- read a file, or reference it by URL] } 
-      #if i >= 10 { list.item[`asset.sass` -- compile SASS/SCSS to CSS] } 
-      #if i >= 11 { list.item[`asset.image` -- convert/resize images] } 
-      #if i >= 12 { list.item[`asset.typst` -- invoke the Typst compiler to create images/pdfs] } 
+    if i >= 6 { list.item[`twyla serve` + hot reloading] }
+    if i >= 7 { list.item[Adds some stdlib features to the Typst language:
+      #if i >= 8 { list.item[List all the pages/posts/documents with the `documents()` function] }
+      #if i == 8 [
+        ```typst
+        #context for doc in documents() {
+          if not doc.draft and doc.kind == "post" [
+            html.div(
+              html.div(
+                [#doc.title],
+                class: "post-title",
+                style: "color: " + doc.extra.color,
+              ),
+              class: "post-header",
+            )
+    
+            #doc.description
+          ]
+        }
+        ```
+      ]
+      #if i >= 9 { list.item[Declare new pages inside other pages with `#document[Hello!]`] }
+      #if i >= 10 { list.item[`asset.file` -- read a file, or reference it by URL] } 
+      #if i >= 11 { list.item[`asset.sass` -- compile SASS/SCSS to CSS] } 
+      #if i >= 12 { list.item[`asset.image` -- convert/resize images] } 
+      #if i >= 13 { list.item[`asset.typst` -- invoke the Typst compiler to create images/pdfs] } 
     ] }
-    if i >= 13 { list.item[`twyla serve` + hot reloading] }
     if i >= 14 { list.item[`twyla convert` to port Zola/Hugo sites -> Twyla] }
   }
 ])
+
+#slide[
+  #section[Dumb Stuff with Twyla]
+]
+
+#slide[
+  = Procedurally Generate your Favicon
+
+  #html.img(src: "/favicon.svg")
+
+  ```typst
+  #let grabber-grad = gradient.linear(rgb("5cc6e8"), rgb("e8a76c"), relative: "parent", space: oklch)
+  #html.link(rel: "icon", type: "image/x-icon", href: asset.typst([
+    #set page(width: auto, height: auto, fill: none, margin: 0mm)
+    #let thing = cetz.canvas({
+      for s in (1, -1) {
+        group({
+          translate((0, s*py))
+          rotate(s*phi, origin: (0, 0))
+          line((0.1, 0), p0, stroke: (paint: grabber-grad, thickness: st, cap: "round"))
+          ...
+        })
+      }
+    })
+    #rect(fill: black, height: auto, width: auto, inset: 5mm, radius: 20mm, thing)
+  ], format: "svg", output: "/favicon.svg").url())
+  ```
+]
+
+#slide[
+  = Resume and Website Together
+
+  #side-by-side[
+    Common `data.typ` file:
+    ```typst
+    #let adobe = (
+      kind: "work",
+      title: [Graduate Research Scientist],
+      employer: [Adobe Research],
+      where: [London UK],
+      start: vaugedate(year: 2026, month: "Jun"),
+      text: [Ongoing work with image generation and editing diffusion models.],
+    )
+
+    #let twyla = (
+      kind: "side",
+      icon: "github",
+      title: [Twyla],
+      start: vaugedate(year: 2026, month: "May"),
+      url: "https://github.com/samsartor/twyla",
+      text: context [
+        My own SSG like Hugo or Zola, but based on Typst.
+        #if version.get() == "site" [ Used for this website! ]
+      ],
+    )
+    ```
+  ][
+    Resume:
+    ```typst
+    #import "resume-template.typ": entries, entry, template
+    #show: doc => template(
+      doc,
+      name: "Sam Sartor",
+      email: "me@samsartor.com",
+    )
+
+    = Work
+    #entries(adobe, sketchup)
+
+    = Other
+    #entries(twya, hornpipe, hypar_map, disjoint_captures)
+    ```
+
+    Homepage:
+    ```typst
+    #html.div(class: "cards", {
+      project-card(resume.twyla)
+      project-card(resume.hornpipe)
+      project-card(resume.disjoint_captures)
+      project-card(resume.hypar_map)
+      html.div(class: "link-card", context [
+        #html.a(href: asset.typst("/resume/resume.typ").url())[Resume.pdf]
+        #html.a(href: asset.typst("/resume/cv.typ").url())[CV.pdf]
+      ])
+    }),
+    ```
+  ]
+]
+
+#let quine = [```typst
+#let side-by-side(..pair) = pair.at(0)
+#let code = QUINE
+#side-by-side[
+  #code
+][
+  #context html.img(
+    src: asset.typst(
+      eval(code.text, mode: "markup"),
+      format: "svg",
+    ).url(),
+    style: "width: 100%",
+  )
+]
+```]
+#let quine_outer = (
+"#let code = ```typst\n" + quine.text.replace("QUINE", "[
+  #set page(width: auto, height: auto)
+  = Hello, World
+]") + "\n```",
+  ..quine.text.split("\n").slice(2),
+).join("\n")
+
+#slide[
+  = Self-Referential Slide
+
+  #eval(
+    quine_outer,
+    mode: "markup",
+    scope: (side-by-side: side-by-side)
+  )
+  /*
+  #let quine_code = eval(
+    quine_src,
+    mode: "markup",
+  )
+  #side-by-side[
+    #quine_code
+  ][
+    #eval(
+      quine_code.text,
+      mode: "markup",
+      scope: (side-by-side: side-by-side)
+    )
+  ]
+  */
+]

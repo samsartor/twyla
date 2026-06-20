@@ -41,6 +41,13 @@
   }
 )
 
+// A section divider: large, vertically-centered title with an underline. Use
+// for the slide that opens a new part of the talk.
+#let section(body) = html.div(
+  class: "centering",
+  html.div(class: "section-header", body)
+)
+
 // A small, muted line pinned to the bottom of a slide — for sources, asides,
 // and attributions.
 #let postscript(body) = html.div(class: "postscript", body)
