@@ -135,23 +135,28 @@ impl Resolver {
     /// requests across iterations or call sites build once); the usage
     /// ([`outputs`](ResolvedAsset::outputs)) is unioned every time, so an asset
     /// both `.url()` and `.read()` ends up carrying both.
+    /// Returns `true` if a new asset was built or a new output policy was added
+    /// to an existing asset (meaning `resolve_outputs` must be re-run).
     pub fn resolve_asset(
         &mut self,
         world: Tracked<dyn World + '_>,
         req: &AssetReq,
-    ) -> SourceResult<()> {
+    ) -> SourceResult<bool> {
+        let mut changed = false;
         if !self.assets.contains_key(&req.spec) {
             let asset = self.build_asset(world, &req.spec, req.span)?;
             self.assets.insert_overwrite(Arc::new(asset));
+            changed = true;
         }
         let mut asset = self.assets.get_mut(&req.spec).expect("just resolved");
         let asset = Arc::make_mut(&mut *asset);
         for output in &req.outputs {
             if !asset.outputs.contains(output) {
                 asset.outputs.push(output.clone());
+                changed = true;
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// Resolve per-usage output policies into concrete bundle paths and URLs.
@@ -227,7 +232,9 @@ impl Resolver {
     /// reaching this twice — shown inline and `.url()`'d, or `.url()`'d
     /// repeatedly — dedups silently to one. Two *different* documents claiming
     /// one `output` is a conflict and errors.
-    pub fn collect_document(&mut self, doc: &ResolvedDocument) -> SourceResult<()> {
+    /// Returns `true` if a new document was added (meaning the next iteration's
+    /// content will differ and `resolve_outputs` must be re-run).
+    pub fn collect_document(&mut self, doc: &ResolvedDocument) -> SourceResult<bool> {
         if let Some(existing) = self.documents.get(doc.output.as_str()) {
             if **existing != *doc {
                 return Err(eco_vec![
@@ -238,10 +245,10 @@ impl Resolver {
                     .with_hint("each `document(..)` needs a distinct `output:`")
                 ]);
             }
-            return Ok(());
+            return Ok(false);
         }
         self.documents.insert_overwrite(Arc::new(doc.clone()));
-        Ok(())
+        Ok(true)
     }
 
     /// Process one spec into a [`ResolvedAsset`]: dispatch to the per-type build,

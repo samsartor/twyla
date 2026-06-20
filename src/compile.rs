@@ -353,12 +353,15 @@ fn compile_bundle_loop(
 
         // Resolve every asset and collect every document this realization
         // requested (recorded as introspections), growing the resolver's stores.
-        discover_requests(resolver, world, subsink.introspections())?;
+        // Returns true when anything genuinely changed (new asset built, new
+        // output policy, new inline document) — only then do we need to re-run
+        // resolve_outputs, since nothing else can alter asset output paths.
+        let new_work = discover_requests(resolver, world, subsink.introspections())?;
 
         // Rebuild the engine after `subsink.introspections()`'s borrow ends, so
         // output-derivation closures can run against the same world/library and
         // warning sink without fighting the tracked `Sink` borrow.
-        {
+        if new_work {
             let mut engine = Engine {
                 library,
                 world,
@@ -424,19 +427,23 @@ fn compile_bundle_loop(
 /// resolution. Because the records live in the comemo-tracked [`Sink`], a
 /// memoized (cached) realization still reports its assets/documents here, so
 /// discovery never misses a page just because it didn't re-run.
+/// Returns `true` if any new asset was built, any existing asset gained a new
+/// output policy, or any new inline document was collected — i.e. whether
+/// `resolve_outputs` needs to run this iteration.
 fn discover_requests(
     resolver: &mut Resolver,
     world: Tracked<dyn World + '_>,
     introspections: &[Introspection],
-) -> SourceResult<()> {
+) -> SourceResult<bool> {
+    let mut changed = false;
     for introspection in introspections {
         if let Some(req) = introspection.downcast::<AssetReqIntrospect>() {
-            resolver.resolve_asset(world, &req.0)?;
+            changed |= resolver.resolve_asset(world, &req.0)?;
         } else if let Some(req) = introspection.downcast::<ResolvedDocumentIntrospect>() {
-            resolver.collect_document(&req.0)?;
+            changed |= resolver.collect_document(&req.0)?;
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn resolve_outputs(resolver: &mut Resolver, engine: &mut Engine) -> SourceResult<()> {
