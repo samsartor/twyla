@@ -315,13 +315,18 @@ fn compile_bundle_loop(
             .collect(),
     );
 
-    // The first iteration realizes against an empty introspector; subsequent
-    // ones against the previous iteration's output wrapper. We keep every output
-    // wrapper so `analyze` can replay each recorded introspection across the
-    // whole history on non-convergence.
-    let empty = TwylaIntrospector {
+    // Warm-start: seed the first-pass introspector with the resolver's current
+    // asset state. After revalidate() the resolver retains all unchanged assets
+    // with their url/output_path intact from the previous compile, even though
+    // clear_asset_usage() has wiped their outputs/resolutions. If those stale
+    // URLs match what resolve_outputs will compute for this compile (true for
+    // any unchanged asset), iteration 1 produces correct HTML and constraint
+    // validates in one pass — eliminating the second full realization. On the
+    // very first compile the resolver is empty, so this is equivalent to the
+    // empty introspector it replaces.
+    let initial = TwylaIntrospector {
         inner: Arc::new(EmptyIntrospector),
-        assets: IdHashMap::new(),
+        assets: resolver.assets_snapshot(),
         documents: IdHashMap::new(),
         file_docs: file_docs.clone(),
         ctx: ctx.clone(),
@@ -334,7 +339,7 @@ fn compile_bundle_loop(
         // to its own bundle output; grows as discovery proceeds.
         let content = build_content(files, resolver);
 
-        let input: &TwylaIntrospector = history.last().unwrap_or(&empty);
+        let input: &TwylaIntrospector = history.last().unwrap_or(&initial);
         let constraint = comemo::Constraint::new();
 
         let mut subsink = Sink::new();
@@ -393,7 +398,7 @@ fn compile_bundle_loop(
             // history so each can diagnose its own non-convergence (a twyla
             // asset/document that never stabilized produces a tailored message
             // via its `Introspect::diagnose`). Mirrors `typst::compile_impl`.
-            let mut introspectors = [&empty as &dyn Introspector; MAX_ITERS + 1];
+            let mut introspectors = [&initial as &dyn Introspector; MAX_ITERS + 1];
             for i in 1..MAX_ITERS {
                 introspectors[i] = &history[i - 1];
             }
