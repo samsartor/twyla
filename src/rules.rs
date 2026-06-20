@@ -25,7 +25,9 @@
 use ecow::{EcoString, eco_format};
 use typst_html::{HtmlElem, attr, tag};
 use typst_library::diag::{At, warning};
-use typst_library::foundations::{Derived, NativeElement, NativeRuleMap, Packed, ShowFn, Target};
+use typst_library::foundations::{
+    Derived, Dict, Module, NativeElement, NativeRuleMap, Packed, ShowFn, Target,
+};
 use typst_library::introspection::Counter;
 use typst_library::layout::BlockElem;
 use typst_library::loading::DataSource;
@@ -135,11 +137,25 @@ const LINK_RULE: ShowFn<LinkElem> = |elem, engine, _| {
     let span = elem.span();
     let dest = elem.dest.resolve_early(engine, span)?;
 
+    // Read base_url from sys.inputs so same-site full URLs are not treated as
+    // external (e.g. ref-resolved links like "https://example.com/portfolio/").
+    let site_base: EcoString = (|| {
+        let sys = engine.library.global.scope().get("sys")?.read().clone();
+        let sys = sys.cast::<Module>().ok()?;
+        let inputs = sys.field("inputs", ()).ok()?.clone();
+        let inputs = inputs.cast::<Dict>().ok()?;
+        let bu = inputs.get("base_url").ok()?.clone();
+        bu.cast::<EcoString>().ok()
+    })()
+    .unwrap_or_default();
+
     let mut external = false;
     let href = match dest {
         Destination::Url(url) => {
             let url = url.clone().into_inner();
-            external = url.starts_with("http://") || url.starts_with("https://");
+            let is_http = url.starts_with("http://") || url.starts_with("https://");
+            let is_same_site = !site_base.is_empty() && url.starts_with(site_base.as_str());
+            external = is_http && !is_same_site;
             Some(url)
         }
         Destination::Position(_) => {

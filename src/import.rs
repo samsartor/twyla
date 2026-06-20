@@ -73,17 +73,19 @@ pub fn import_hugo_md(
     kind: &str,
     output: Option<&str>,
     route: &str,
+    base_url: Option<&str>,
 ) -> Result<String, String> {
     let (fm_text, body) = split_yaml_frontmatter(input)?;
     let meta = parse_yaml_frontmatter(fm_text)?;
     let prefix = derive_page_prefix(route);
     let (summary_md, body) = split_summary(body);
-    let summary = summary_md
-        .map(|md| ir::render_hugo(&parse_blocks(&preprocess_hugo_shortcodes(md)), &prefix));
+    let summary = summary_md.map(|md| {
+        ir::render_hugo(&parse_blocks(&preprocess_hugo_shortcodes(md)), &prefix, base_url)
+    });
     let blocks = parse_blocks(&preprocess_hugo_shortcodes(&body));
     Ok(assemble(
         &meta,
-        &ir::render_hugo(&blocks, &prefix),
+        &ir::render_hugo(&blocks, &prefix, base_url),
         summary.as_deref(),
         kind,
         output,

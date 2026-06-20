@@ -119,270 +119,268 @@ pub enum Block {
 
 /// Render a document body using Zola's slugification for heading anchors.
 pub fn render(blocks: &[Block]) -> String {
-    render_with_slug(blocks, "", crate::slug::slugify)
+    Renderer { prefix: "", slug: crate::slug::slugify, base_url: None }.render_blocks(blocks)
 }
 
 /// Render a document body using Hugo/goldmark slugification for heading anchors.
 /// `label_prefix` is prepended to every heading label and same-page anchor
 /// target to prevent cross-page label conflicts in the typst bundle.
-pub fn render_hugo(blocks: &[Block], label_prefix: &str) -> String {
-    render_with_slug(blocks, label_prefix, hugo_slugify)
+/// `base_url` is used to resolve Hugo `{{< ref >}}` shortcode links.
+pub fn render_hugo(blocks: &[Block], label_prefix: &str, base_url: Option<&str>) -> String {
+    Renderer { prefix: label_prefix, slug: hugo_slugify, base_url }.render_blocks(blocks)
 }
 
-fn render_with_slug(blocks: &[Block], prefix: &str, slug: fn(&str) -> String) -> String {
-    let mut out = String::new();
-    for b in blocks {
-        render_block(b, &mut out, prefix, slug);
+/// Rendering context — holds per-page state so it doesn't have to be threaded
+/// through every function signature.
+struct Renderer<'a> {
+    prefix: &'a str,
+    slug: fn(&str) -> String,
+    base_url: Option<&'a str>,
+}
+
+impl Renderer<'_> {
+    fn render_blocks(&self, blocks: &[Block]) -> String {
+        let mut out = String::new();
+        for b in blocks {
+            self.render_block(b, &mut out);
+        }
+        out
     }
-    out
-}
 
-fn render_block(b: &Block, out: &mut String, prefix: &str, slug: fn(&str) -> String) {
-    match b {
-        Block::Heading { level, id, content } => {
-            for _ in 0..*level {
-                out.push('=');
+    fn render_block(&self, b: &Block, out: &mut String) {
+        match b {
+            Block::Heading { level, id, content } => {
+                for _ in 0..*level {
+                    out.push('=');
+                }
+                out.push(' ');
+                self.render_inlines(content, out);
+                // Label: use explicit `{#id}` attribute when present (Hugo/goldmark),
+                // otherwise slugify the heading text. Always scoped with `prefix` to
+                // avoid cross-page label conflicts in the typst bundle.
+                let prefix = self.prefix;
+                let label = match id.as_deref() {
+                    Some(explicit) => format!("{prefix}{explicit}"),
+                    None => format!("{prefix}{}", (self.slug)(&plain_text(content))),
+                };
+                writeln!(out, " <{label}>\n").unwrap();
             }
-            out.push(' ');
-            render_inlines(content, out, prefix);
-            // Label: use explicit `{#id}` attribute when present (Hugo/goldmark),
-            // otherwise slugify the heading text. Always scoped with `prefix` to
-            // avoid cross-page label conflicts in the typst bundle.
-            let label = match id.as_deref() {
-                Some(explicit) => format!("{prefix}{explicit}"),
-                None => format!("{prefix}{}", slug(&plain_text(content))),
-            };
-            writeln!(out, " <{label}>\n").unwrap();
-        }
-        Block::Para(content) => {
-            render_inlines(content, out, prefix);
-            out.push_str("\n\n");
-        }
-        Block::Code { lang, text } => {
-            out.push_str("```");
-            out.push_str(lang);
-            out.push('\n');
-            out.push_str(text);
-            if !text.ends_with('\n') {
+            Block::Para(content) => {
+                self.render_inlines(content, out);
+                out.push_str("\n\n");
+            }
+            Block::Code { lang, text } => {
+                out.push_str("```");
+                out.push_str(lang);
+                out.push('\n');
+                out.push_str(text);
+                if !text.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("```\n\n");
+            }
+            Block::Quote(blocks) => {
+                out.push_str("#html.blockquote[\n");
+                for b in blocks {
+                    self.render_block(b, out);
+                }
+                out.push_str("]\n\n");
+            }
+            Block::List { ordered, items } => {
+                let marker = if *ordered { "+ " } else { "- " };
+                for item in items {
+                    let mut buf = String::new();
+                    self.render_item(item, &mut buf);
+                    // Indent continuation lines under the marker (width of `- `):
+                    // an unindented line ends the item, so typst would split it out
+                    // of the list (`</ul><p>…</p><ul>`).
+                    out.push_str(marker);
+                    indent_continuation(&buf, "  ", out);
+                }
                 out.push('\n');
             }
-            out.push_str("```\n\n");
-        }
-        Block::Quote(blocks) => {
-            out.push_str("#html.blockquote[\n");
-            for b in blocks {
-                render_block(b, out, prefix, slug);
+            Block::Table { align, head, rows } => {
+                self.render_table(align, head, rows, out);
             }
-            out.push_str("]\n\n");
+            Block::Rule => out.push_str("#html.hr()\n\n"),
+            Block::Shortcode { name, args, body } => {
+                writeln!(out, "\n#{name}({args})[").unwrap();
+                for b in body {
+                    self.render_block(b, out);
+                }
+                // Trim the trailing block break so the body stays a single
+                // paragraph inside the shortcode (avoids a stray empty `<p>`).
+                while out.ends_with(char::is_whitespace) {
+                    out.pop();
+                }
+                out.push_str("]\n\n");
+            }
+            Block::Html(node) => {
+                convert_html_node(node, out);
+                out.push_str("\n\n");
+            }
+            Block::Raw(s) => {
+                write!(out, "/* TODO twyla-convert: {s} */\n\n").unwrap();
+            }
         }
-        Block::List { ordered, items } => {
-            let marker = if *ordered { "+ " } else { "- " };
-            for item in items {
-                let mut buf = String::new();
-                render_item(item, &mut buf, prefix, slug);
-                // Indent continuation lines under the marker (width of `- `):
-                // an unindented line ends the item, so typst would split it out
-                // of the list (`</ul><p>…</p><ul>`).
-                out.push_str(marker);
-                indent_continuation(&buf, "  ", out);
+    }
+
+    /// A list item: inline the common single-paragraph case (`- text`), otherwise
+    /// render its blocks.
+    fn render_item(&self, blocks: &[Block], out: &mut String) {
+        if let [Block::Para(content)] = blocks {
+            self.render_inlines(content, out);
+            out.push('\n');
+        } else {
+            for b in blocks {
+                self.render_block(b, out);
+            }
+        }
+    }
+
+    fn render_table(
+        &self,
+        align: &[Align],
+        head: &[Content],
+        rows: &[Vec<Content>],
+        out: &mut String,
+    ) {
+        out.push_str("\n// TODO twyla-convert: check table styling\n");
+        writeln!(out, "#table(").unwrap();
+        writeln!(out, "  columns: {},", align.len()).unwrap();
+        if align.iter().any(|a| *a != Align::None) {
+            let cols: Vec<&str> = align.iter().map(|a| align_name(*a)).collect();
+            writeln!(out, "  align: ({}),", cols.join(", ")).unwrap();
+        }
+        if !head.is_empty() {
+            out.push_str("  table.header(");
+            for cell in head {
+                out.push('[');
+                self.render_inlines(cell, out);
+                out.push_str("], ");
+            }
+            out.push_str("),\n");
+        }
+        for row in rows {
+            out.push_str("  ");
+            for cell in row {
+                out.push('[');
+                self.render_inlines(cell, out);
+                out.push_str("], ");
             }
             out.push('\n');
         }
-        Block::Table { align, head, rows } => render_table(align, head, rows, out, prefix),
-        Block::Rule => out.push_str("#html.hr()\n\n"),
-        Block::Shortcode { name, args, body } => {
-            writeln!(out, "\n#{name}({args})[").unwrap();
-            for b in body {
-                render_block(b, out, prefix, slug);
-            }
-            // Trim the trailing block break so the body stays a single
-            // paragraph inside the shortcode (avoids a stray empty `<p>`).
-            while out.ends_with(char::is_whitespace) {
-                out.pop();
-            }
-            out.push_str("]\n\n");
-        }
-        Block::Html(node) => {
-            convert_html_node(node, out);
-            out.push_str("\n\n");
-        }
-        Block::Raw(s) => {
-            write!(out, "/* TODO twyla-convert: {s} */\n\n").unwrap();
-        }
+        out.push_str(")\n\n");
     }
-}
 
-/// A list item: inline the common single-paragraph case (`- text`), otherwise
-/// render its blocks.
-fn render_item(blocks: &[Block], out: &mut String, prefix: &str, slug: fn(&str) -> String) {
-    if let [Block::Para(content)] = blocks {
-        render_inlines(content, out, prefix);
-        out.push('\n');
-    } else {
-        for b in blocks {
-            render_block(b, out, prefix, slug);
-        }
-    }
-}
-
-/// Append `text`, indenting every line after the first by `pad` (empty lines
-/// stay empty). Used to keep a list item's continuation content — extra
-/// paragraphs, hard breaks, nested lists — under its marker.
-fn indent_continuation(text: &str, pad: &str, out: &mut String) {
-    for (i, line) in text.split_inclusive('\n').enumerate() {
-        if i > 0 && !line.trim_start().is_empty() {
-            out.push_str(pad);
-        }
-        out.push_str(line);
-    }
-}
-
-fn render_table(
-    align: &[Align],
-    head: &[Content],
-    rows: &[Vec<Content>],
-    out: &mut String,
-    prefix: &str,
-) {
-    out.push_str("\n// TODO twyla-convert: check table styling\n");
-    writeln!(out, "#table(").unwrap();
-    writeln!(out, "  columns: {},", align.len()).unwrap();
-    if align.iter().any(|a| *a != Align::None) {
-        let cols: Vec<&str> = align.iter().map(|a| align_name(*a)).collect();
-        writeln!(out, "  align: ({}),", cols.join(", ")).unwrap();
-    }
-    if !head.is_empty() {
-        out.push_str("  table.header(");
-        for cell in head {
-            out.push('[');
-            render_inlines(cell, out, prefix);
-            out.push_str("], ");
-        }
-        out.push_str("),\n");
-    }
-    for row in rows {
-        out.push_str("  ");
-        for cell in row {
-            out.push('[');
-            render_inlines(cell, out, prefix);
-            out.push_str("], ");
-        }
-        out.push('\n');
-    }
-    out.push_str(")\n\n");
-}
-
-fn render_inlines(inlines: &[Inline], out: &mut String, prefix: &str) {
-    for (idx, i) in inlines.iter().enumerate() {
-        // Typst greedily parses `#expr](text)` / `#expr)(text)` as function
-        // calls. Insert an empty content block to break the ambiguity when a
-        // text node starting with `(` follows a code expression.
-        if idx > 0 && code_expr_ending(&inlines[idx - 1]) {
-            if let Inline::Text(s) = i {
-                if s.starts_with('(') {
-                    out.push_str("/**/");
+    fn render_inlines(&self, inlines: &[Inline], out: &mut String) {
+        for (idx, i) in inlines.iter().enumerate() {
+            // Typst greedily parses `#expr](text)` / `#expr)(text)` as function
+            // calls. Insert an empty content block to break the ambiguity when a
+            // text node starting with `(` follows a code expression.
+            if idx > 0 && code_expr_ending(&inlines[idx - 1]) {
+                if let Inline::Text(s) = i {
+                    if s.starts_with('(') {
+                        out.push_str("/**/");
+                    }
                 }
             }
-        }
 
-        // When `_`/`*` would be directly adjacent to an alphanumeric character
-        // on either side, typst won't open or close the delimiter there. Use
-        // the function-call form instead.
-        let needs_func_emph = matches!(i, Inline::Emph(_) | Inline::Strong(_)) && {
-            let next_alnum = inlines.get(idx + 1).is_some_and(|next| {
-                matches!(next, Inline::Text(s) if s.starts_with(|c: char| c.is_alphanumeric()))
-            });
-            let prev_alnum = out.chars().last().is_some_and(|c| c.is_alphanumeric());
-            next_alnum || prev_alnum
-        };
-        match (i, needs_func_emph) {
-            (Inline::Emph(c), true) => {
-                out.push_str("#emph[");
-                render_inlines(c, out, prefix);
-                out.push(']');
+            // When `_`/`*` would be directly adjacent to an alphanumeric character
+            // on either side, typst won't open or close the delimiter there. Use
+            // the function-call form instead.
+            let needs_func_emph = matches!(i, Inline::Emph(_) | Inline::Strong(_)) && {
+                let next_alnum = inlines.get(idx + 1).is_some_and(|next| {
+                    matches!(next, Inline::Text(s) if s.starts_with(|c: char| c.is_alphanumeric()))
+                });
+                let prev_alnum = out.chars().last().is_some_and(|c| c.is_alphanumeric());
+                next_alnum || prev_alnum
+            };
+            match (i, needs_func_emph) {
+                (Inline::Emph(c), true) => {
+                    out.push_str("#emph[");
+                    self.render_inlines(c, out);
+                    out.push(']');
+                }
+                (Inline::Strong(c), true) => {
+                    out.push_str("#strong[");
+                    self.render_inlines(c, out);
+                    out.push(']');
+                }
+                _ => self.render_inline(i, out),
             }
-            (Inline::Strong(c), true) => {
-                out.push_str("#strong[");
-                render_inlines(c, out, prefix);
-                out.push(']');
-            }
-            _ => render_inline(i, out, prefix),
         }
     }
-}
 
-fn code_expr_ending(i: &Inline) -> bool {
-    matches!(
-        i,
-        Inline::Html { .. }
-            | Inline::Link { .. }
-            | Inline::ShortcodeBody { .. }
-            | Inline::Strike(_)
-    )
-}
-
-fn render_inline(i: &Inline, out: &mut String, prefix: &str) {
-    match i {
-        Inline::Text(s) => out.push_str(&escape_markup(s)),
-        Inline::Code(s) => write!(out, "`{s}`").unwrap(),
-        Inline::Emph(c) => wrap(out, "_", c, "_", prefix),
-        Inline::Strong(c) => wrap(out, "*", c, "*", prefix),
-        Inline::Strike(c) => wrap(out, "#strike[", c, "]", prefix),
-        Inline::Link { dest, content } => {
-            // Hugo {{< ref >}} shortcodes in link destinations are mangled by
-            // pulldown-cmark's angle-bracket stripping: `<!--TWYLA-HUGO:...-->`
-            // becomes `!--TWYLA-HUGO:...--`. Render the link text as-is with a
-            // TODO comment so the porter can fix the href manually.
-            if dest.contains("TWYLA-HUGO") {
-                out.push_str("/* TODO twyla-convert: hugo ref link */");
-                render_inlines(content, out, prefix);
-                return;
-            }
-            if let Some(frag) = dest.strip_prefix('#') {
-                // Same-page anchor link: prefix with the page label prefix so
-                // it matches the correspondingly-prefixed heading label.
-                write!(out, "#link(<{prefix}{frag}>)[").unwrap();
-            } else {
-                write!(out, "#link(\"{}\")[", escape_typst_string(dest)).unwrap();
-            }
-            render_inlines(content, out, prefix);
-            out.push(']');
-        }
-        Inline::Shortcode { name, args } => write!(out, "#{name}({args})").unwrap(),
-        Inline::ShortcodeBody {
-            name,
-            args,
-            content,
-        } => {
-            write!(out, "#{name}({args})[").unwrap();
-            render_inlines(content, out, prefix);
-            out.push(']');
-        }
-        Inline::Html {
-            tag,
-            attrs,
-            children,
-        } => {
-            let dict = typst_attrs(attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-            // Wrap block-ish tags in `box()` so they stay inline: typst splits a
-            // paragraph around an inline element it doesn't group into paragraphs
-            // (`should_group_into_pars == false`, e.g. `<div>`/`<section>`).
-            let boxed = !groups_into_pars(tag);
-            if boxed {
-                out.push_str("#box(");
-                write!(out, "html.elem(\"{tag}\"{dict})").unwrap();
-            } else {
-                write!(out, "#html.elem(\"{tag}\"{dict})").unwrap();
-            }
-            if !(children.is_empty() && is_void(tag)) {
-                out.push('[');
-                render_inlines(children, out, prefix);
+    fn render_inline(&self, i: &Inline, out: &mut String) {
+        let prefix = self.prefix;
+        match i {
+            Inline::Text(s) => out.push_str(&escape_markup(s)),
+            Inline::Code(s) => write!(out, "`{s}`").unwrap(),
+            Inline::Emph(c) => self.wrap(out, "_", c, "_"),
+            Inline::Strong(c) => self.wrap(out, "*", c, "*"),
+            Inline::Strike(c) => self.wrap(out, "#strike[", c, "]"),
+            Inline::Link { dest, content } => {
+                // Hugo {{< ref >}} shortcodes in link destinations are mangled by
+                // pulldown-cmark's angle-bracket stripping: `<!--TWYLA-HUGO:...-->`
+                // becomes `!--TWYLA-HUGO:...--`. Try to resolve as a ref link;
+                // fall back to a TODO comment if parsing fails.
+                if dest.contains("TWYLA-HUGO") {
+                    if let Some(url) = parse_hugo_ref_url(dest, self.base_url) {
+                        write!(out, "#link(\"{}\")[", escape_typst_string(&url)).unwrap();
+                        self.render_inlines(content, out);
+                        out.push(']');
+                    } else {
+                        out.push_str("/* TODO twyla-convert: hugo ref link */");
+                        self.render_inlines(content, out);
+                    }
+                    return;
+                }
+                if let Some(frag) = dest.strip_prefix('#') {
+                    // Same-page anchor link: prefix with the page label prefix so
+                    // it matches the correspondingly-prefixed heading label.
+                    write!(out, "#link(<{prefix}{frag}>)[").unwrap();
+                } else {
+                    write!(out, "#link(\"{}\")[", escape_typst_string(dest)).unwrap();
+                }
+                self.render_inlines(content, out);
                 out.push(']');
             }
-            if boxed {
-                out.push(')');
+            Inline::Shortcode { name, args } => write!(out, "#{name}({args})").unwrap(),
+            Inline::ShortcodeBody {
+                name,
+                args,
+                content,
+            } => {
+                write!(out, "#{name}({args})[").unwrap();
+                self.render_inlines(content, out);
+                out.push(']');
             }
-        }
+            Inline::Html {
+                tag,
+                attrs,
+                children,
+            } => {
+                let dict = typst_attrs(attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+                // Wrap block-ish tags in `box()` so they stay inline: typst splits a
+                // paragraph around an inline element it doesn't group into paragraphs
+                // (`should_group_into_pars == false`, e.g. `<div>`/`<section>`).
+                let boxed = !groups_into_pars(tag);
+                if boxed {
+                    out.push_str("#box(");
+                    write!(out, "html.elem(\"{tag}\"{dict})").unwrap();
+                } else {
+                    write!(out, "#html.elem(\"{tag}\"{dict})").unwrap();
+                }
+                if !(children.is_empty() && is_void(tag)) {
+                    out.push('[');
+                    self.render_inlines(children, out);
+                    out.push(']');
+                }
+                if boxed {
+                    out.push(')');
+                }
+            }
         Inline::Image { src, alt } => {
             if src.starts_with("http://") || src.starts_with("https://") {
                 let dict = typst_attrs([("src", src.as_str()), ("alt", alt.as_str())].into_iter());
@@ -406,10 +404,63 @@ fn render_inline(i: &Inline, out: &mut String, prefix: &str) {
     }
 }
 
-fn wrap(out: &mut String, open: &str, content: &[Inline], close: &str, prefix: &str) {
-    out.push_str(open);
-    render_inlines(content, out, prefix);
-    out.push_str(close);
+    fn wrap(&self, out: &mut String, open: &str, content: &[Inline], close: &str) {
+        out.push_str(open);
+        self.render_inlines(content, out);
+        out.push_str(close);
+    }
+}
+
+fn code_expr_ending(i: &Inline) -> bool {
+    matches!(
+        i,
+        Inline::Html { .. }
+            | Inline::Link { .. }
+            | Inline::ShortcodeBody { .. }
+            | Inline::Strike(_)
+    )
+}
+
+/// Append `text`, indenting every line after the first by `pad` (empty lines
+/// stay empty). Used to keep a list item's continuation content — extra
+/// paragraphs, hard breaks, nested lists — under its marker.
+fn indent_continuation(text: &str, pad: &str, out: &mut String) {
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        if i > 0 && !line.trim_start().is_empty() {
+            out.push_str(pad);
+        }
+        out.push_str(line);
+    }
+}
+
+/// Parse a Hugo `ref` shortcode URL from a pulldown-cmark-mangled link dest.
+///
+/// Hugo's `{{< ref "/path" >}}` in a link destination becomes
+/// `<!--TWYLA-HUGO:ref &quot;/path&quot;-->` after preprocessing, then
+/// `!--TWYLA-HUGO:ref &quot;/path&quot;--` after pulldown-cmark strips the
+/// angle brackets. Returns the resolved URL, or `None` if parsing fails.
+fn parse_hugo_ref_url(dest: &str, base_url: Option<&str>) -> Option<String> {
+    let inner = dest
+        .strip_prefix("!--TWYLA-HUGO:")?
+        .strip_suffix("--")?;
+    let inner = inner.replace("&quot;", "\"");
+    let path_raw = inner.strip_prefix("ref")?.trim().trim_matches('"');
+    let (path, anchor) = match path_raw.split_once('#') {
+        Some((p, a)) => (p, Some(a)),
+        None => (path_raw, None),
+    };
+    // Add trailing slash to paths without a file extension (e.g. `/portfolio`
+    // → `/portfolio/`) to match Hugo's output.
+    let path = if !path.ends_with('/') && !path.contains('.') {
+        format!("{path}/")
+    } else {
+        path.to_string()
+    };
+    let base = base_url.unwrap_or("").trim_end_matches('/');
+    Some(match anchor {
+        Some(a) => format!("{base}{path}#{a}"),
+        None => format!("{base}{path}"),
+    })
 }
 
 /// Plain text of an inline run — used to derive heading slugs.

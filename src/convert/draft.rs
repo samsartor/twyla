@@ -41,7 +41,7 @@ pub fn ensure_drafts(
             // Hand-edited draft already present — leave it (unless overwriting).
             (true, ConvertMode::Generate | ConvertMode::Verify) => {}
             (true, ConvertMode::Overwrite) => {
-                write_draft(page, source)?;
+                write_draft(page, source, ctx.base_url.as_deref())?;
                 findings.push(Finding::DraftWritten {
                     typ: page.typ_path.clone(),
                 });
@@ -55,7 +55,7 @@ pub fn ensure_drafts(
             }
             // Missing draft — generate scaffolding.
             (false, ConvertMode::Generate | ConvertMode::Overwrite) => {
-                write_draft(page, source)?;
+                write_draft(page, source, ctx.base_url.as_deref())?;
                 findings.push(Finding::DraftWritten {
                     typ: page.typ_path.clone(),
                 });
@@ -71,7 +71,7 @@ pub fn ensure_drafts(
     Ok(findings)
 }
 
-fn write_draft(page: &MappedPage, source: SourceFormat) -> io::Result<()> {
+fn write_draft(page: &MappedPage, source: SourceFormat, base_url: Option<&str>) -> io::Result<()> {
     let src = fs::read_to_string(&page.md_path)?;
     let import = match source {
         SourceFormat::Zola => import_md(&src, &page.kind, page.output_override.as_deref()),
@@ -80,6 +80,7 @@ fn write_draft(page: &MappedPage, source: SourceFormat) -> io::Result<()> {
             &page.kind,
             page.output_override.as_deref(),
             &page.route,
+            base_url,
         ),
     };
     let draft = import.map_err(|e| {
