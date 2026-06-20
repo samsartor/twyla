@@ -116,6 +116,12 @@ impl TwylaContext {
         self.root.join("content")
     }
 
+    /// `<root>/.twyla-cache/assets/` — filesystem cache for built assets.
+    /// Never automatically invalidated; delete the directory to clear.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.join(".twyla-cache").join("assets")
+    }
+
     /// `<root>/static/` — copied verbatim into the build output and
     /// served as-is by the dev server.
     pub fn static_dir(&self) -> PathBuf {

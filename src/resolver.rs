@@ -24,7 +24,8 @@ use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult};
 
 use crate::asset::{
-    AssetReq, AssetSpec, OutputReq, Resolution, ResolvedAsset, file, image, raw, sass, typst_doc,
+    AssetReq, AssetSpec, Built, OutputReq, Resolution, ResolvedAsset, cache, file, image, raw,
+    sass, typst_doc,
 };
 use crate::document::ResolvedDocument;
 use crate::project::TwylaContext;
@@ -251,15 +252,51 @@ impl Resolver {
         Ok(true)
     }
 
-    /// Process one spec into a [`ResolvedAsset`]: dispatch to the per-type build,
-    /// then add the shared fingerprinted output path + URL.
+    /// Process one spec into a [`ResolvedAsset`]: check the filesystem cache,
+    /// dispatch to the per-type build on a miss, then add the shared
+    /// fingerprinted output path + URL.
     fn build_asset(
         &self,
         world: Tracked<dyn World + '_>,
         spec: &AssetSpec,
         span: typst::syntax::Span,
     ) -> SourceResult<ResolvedAsset> {
-        let built = match spec {
+        let cache_dir = self.ctx.cache_dir();
+        let built = if let Some(key) = cache::cache_key(spec) {
+            if let Some(cached) = cache::load(&cache_dir, key) {
+                cached
+            } else {
+                let built = self.build_asset_inner(world, spec, span)?;
+                cache::store(&cache_dir, key, &built);
+                built
+            }
+        } else {
+            self.build_asset_inner(world, spec, span)?
+        };
+
+        let output_path = self.ctx.default_asset_output(&built);
+        let url = self.ctx.asset_url(&output_path);
+
+        Ok(ResolvedAsset {
+            spec: spec.clone(),
+            span,
+            built,
+            output_path,
+            url,
+            resolutions: Vec::new(),
+            // Filled in by `resolve_asset` from the request(s) that reached it.
+            outputs: Vec::new(),
+        })
+    }
+
+    /// Unconditionally build `spec` without consulting the cache.
+    fn build_asset_inner(
+        &self,
+        world: Tracked<dyn World + '_>,
+        spec: &AssetSpec,
+        span: typst::syntax::Span,
+    ) -> SourceResult<Built> {
+        Ok(match spec {
             AssetSpec::File { file } => file::build(world, *file, &self.ctx, span)?,
             AssetSpec::Sass { file, minify } => {
                 sass::build(world, *file, *minify, &self.ctx, span)?
@@ -280,20 +317,6 @@ impl Resolver {
             AssetSpec::Typst { input, format, ppi } => {
                 typst_doc::build(world, input, *format, *ppi, &self.ctx, span)?
             }
-        };
-
-        let output_path = self.ctx.default_asset_output(&built);
-        let url = self.ctx.asset_url(&output_path);
-
-        Ok(ResolvedAsset {
-            spec: spec.clone(),
-            span,
-            built,
-            output_path,
-            url,
-            resolutions: Vec::new(),
-            // Filled in by `resolve_asset` from the request(s) that reached it.
-            outputs: Vec::new(),
         })
     }
 

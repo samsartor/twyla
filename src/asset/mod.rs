@@ -67,6 +67,7 @@ macro_rules! asset_methods {
     };
 }
 
+pub(crate) mod cache;
 pub(crate) mod file;
 pub(crate) mod image;
 pub(crate) mod raw;
