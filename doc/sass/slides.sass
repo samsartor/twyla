@@ -1,13 +1,179 @@
 // Twyla slide deck. Full-screen, projector-first: one slide visible at a time
 // (JS toggles `.is-active`; see templates/slides.js), big type that scales with
-// the viewport, and a progress bar pinned to the bottom edge. Loaded on top of
-// main.sass, so it inherits the theme variables and prose rules.
+// the viewport, and a progress bar pinned to the bottom edge.
+//
+// STANDALONE: this is the *only* stylesheet the presentation loads (see
+// `site-head(slides: true)` in templates/theme.typ). The "Vendored from
+// main.sass" section below copies the base/theme/prose/boxdraw/hero rules the
+// deck relies on, so future edits to main.sass can never break the slides. If
+// you change one of those rules in main.sass and want the slides to follow,
+// copy it here too.
+
+// ── Vendored from main.sass ───────────────────────────────────────────────────
+
+:root
+	color-scheme: light dark
+	--bg:      light-dark(#ffffff, #1b1b1f)
+	--fg:      light-dark(#1f2328, #e6e6e9)
+	--muted:   light-dark(#656d76, #9aa0a6)
+	--border:  light-dark(#e6e6e9, #2c2c33)
+	--panel:   light-dark(#f5f5f6, #25252b)
+	--accent:  light-dark(#0a7ea4, #5cc6e8)
+	--code-bg: #282a36
+	--code-fg: #f8f8f2
+
+*
+	box-sizing: border-box
 
 html, body
+	margin: 0
 	height: 100%
 
 body
 	overflow: hidden
+	background: var(--bg)
+	color: var(--fg)
+	font-family: 'Iosevka Aile Web', system-ui, sans-serif
+	line-height: 1.65
+
+code, pre
+	font-family: 'Iosevka Web', ui-monospace, monospace
+
+.prose
+	min-width: 0
+
+.prose a
+	color: var(--accent)
+	text-decoration: none
+	&:hover
+		text-decoration: underline
+
+.prose :not(pre) > code
+	background: var(--panel)
+	padding: 0.1rem 0.35rem
+	border-radius: 0.3rem
+	font-size: 0.88em
+
+.prose pre
+	background: var(--code-bg)
+	color: var(--code-fg)
+	padding: 1rem 1.15rem
+	border-radius: 0.6rem
+	overflow-x: auto
+	line-height: 1.55
+	font-size: 0.88rem
+	margin: 1rem 0
+
+.prose pre code
+	background: none
+	padding: 0
+	font-size: inherit
+	color: inherit
+
+.prose hr
+	border: none
+	border-top: 1px solid var(--border)
+	margin: 2rem 0
+
+.prose blockquote
+	margin: 1rem 0
+	padding: 0.5rem 1rem
+	border-left: 3px solid var(--accent)
+	background: var(--panel)
+	border-radius: 0 0.4rem 0.4rem 0
+
+.prose table
+	border-collapse: collapse
+	width: 100%
+	margin: 1.25rem 0
+	font-size: 0.95em
+
+.prose th, .prose td
+	border: 1px solid var(--border)
+	padding: 0.45rem 0.7rem
+	text-align: left
+	vertical-align: top
+
+.prose th
+	background: var(--panel)
+	font-weight: 700
+
+.prose td > code, .prose th > code
+	background: none
+	padding: 0
+
+.boxdraw
+	--boxdraw-pad-y: 1rem
+	--boxdraw-pad-x: 1.15rem
+	position: relative
+	display: block
+	max-width: 100%
+	overflow-x: auto
+	vertical-align: top
+	background: var(--code-bg)
+	color: var(--code-fg)
+	font-family: 'Iosevka Web', ui-monospace, monospace
+	padding: var(--boxdraw-pad-y) var(--boxdraw-pad-x)
+	border-radius: 0.6rem
+	line-height: var(--boxdraw-line-height)
+	font-size: 0.88rem
+	margin: 1rem 0
+
+	pre
+		margin: 0
+		padding: 0
+		background: transparent
+		color: inherit
+		border-radius: 0
+		overflow: visible
+		line-height: inherit
+		font-size: inherit
+
+	code
+		color: inherit
+		background: none
+		padding: 0
+		font: inherit
+
+.boxdraw-svg
+	position: absolute
+	left: var(--boxdraw-pad-x)
+	top: var(--boxdraw-pad-y)
+	width: calc(var(--boxdraw-cols) * 1ch)
+	height: calc(var(--boxdraw-rows) * var(--boxdraw-line-height) * 1em)
+	overflow: visible
+	pointer-events: none
+
+.hero
+	text-align: center
+	padding: 3.5rem 0 2.5rem
+	border-bottom: 1px solid var(--border)
+	margin-bottom: 2rem
+
+.hero-title
+	font-family: 'Iosevka Web', monospace
+	font-size: 3.5rem
+	letter-spacing: -0.03em
+	margin: 0
+
+.hero-tagline
+	color: var(--muted)
+	font-size: 1.2rem
+	margin: 0.5rem 0 0
+
+.heroicon
+	display: flex
+	justify-content: center
+	margin: 1rem
+	gap: 3rem
+	overflow: hidden
+	flex-wrap: wrap
+
+	svg
+		height: 5rem !important
+		width: auto !important
+
+// ── Deck ──────────────────────────────────────────────────────────────────────
 
 .deck
 	position: fixed
@@ -33,15 +199,28 @@ body
 	flex-direction: column
 	padding: 5vmin 8vmin 8vmin
 	overflow: hidden
+	background: var(--bg)
 	// Hidden by default; the active slide fades in. All slides are stacked, so
 	// this is a crossfade rather than a reflow.
 	opacity: 0
 	visibility: hidden
-	transition: opacity 0.25s ease
+	z-index: 0
+	transition: opacity 0.3s ease
 
 .slide.is-active
 	opacity: 1
 	visibility: visible
+	z-index: 2
+
+// The slide we just left: kept fully opaque one layer below the incoming one,
+// so the crossfade never reveals the deck background (no white flash). For
+// incremental slides — same content plus a bullet — the unchanged parts fade in
+// over identical pixels and look static, while only the new part appears.
+.slide.is-prev
+	opacity: 1
+	visibility: visible
+	z-index: 1
+	transition: none
 
 .deck .slide h1
 	font-family: 'Iosevka Web', monospace

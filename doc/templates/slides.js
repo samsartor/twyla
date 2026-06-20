@@ -17,6 +17,7 @@
   const nextBtn = deck.querySelector('.deck-next');
 
   let index = 0;
+  let activeIndex = -1;
 
   const clamp = (i) => Math.max(0, Math.min(slides.length - 1, i));
 
@@ -26,7 +27,14 @@
   }
 
   function render() {
-    slides.forEach((slide, i) => slide.classList.toggle('is-active', i === index));
+    slides.forEach((slide, i) => {
+      slide.classList.toggle('is-active', i === index);
+      // The slide we just left stays opaque one layer below the incoming one
+      // (see `.is-prev` in slides.sass) so the crossfade never flashes the deck
+      // background.
+      slide.classList.toggle('is-prev', i === activeIndex && activeIndex !== index);
+    });
+    activeIndex = index;
     if (fill) fill.style.width = ((index + 1) / slides.length) * 100 + '%';
     if (counter) counter.textContent = (index + 1) + ' / ' + slides.length;
   }

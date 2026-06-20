@@ -61,9 +61,13 @@ try {
   )
   html.elem("link", attrs: (rel: "stylesheet", href: "https://bin.samsartor.com/iosevka_27.3.3/iosevka.css"))
   html.elem("link", attrs: (rel: "stylesheet", href: "https://bin.samsartor.com/iosevka_27.3.3/iosevka-aile.css"))
-  html.elem("link", attrs: (rel: "stylesheet", href: asset.sass("/sass/main.sass").url()))
+  // Slides use a self-contained stylesheet (it vendors the base/prose/boxdraw
+  // rules it needs from main.sass) so that ongoing work on the docs' main.sass
+  // can't silently break the presentation. Normal pages get main.sass.
   if slides {
     html.elem("link", attrs: (rel: "stylesheet", href: asset.sass("/sass/slides.sass").url()))
+  } else {
+    html.elem("link", attrs: (rel: "stylesheet", href: asset.sass("/sass/main.sass").url()))
   }
   html.elem("script", theme-script)
   html.elem("script", attrs: (data-goatcounter: "https://twyla.goatcounter.com/count", async: "", src: "//gc.zgo.at/count.js"))
