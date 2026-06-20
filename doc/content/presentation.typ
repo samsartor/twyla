@@ -19,6 +19,77 @@
   ]
 ]
 
+#slide(n: 10, i => [
+  #side-by-side[
+    = Markdown
+
+    #if i < 3 [
+      - Some obsidian notes
+    ]
+    #if i < 10 [
+      - My website
+      #image("presentation/samsartorcom_color_screenshot.png")
+    ]
+  ][
+    = #LaTeX
+    #if i < 3 [
+      - Some other notes
+    ]
+    - #if i < 8 [All] else [Most] of my research papers
+    #image("presentation/contentawaretiles.png")
+    #if i < 8 [ #image("presentation/latex_plot.png") ]
+  ][
+    #if i >= 2 [
+    = Typst
+      - Brand new!
+    ]
+    #if i >= 3 [
+      - The new notes
+    ]
+    #if i == 3 [
+      #image("presentation/brushverse_notes.png")
+    ]
+    #if i >= 4 [
+      - A bunch of diagrams
+    ]
+    #if i == 4 [
+      #image("presentation/brushverse_diagram.png")
+    ]
+    #if i >= 5 [
+      - My resume (on my website)
+    ]
+    #if i == 5 [
+      #image("presentation/resume_screenshot.png")
+    ]
+    #if i >= 6 [
+      - Sumner's resume
+    ]
+    #if i == 6 [
+      #image("presentation/sumner_resume.png")
+    ]
+    #if i == 7 [
+      #image("presentation/the_beginning.png")
+    ]
+    #if i >= 8 [
+      - The figures in a paper
+    ]
+    #if i == 8 [
+      #image("presentation/overpainting_cetz_screenshot.png")
+      #image("presentation/overpainting_teapot_screenshot.png")
+    ]
+    #if i >= 9 [
+      - My entire dissertation
+    ]
+    #if i == 9 [
+      #image("presentation/dissertation_flow_screenshot.png")
+    ]
+    #if i >= 10 [
+      - My website
+      #image("presentation/samsartorcom_color_screenshot.png")
+    ]
+  ]
+])
+
 #slide(n: 3)[
   = Zola
 
@@ -55,48 +126,6 @@
             </div>
         {%- endif -%}
     </div>
-    ```
-  ]
-]
-
-#slide(n: 3)[
-  = Twyla
-
-  #context if frame.get() == 1 [
-    Now my website is built using Twyla
-
-    #image("presentation/samsartorcom_color_screenshot.png")
-  ]
-  #context if frame.get() >= 2 [
-    ... which means it is written in Typst
-
-    ```typst
-    #set document(
-      title: "What is color?",
-      date: datetime(year: 2024, month: 9, day: 27),
-    )
-
-    = Physics <physics>
-
-    #html.blockquote[*Color is a property of light.*]
-
-    #svg(asset.file("electromagnetic_spectrum.svg"))
-    For example, light with a wavelength of #cols[460nm] is blue.
-    ```
-  ]
-  #context if frame.get() >= 3 [
-    ... and templated/themed using Typst
-
-    ```typst
-    #let svg(asset, size: "m", caption: none) = html.div(
-      class: "image --" + size,
-      {
-        context raw-html(asset.read())
-        if caption != none {
-          html.div(class: "caption", align: "center", caption)
-        }
-     },
-    )
     ```
   ]
 ]
@@ -154,6 +183,14 @@
   Leslie Lamport packaged #TeX together with his own macros as #LaTeX in the 1980s.
 
   #image("presentation/artofprogramming_screenshot.png")
+]
+
+#slide[
+  = #LaTeX HTML Export
+
+  #html.div(class: "centering", style: "font-size: 3em")[Pandoc!]
+
+  #image("presentation/pandoc-cartoon.svg")
 ]
 
 #slide(n: 2)[
@@ -234,75 +271,52 @@
   ]
 ]
 
-#slide(n: 9, i => [
-  #side-by-side[
-    = Markdown
+#slide(n: 3)[
+  = Twyla
 
-    #if i < 2 [
-      - Some obsidian notes
-    ]
-    #if i < 9 [
-      - My website
-      #image("presentation/samsartorcom_color_screenshot.png")
-    ]
-  ][
-    = #LaTeX
-    #if i < 2 [
-      - Some other notes
-    ]
-    - #if i < 7 [All] else [Most] of my research papers
-    #image("presentation/contentawaretiles.png")
-    #if i < 7 [ #image("presentation/latex_plot.png") ]
-  ][
-    = Typst
-    #if i == 1 [
-      - Nothing! We found out about it
-    ]
-    #if i >= 2 [
-      - The new notes
-    ]
-    #if i == 2 [
-      #image("presentation/brushverse_notes.png")
-    ]
-    #if i >= 3 [
-      - A bunch of diagrams
-    ]
-    #if i == 3 [
-      #image("presentation/brushverse_diagram.png")
-    ]
-    #if i >= 4 [
-      - My resume (on my website)
-    ]
-    #if i == 4 [
-      #image("presentation/resume_screenshot.png")
-    ]
-    #if i >= 5 [
-      - Sumner's resume
-    ]
-    #if i == 5 [
-      #image("presentation/sumner_resume.png")
-    ]
-    #if i == 6 [
-      #image("presentation/the_beginning.png")
-    ]
-    #if i >= 7 [
-      - The figures in a paper
-    ]
-    #if i == 7 [
-      #image("presentation/overpainting_cetz_screenshot.png")
-      #image("presentation/overpainting_teapot_screenshot.png")
-    ]
-    #if i >= 8 [
-      - My entire dissertation
-    ]
-    #if i == 8 [
-      #image("presentation/dissertation_flow_screenshot.png")
-    ]
-    #if i >= 9 [
-      - My website
-      #image("presentation/samsartorcom_color_screenshot.png")
-    ]
+  #context if frame.get() == 1 [
+    Now my website is built using Twyla
+
+    #image("presentation/samsartorcom_color_screenshot.png")
   ]
+  #context if frame.get() >= 2 [
+    ... which means it is written in Typst
+
+    ```typst
+    #set document(
+      title: "What is color?",
+      date: datetime(year: 2024, month: 9, day: 27),
+    )
+
+    = Physics <physics>
+
+    #html.blockquote[*Color is a property of light.*]
+
+    #svg(asset.file("electromagnetic_spectrum.svg"))
+    For example, light with a wavelength of #cols[460nm] is blue.
+    ```
+  ]
+  #context if frame.get() >= 3 [
+    ... and templated/themed using Typst
+
+    ```typst
+    #let svg(asset, size: "m", caption: none) = html.div(
+      class: "image --" + size,
+      {
+        context raw-html(asset.read())
+        if caption != none {
+          html.div(class: "caption", align: "center", caption)
+        }
+     },
+    )
+    ```
+  ]
+]
+
+#slide(n: 4, i => [
+  = Typst HTML Export
+
+  #image("presentation/html_history" + ("4", "1", "3", "2").at(i - 1) + ".png")
 ])
 
 /*
@@ -310,20 +324,6 @@
   #center-thought[Maybe I really should build my website in Typst...]
 ]
 */
-
-#slide[
-  = #LaTeX HTML Export
-
-  #html.div(class: "centering", style: "font-size: 3em")[Pandoc!]
-
-  #image("presentation/pandoc-cartoon.svg")
-]
-
-#slide(n: 4, i => [
-  = Typst HTML Export
-
-  #image("presentation/html_history" + str(i) + ".png")
-])
 
 /*
 #slide(n: 2)[
@@ -387,7 +387,10 @@
       ]
       #if i >= 9 { list.item[Declare new pages inside other pages with `#document[Hello!]`] }
       #if i >= 10 { list.item[`asset.file` -- read a file, or reference it by URL] } 
-      #if i >= 11 { list.item[`asset.sass` -- compile SASS/SCSS to CSS] } 
+      #if i >= 11 { list.item[`asset.sass` -- compile SASS/SCSS to CSS] }
+      #if i == 11 [```typc
+      context html.link(rel: "stylesheet", href: asset.sass("/sass/main.sass").url())
+      ```]
       #if i >= 12 { list.item[`asset.image` -- convert/resize images] } 
       #if i >= 13 { list.item[`asset.typst` -- invoke the Typst compiler to create images/pdfs] } 
     ] }
@@ -397,6 +400,10 @@
 
 #slide[
   #section[Dumb Stuff with Twyla]
+]
+
+#slide[
+  #html.div(html.iframe(src: "/", height: 800, width: 1200), class: "centering")
 ]
 
 #slide[
@@ -483,27 +490,16 @@
   ]
 ]
 
-#let quine = [```typst
-#let side-by-side(..pair) = pair.at(0)
-#let code = QUINE
-#side-by-side[
-  #code
-][
-  #context html.img(
-    src: asset.typst(
-      eval(code.text, mode: "markup"),
-      format: "svg",
-    ).url(),
-    style: "width: 100%",
-  )
+#slide[
+  = Making a Slide Deck
+
+  #center-thought[You are looking at it!]
 ]
-```]
+
+#let quine_inner = read("presentation/_quine.typ")
 #let quine_outer = (
-"#let code = ```typst\n" + quine.text.replace("QUINE", "[
-  #set page(width: auto, height: auto)
-  = Hello, World
-]") + "\n```",
-  ..quine.text.split("\n").slice(2),
+  "#let code = raw(read(\"presentation/_quine.typ\"), lang: \"typst\", block: true)",
+  ..quine_inner.split("\n").slice(5),
 ).join("\n")
 
 #slide[
@@ -514,19 +510,4 @@
     mode: "markup",
     scope: (side-by-side: side-by-side)
   )
-  /*
-  #let quine_code = eval(
-    quine_src,
-    mode: "markup",
-  )
-  #side-by-side[
-    #quine_code
-  ][
-    #eval(
-      quine_code.text,
-      mode: "markup",
-      scope: (side-by-side: side-by-side)
-    )
-  ]
-  */
 ]
