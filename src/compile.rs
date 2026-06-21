@@ -315,13 +315,18 @@ fn compile_bundle_loop(
             .collect(),
     );
 
-    // The first iteration realizes against an empty introspector; subsequent
-    // ones against the previous iteration's output wrapper. We keep every output
-    // wrapper so `analyze` can replay each recorded introspection across the
-    // whole history on non-convergence.
-    let empty = TwylaIntrospector {
+    // Warm-start: seed the first-pass introspector with the resolver's current
+    // asset state. After revalidate() the resolver retains all unchanged assets
+    // with their url/output_path intact from the previous compile, even though
+    // clear_asset_usage() has wiped their outputs/resolutions. If those stale
+    // URLs match what resolve_outputs will compute for this compile (true for
+    // any unchanged asset), iteration 1 produces correct HTML and constraint
+    // validates in one pass — eliminating the second full realization. On the
+    // very first compile the resolver is empty, so this is equivalent to the
+    // empty introspector it replaces.
+    let initial = TwylaIntrospector {
         inner: Arc::new(EmptyIntrospector),
-        assets: IdHashMap::new(),
+        assets: resolver.assets_snapshot(),
         documents: IdHashMap::new(),
         file_docs: file_docs.clone(),
         ctx: ctx.clone(),
@@ -334,7 +339,7 @@ fn compile_bundle_loop(
         // to its own bundle output; grows as discovery proceeds.
         let content = build_content(files, resolver);
 
-        let input: &TwylaIntrospector = history.last().unwrap_or(&empty);
+        let input: &TwylaIntrospector = history.last().unwrap_or(&initial);
         let constraint = comemo::Constraint::new();
 
         let mut subsink = Sink::new();
@@ -353,12 +358,15 @@ fn compile_bundle_loop(
 
         // Resolve every asset and collect every document this realization
         // requested (recorded as introspections), growing the resolver's stores.
-        discover_requests(resolver, world, subsink.introspections())?;
+        // Returns true when anything genuinely changed (new asset built, new
+        // output policy, new inline document) — only then do we need to re-run
+        // resolve_outputs, since nothing else can alter asset output paths.
+        let new_work = discover_requests(resolver, world, subsink.introspections())?;
 
         // Rebuild the engine after `subsink.introspections()`'s borrow ends, so
         // output-derivation closures can run against the same world/library and
         // warning sink without fighting the tracked `Sink` borrow.
-        {
+        if new_work {
             let mut engine = Engine {
                 library,
                 world,
@@ -390,7 +398,7 @@ fn compile_bundle_loop(
             // history so each can diagnose its own non-convergence (a twyla
             // asset/document that never stabilized produces a tailored message
             // via its `Introspect::diagnose`). Mirrors `typst::compile_impl`.
-            let mut introspectors = [&empty as &dyn Introspector; MAX_ITERS + 1];
+            let mut introspectors = [&initial as &dyn Introspector; MAX_ITERS + 1];
             for i in 1..MAX_ITERS {
                 introspectors[i] = &history[i - 1];
             }
@@ -424,19 +432,23 @@ fn compile_bundle_loop(
 /// resolution. Because the records live in the comemo-tracked [`Sink`], a
 /// memoized (cached) realization still reports its assets/documents here, so
 /// discovery never misses a page just because it didn't re-run.
+/// Returns `true` if any new asset was built, any existing asset gained a new
+/// output policy, or any new inline document was collected — i.e. whether
+/// `resolve_outputs` needs to run this iteration.
 fn discover_requests(
     resolver: &mut Resolver,
     world: Tracked<dyn World + '_>,
     introspections: &[Introspection],
-) -> SourceResult<()> {
+) -> SourceResult<bool> {
+    let mut changed = false;
     for introspection in introspections {
         if let Some(req) = introspection.downcast::<AssetReqIntrospect>() {
-            resolver.resolve_asset(world, &req.0)?;
+            changed |= resolver.resolve_asset(world, &req.0)?;
         } else if let Some(req) = introspection.downcast::<ResolvedDocumentIntrospect>() {
-            resolver.collect_document(&req.0)?;
+            changed |= resolver.collect_document(&req.0)?;
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 fn resolve_outputs(resolver: &mut Resolver, engine: &mut Engine) -> SourceResult<()> {

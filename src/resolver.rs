@@ -24,7 +24,8 @@ use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult};
 
 use crate::asset::{
-    AssetReq, AssetSpec, OutputReq, Resolution, ResolvedAsset, file, image, raw, sass, typst_doc,
+    AssetReq, AssetSpec, Built, OutputReq, Resolution, ResolvedAsset, cache, file, image, raw,
+    sass, typst_doc,
 };
 use crate::document::ResolvedDocument;
 use crate::project::TwylaContext;
@@ -135,23 +136,28 @@ impl Resolver {
     /// requests across iterations or call sites build once); the usage
     /// ([`outputs`](ResolvedAsset::outputs)) is unioned every time, so an asset
     /// both `.url()` and `.read()` ends up carrying both.
+    /// Returns `true` if a new asset was built or a new output policy was added
+    /// to an existing asset (meaning `resolve_outputs` must be re-run).
     pub fn resolve_asset(
         &mut self,
         world: Tracked<dyn World + '_>,
         req: &AssetReq,
-    ) -> SourceResult<()> {
+    ) -> SourceResult<bool> {
+        let mut changed = false;
         if !self.assets.contains_key(&req.spec) {
             let asset = self.build_asset(world, &req.spec, req.span)?;
             self.assets.insert_overwrite(Arc::new(asset));
+            changed = true;
         }
         let mut asset = self.assets.get_mut(&req.spec).expect("just resolved");
         let asset = Arc::make_mut(&mut *asset);
         for output in &req.outputs {
             if !asset.outputs.contains(output) {
                 asset.outputs.push(output.clone());
+                changed = true;
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// Resolve per-usage output policies into concrete bundle paths and URLs.
@@ -227,7 +233,9 @@ impl Resolver {
     /// reaching this twice — shown inline and `.url()`'d, or `.url()`'d
     /// repeatedly — dedups silently to one. Two *different* documents claiming
     /// one `output` is a conflict and errors.
-    pub fn collect_document(&mut self, doc: &ResolvedDocument) -> SourceResult<()> {
+    /// Returns `true` if a new document was added (meaning the next iteration's
+    /// content will differ and `resolve_outputs` must be re-run).
+    pub fn collect_document(&mut self, doc: &ResolvedDocument) -> SourceResult<bool> {
         if let Some(existing) = self.documents.get(doc.output.as_str()) {
             if **existing != *doc {
                 return Err(eco_vec![
@@ -238,21 +246,57 @@ impl Resolver {
                     .with_hint("each `document(..)` needs a distinct `output:`")
                 ]);
             }
-            return Ok(());
+            return Ok(false);
         }
         self.documents.insert_overwrite(Arc::new(doc.clone()));
-        Ok(())
+        Ok(true)
     }
 
-    /// Process one spec into a [`ResolvedAsset`]: dispatch to the per-type build,
-    /// then add the shared fingerprinted output path + URL.
+    /// Process one spec into a [`ResolvedAsset`]: check the filesystem cache,
+    /// dispatch to the per-type build on a miss, then add the shared
+    /// fingerprinted output path + URL.
     fn build_asset(
         &self,
         world: Tracked<dyn World + '_>,
         spec: &AssetSpec,
         span: typst::syntax::Span,
     ) -> SourceResult<ResolvedAsset> {
-        let built = match spec {
+        let cache_dir = self.ctx.cache_dir();
+        let built = if let Some(key) = cache::cache_key(spec) {
+            if let Some(cached) = cache::load(&cache_dir, key) {
+                cached
+            } else {
+                let built = self.build_asset_inner(world, spec, span)?;
+                cache::store(&cache_dir, key, &built);
+                built
+            }
+        } else {
+            self.build_asset_inner(world, spec, span)?
+        };
+
+        let output_path = self.ctx.default_asset_output(&built);
+        let url = self.ctx.asset_url(&output_path);
+
+        Ok(ResolvedAsset {
+            spec: spec.clone(),
+            span,
+            built,
+            output_path,
+            url,
+            resolutions: Vec::new(),
+            // Filled in by `resolve_asset` from the request(s) that reached it.
+            outputs: Vec::new(),
+        })
+    }
+
+    /// Unconditionally build `spec` without consulting the cache.
+    fn build_asset_inner(
+        &self,
+        world: Tracked<dyn World + '_>,
+        spec: &AssetSpec,
+        span: typst::syntax::Span,
+    ) -> SourceResult<Built> {
+        Ok(match spec {
             AssetSpec::File { file } => file::build(world, *file, &self.ctx, span)?,
             AssetSpec::Sass { file, minify } => {
                 sass::build(world, *file, *minify, &self.ctx, span)?
@@ -273,20 +317,6 @@ impl Resolver {
             AssetSpec::Typst { input, format, ppi } => {
                 typst_doc::build(world, input, *format, *ppi, &self.ctx, span)?
             }
-        };
-
-        let output_path = self.ctx.default_asset_output(&built);
-        let url = self.ctx.asset_url(&output_path);
-
-        Ok(ResolvedAsset {
-            spec: spec.clone(),
-            span,
-            built,
-            output_path,
-            url,
-            resolutions: Vec::new(),
-            // Filled in by `resolve_asset` from the request(s) that reached it.
-            outputs: Vec::new(),
         })
     }
 
