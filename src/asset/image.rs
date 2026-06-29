@@ -42,7 +42,7 @@ use typst::syntax::Span;
 /// ))
 /// ```
 ///
-/// By default, the image file is copied verbatim (same as #link[file]("#file")).
+/// By default, the image file is copied verbatim (same as #link("#file")[file]).
 /// If `format` is provided, the image will be transcoded. If `width`/`height` are
 /// provided, the image will be resized.
 ///

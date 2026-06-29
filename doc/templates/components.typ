@@ -103,8 +103,10 @@
   // The baked `///` docs are twyla's own builtin comments, authored as typst
   // markup — eval as markup so prose, lists, inline code, fenced blocks, and
   // tables all render. A doc comment that fails to parse fails the build.
-  if p.docs != none and p.docs != "" {
-    html.elem("div", attrs: (class: "param-body"), eval(p.docs, mode: "markup"))
+  // `describe` now evals doc comments to content in Rust (so failures name the
+  // builtin + Rust source), so `p.docs` is content, not a string to re-eval.
+  if p.docs != none {
+    html.elem("div", attrs: (class: "param-body"), p.docs)
   }
 })
 
@@ -193,8 +195,8 @@
   ref-heading(head-label, anchor, depth)
   render-signature(d, receiver: receiver)
 
-  if d.docs != none and d.docs != "" {
-    eval(d.docs, mode: "markup")
+  if d.docs != none {
+    d.docs
   }
 
   for p in visible-params(d) {

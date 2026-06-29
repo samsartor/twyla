@@ -59,7 +59,7 @@ pub struct SvgAsset {
     /// can reference the whole graphic cross-document. `{none}` (the default)
     /// leaves the root untouched; `{auto}` derives a stable id from the source
     /// content hash; a string is used verbatim. Read the resolved id back with
-    /// [`elem-id`]($asset.svg.elem-id).
+    /// #link("#elem-id")[`.elem-id()`].
     #[default(SvgId::None)]
     pub id: SvgId,
 
