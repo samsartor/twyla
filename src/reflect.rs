@@ -28,6 +28,41 @@ use typst::foundations::{
     Array, CastInfo, Dict, Func, IntoValue, Module, NativeParamInfo, Scope, Symbol, Type, Value,
     dict, func,
 };
+use typst::syntax::Source;
+use typst_utils::DefSite;
+
+/// Parse-check a baked-in doc string with the same parser the reference page's
+/// `eval(.., mode: "markup")` uses, and warn (pointing at the Rust source) if it
+/// won't parse.
+///
+/// A malformed `///` comment — an unclosed `[`, `$`, `#(`, etc. — otherwise
+/// surfaces only as an opaque "unclosed delimiter" pinned to the `eval` call
+/// site in `components.typ`, with no hint as to *which* builtin's docs are
+/// broken (typst traces print argument expressions, not their values). Here we
+/// re-parse up front and, on error, name the builtin plus its `def_site` Rust
+/// file and the line/column *within the doc comment*.
+fn check_docs(label: &str, def_site: Option<DefSite>, docs: &str) {
+    let source = Source::detached(docs);
+    let errors = source.root().errors();
+    if errors.is_empty() {
+        return;
+    }
+    let origin = match def_site {
+        Some(d) => format!("{} ({})", d.path, d.key),
+        None => "<unknown rust source>".into(),
+    };
+    for error in errors {
+        let at = source
+            .range(error.span)
+            .and_then(|range| source.lines().byte_to_line_column(range.start))
+            .map(|(line, col)| format!("doc-comment line {}, col {}", line + 1, col + 1))
+            .unwrap_or_else(|| "doc-comment".into());
+        eprintln!("warning: malformed docs for `{label}` at {origin}: {} ({at})", error.message);
+        for hint in &error.hints {
+            eprintln!("  hint: {hint}");
+        }
+    }
+}
 
 /// Describe a twyla builtin (function, type, or symbol) as a dict the docs
 /// markup can render: `name`, `title`, `docs`, `params`, `returns`, …
@@ -48,6 +83,8 @@ pub fn describe(
 
 /// Metadata for a native function: name, title, docs, and its parameters.
 fn describe_func(func: &Func) -> Dict {
+    let fn_name = func.name().unwrap_or("?");
+    check_docs(fn_name, func.def_site(), func.docs().unwrap_or_default());
     dict! {
         "name" => func.name(),
         "title" => func.title(),
@@ -56,7 +93,11 @@ fn describe_func(func: &Func) -> Dict {
         "contextual" => func.contextual(),
         "params" => func
             .params()
-            .filter_map(|info| info.to_native().map(|n| describe_param(n).into_value()))
+            .filter_map(|info| info.to_native())
+            .map(|n| {
+                check_docs(&format!("{fn_name}.{}", n.name), n.def_site, n.docs);
+                describe_param(n).into_value()
+            })
             .collect::<Array>(),
         "returns" => func.returns().map(describe_cast_info),
         "keywords" => func.keywords(),
@@ -88,6 +129,7 @@ fn describe_param(param: &NativeParamInfo) -> Dict {
 
 /// Metadata for a native type (e.g. twyla's `DocumentSink`).
 fn describe_ty(ty: &Type) -> Dict {
+    check_docs(ty.long_name(), Some(ty.def_site()), ty.docs());
     dict! {
         "short-name" => ty.short_name(),
         "long-name" => ty.long_name(),

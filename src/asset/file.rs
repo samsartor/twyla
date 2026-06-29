@@ -17,7 +17,7 @@ use typst::foundations::{Packed, PathOrStr, ShowFn, StyleChain, elem, func, scop
 use typst::loading::Encoding;
 use typst::syntax::{FileId, Span};
 
-/// Reference a project file as an asset, copied verbatim and fingerprinted.
+/// Pulls in a file verbatim as an asset.
 ///
 /// ```typ
 /// #context html.elem("img", attrs: (src: asset.file("logo.svg").url()))

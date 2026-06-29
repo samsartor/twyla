@@ -27,12 +27,7 @@ macro_rules! asset_methods {
     ($this:ty, $spec:path, $output:path, $default_encoding:expr, extra { $($extra:item)* }) => {
         #[scope]
         impl $this {
-            /// The resolved, fingerprinted URL of this asset. Contextual — call
-            /// it inside `#context`.
-            ///
-            /// `engine` precedes the `this` self-positional: the `#[func]` macro
-            /// forwards special params ahead of ordinary positionals, and the
-            /// method call prepends the element as that positional.
+            /// The resolved, fingerprinted URL of this asset.
             #[func(contextual)]
             fn url(
                 engine: &mut ::typst::engine::Engine,
@@ -51,9 +46,9 @@ macro_rules! asset_methods {
                 ))
             }
 
-            /// This asset's bytes — for inlining instead of linking. Mirrors the
-            /// native `read`: UTF-8 `str` by default, raw `bytes` with
-            /// `encoding: none`. Contextual.
+            /// This asset's bytes, to inline instead of link.
+            /// Returns a UTF-8 `str` by default, raw `bytes` with
+            /// `encoding: none`, same as #link("https://typst.app/docs/reference/data-loading/read")[read].
             #[func(contextual)]
             fn read(
                 engine: &mut ::typst::engine::Engine,

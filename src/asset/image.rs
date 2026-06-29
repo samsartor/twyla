@@ -34,7 +34,7 @@ use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{Bytes, Cast, Packed, PathOrStr, ShowFn, StyleChain, elem, func, scope};
 use typst::syntax::Span;
 
-/// Decode, resize, and re-encode a raster image asset.
+/// Pulls in an image file as an asset.
 ///
 /// ```typ
 /// #context html.elem("img", attrs: (
@@ -42,9 +42,12 @@ use typst::syntax::Span;
 /// ))
 /// ```
 ///
-/// With no `width`/`height` the image is only transcoded (to `format`); with no
-/// `format` it keeps its source format and is only resized. All parameters are
-/// settable, so `#set asset.image(format: "webp")` applies to a whole scope.
+/// By default, the image file is copied verbatim (same as #link[file]("#file")).
+/// If `format` is provided, the image will be transcoded. If `width`/`height` are
+/// provided, the image will be resized.
+///
+/// All parameters are settable, so `#set asset.image(format: "webp")` applies to
+/// any image asset in the scope.
 #[elem(scope, name = "image")]
 pub struct ImageAsset {
     /// Path to the source image, relative to the calling file.
