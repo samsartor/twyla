@@ -38,7 +38,7 @@ use typst_library::visualize::{
 };
 
 use crate::asset::{
-    AssetSpec, ImageSource, OutputReq, image, resolve_image_or_request, resolve_or_request,
+    AssetSpec, ImageSource, OutputReq, image, resolve_image_or_request, resolve_or_request, svg,
 };
 
 /// Install twyla's native HTML rules into a freshly built library's
@@ -65,6 +65,8 @@ pub fn install(rules: &mut NativeRuleMap) {
     rules.register(Target::Paged, crate::asset::sass::SHOW_RULE);
     rules.register(Target::Html, crate::asset::image::SHOW_RULE);
     rules.register(Target::Paged, crate::asset::image::SHOW_RULE);
+    rules.register(Target::Html, crate::asset::svg::SHOW_RULE);
+    rules.register(Target::Paged, crate::asset::svg::SHOW_RULE);
     rules.register(Target::Html, crate::asset::typst_doc::SHOW_RULE);
     rules.register(Target::Paged, crate::asset::typst_doc::SHOW_RULE);
 }
@@ -199,10 +201,12 @@ const LINK_RULE: ShowFn<LinkElem> = |elem, engine, _| {
 /// [`ImageSource::File`] (read + watched), an inline/byte-source image an
 /// [`ImageSource::Bytes`].
 ///
-/// **Vector images** (SVG/PDF) can't be raster-processed, so they stay verbatim:
-/// a path-backed one is a fingerprinted [`AssetSpec::File`] copy, a byte-source
-/// one a content-addressed [`AssetSpec::Raw`] with its extension sniffed from the
-/// bytes ([`image_ext`]).
+/// **SVG images** route through the `asset.svg` pipeline ([`AssetSpec::Svg`]),
+/// so a markdown `![](icon.svg)` minifies per any `#set asset.svg(..)` on the
+/// chain ([`svg::spec_from_styles`]). **Other vectors** (PDF) stay verbatim: a
+/// path-backed one is a fingerprinted [`AssetSpec::File`] copy, a byte-source
+/// one a content-addressed [`AssetSpec::Raw`] with its extension sniffed from
+/// the bytes ([`image_ext`]).
 const IMAGE_RULE: ShowFn<ImageElem> = |elem, engine, styles| {
     let span = elem.span();
     let Derived {
@@ -217,11 +221,10 @@ const IMAGE_RULE: ShowFn<ImageElem> = |elem, engine, styles| {
     };
 
     // Only raster formats can go through the decode/resize/transcode pipeline;
-    // vectors are copied verbatim.
-    let raster = matches!(
-        ImageFormat::detect(&loaded.data),
-        Some(ImageFormat::Raster(_))
-    );
+    // SVGs go through the minify pipeline; other vectors are copied verbatim.
+    let detected = ImageFormat::detect(&loaded.data);
+    let raster = matches!(detected, Some(ImageFormat::Raster(_)));
+    let is_svg = matches!(detected, Some(ImageFormat::Vector(VectorFormat::Svg)));
 
     let (src, dimensions) = if raster {
         let img_source = match file {
@@ -231,6 +234,16 @@ const IMAGE_RULE: ShowFn<ImageElem> = |elem, engine, styles| {
         let spec = image::spec_from_styles(img_source, styles).at(span)?;
         let resolved = resolve_image_or_request(engine, spec, span);
         (resolved.url, resolved.dimensions)
+    } else if is_svg {
+        let source = match file {
+            Some(file) => ImageSource::File(file),
+            None => ImageSource::Bytes(loaded.data.clone()),
+        };
+        let spec = svg::spec_from_styles(source, styles);
+        (
+            resolve_or_request(engine, spec, span, OutputReq::Auto),
+            None,
+        )
     } else {
         let spec = match file {
             Some(file) => AssetSpec::File { file },

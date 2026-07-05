@@ -23,5 +23,6 @@ pub(crate) fn build(bytes: Bytes, ext: Option<EcoString>) -> Built {
         upstream: Vec::new(),
         emit: crate::render::Emit::Bytes(bytes),
         dimensions: None,
+        elem_id: None,
     }
 }

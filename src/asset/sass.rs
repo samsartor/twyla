@@ -133,6 +133,7 @@ pub(crate) fn build(
         ext: Some("css".to_string()),
         stem,
         dimensions: None,
+        elem_id: None,
     })
 }
 

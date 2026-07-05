@@ -90,6 +90,13 @@ pub struct TypstAsset {
     #[default(144)]
     pub ppi: i64,
 
+    /// Minify `svg` output with svgm (best-effort — unparsable output warns
+    /// and passes through). Ignored by the other formats (and excluded from
+    /// their cache key). Off by default so raw compiles stay byte-identical to
+    /// `typst compile`.
+    #[default(false)]
+    pub minify: bool,
+
     /// Bundle-relative output path policy.
     #[default(OutputReq::Auto)]
     pub output: OutputReq,
@@ -113,7 +120,16 @@ fn spec(elem: &Packed<TypstAsset>, styles: StyleChain) -> HintedStrResult<AssetS
         Format::Png => elem.ppi.get(styles),
         _ => 0,
     };
-    Ok(AssetSpec::Typst { input, format, ppi })
+    let minify = match format {
+        Format::Svg => elem.minify.get(styles),
+        _ => false,
+    };
+    Ok(AssetSpec::Typst {
+        input,
+        format,
+        ppi,
+        minify,
+    })
 }
 
 fn output(elem: &Packed<TypstAsset>, styles: StyleChain) -> HintedStrResult<OutputReq> {
@@ -196,13 +212,16 @@ impl Format {
 /// compiles the real project file as `main`; an inline content value is bound
 /// into the stock global scope and compiled through a one-line synthetic
 /// `main`. Every file the sub-compile reads is recorded into `upstream`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build(
     world: Tracked<dyn World + '_>,
     input: &TypstInput,
     format: Format,
     ppi: i64,
+    minify: bool,
     ctx: &TwylaContext,
     span: Span,
+    warnings: &mut Vec<SourceDiagnostic>,
 ) -> SourceResult<Built> {
     // A stock library: the standard typst stdlib (with the HTML feature, needed
     // for `format: "html"` and harmless otherwise) but NONE of twyla's
@@ -254,7 +273,14 @@ pub(crate) fn build(
         Format::Svg | Format::Png | Format::Pdf => {
             let doc = compile_paged(&subworld)?;
             match format {
-                Format::Svg => typst_svg::svg_merged(&doc, Abs::zero()).into_bytes(),
+                Format::Svg => {
+                    let svg = typst_svg::svg_merged(&doc, Abs::zero());
+                    if minify {
+                        super::svg::minify_str(svg, span, warnings).into_bytes()
+                    } else {
+                        svg.into_bytes()
+                    }
+                }
                 Format::Pdf => typst_pdf::pdf(&doc, &PdfOptions::default())?,
                 Format::Png => {
                     let ppp = ppi as f32 / 72.0;
@@ -278,6 +304,7 @@ pub(crate) fn build(
         ext: Some(format.ext().to_owned()),
         stem,
         dimensions: None,
+        elem_id: None,
     })
 }
 

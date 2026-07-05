@@ -24,7 +24,8 @@ use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult};
 
 use crate::asset::{
-    AssetReq, AssetSpec, OutputReq, Resolution, ResolvedAsset, file, image, raw, sass, typst_doc,
+    AssetReq, AssetSpec, OutputReq, Resolution, ResolvedAsset, file, image, raw, sass, svg,
+    typst_doc,
 };
 use crate::document::ResolvedDocument;
 use crate::project::TwylaContext;
@@ -43,6 +44,11 @@ pub struct Resolver {
     assets: IdHashMap<Arc<ResolvedAsset>>,
     /// Every document discovered so far, keyed by its `output` path.
     documents: IdHashMap<Arc<ResolvedDocument>>,
+    /// Warnings pushed by asset builds this compile (e.g. a best-effort svg
+    /// minify that fell back to verbatim). Drained into the sink by the
+    /// compile loop after each discovery pass; a build only runs (and so only
+    /// warns) when its spec isn't already cached.
+    warnings: Vec<SourceDiagnostic>,
 }
 
 impl Resolver {
@@ -53,7 +59,13 @@ impl Resolver {
             ctx: ctx.clone(),
             assets: IdHashMap::new(),
             documents: IdHashMap::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Drain the warnings asset builds queued since the last call.
+    pub fn take_warnings(&mut self) -> Vec<SourceDiagnostic> {
+        std::mem::take(&mut self.warnings)
     }
 
     // -- snapshots: cheap Arc clones for the introspector + convergence history -
@@ -247,7 +259,7 @@ impl Resolver {
     /// Process one spec into a [`ResolvedAsset`]: dispatch to the per-type build,
     /// then add the shared fingerprinted output path + URL.
     fn build_asset(
-        &self,
+        &mut self,
         world: Tracked<dyn World + '_>,
         spec: &AssetSpec,
         span: typst::syntax::Span,
@@ -259,6 +271,9 @@ impl Resolver {
             }
             // `Raw` is in-memory bytes — it can't fail, so it needs no span.
             AssetSpec::Raw { bytes, ext } => raw::build(bytes.clone(), ext.clone()),
+            AssetSpec::Svg { source, minify, id } => {
+                svg::build(source, *minify, id, &self.ctx, span, &mut self.warnings)?
+            }
             AssetSpec::Image {
                 source,
                 width,
@@ -270,9 +285,21 @@ impl Resolver {
             } => image::build(
                 source, *width, *height, *fit, *filter, *format, *quality, &self.ctx, span,
             )?,
-            AssetSpec::Typst { input, format, ppi } => {
-                typst_doc::build(world, input, *format, *ppi, &self.ctx, span)?
-            }
+            AssetSpec::Typst {
+                input,
+                format,
+                ppi,
+                minify,
+            } => typst_doc::build(
+                world,
+                input,
+                *format,
+                *ppi,
+                *minify,
+                &self.ctx,
+                span,
+                &mut self.warnings,
+            )?,
         };
 
         let output_path = self.ctx.default_asset_output(&built);

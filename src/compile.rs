@@ -355,6 +355,13 @@ fn compile_bundle_loop(
         // requested (recorded as introspections), growing the resolver's stores.
         discover_requests(resolver, world, subsink.introspections())?;
 
+        // Surface warnings the asset builds queued (e.g. a best-effort svg
+        // minify that fell back to verbatim). A build only runs on a cache
+        // miss, so each warning fires once per (re)build, not per iteration.
+        for warning in resolver.take_warnings() {
+            subsink.warn(warning);
+        }
+
         // Rebuild the engine after `subsink.introspections()`'s borrow ends, so
         // output-derivation closures can run against the same world/library and
         // warning sink without fighting the tracked `Sink` borrow.

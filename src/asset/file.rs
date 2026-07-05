@@ -87,5 +87,6 @@ pub(crate) fn build(
             .map(|e| e.to_ascii_lowercase()),
         upstream: vec![on_disk],
         dimensions: None,
+        elem_id: None,
     })
 }

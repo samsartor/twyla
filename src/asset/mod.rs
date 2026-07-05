@@ -19,6 +19,12 @@
 /// `func`/`scope` attributes the element already uses.
 macro_rules! asset_methods {
     ($this:ty, $spec:path, $output:path, $default_encoding:expr) => {
+        asset_methods!($this, $spec, $output, $default_encoding, extra {});
+    };
+    // The `extra { .. }` arm appends element-specific contextual methods to the
+    // one `#[scope]` impl (a type has exactly one scope, so extras can't live
+    // in a second impl at the call site) — e.g. `asset.svg`'s `elem-id()`.
+    ($this:ty, $spec:path, $output:path, $default_encoding:expr, extra { $($extra:item)* }) => {
         #[scope]
         impl $this {
             /// The resolved, fingerprinted URL of this asset. Contextual — call
@@ -63,6 +69,8 @@ macro_rules! asset_methods {
                 let spec = $spec(&elem, context.styles()?)?;
                 $crate::asset::read_or_request(engine, spec, elem.span(), encoding)
             }
+
+            $($extra)*
         }
     };
 }
@@ -71,6 +79,7 @@ pub(crate) mod file;
 pub(crate) mod image;
 pub(crate) mod raw;
 pub(crate) mod sass;
+pub(crate) mod svg;
 pub(crate) mod typst_doc;
 
 use std::hash::{Hash, Hasher};
@@ -114,6 +123,13 @@ pub enum AssetSpec {
         /// by the caller; `None` → `bin`.
         ext: Option<EcoString>,
     },
+    Svg {
+        source: ImageSource,
+        minify: bool,
+        /// Root-element `id` request (`none`/`auto`/fixed). Part of the key, so
+        /// differently-id'd uses of one file are distinct assets.
+        id: svg::SvgId,
+    },
     Image {
         source: ImageSource,
         width: Option<u32>,
@@ -130,6 +146,8 @@ pub enum AssetSpec {
         /// `png` resolution in pixels per inch. Normalized to `0` for the other
         /// formats, so it never fragments their output.
         ppi: i64,
+        /// Minify `svg` output. Normalized to `false` for the other formats.
+        minify: bool,
     },
 }
 
@@ -239,7 +257,7 @@ impl Introspect for AssetReqIntrospect {
 /// bytes) — carried for emission policy and the upcoming per-request output
 /// paths. `span` blames a real source location when a [`build`](file::build)
 /// fails (missing file, sass error).
-fn introspect_asset(
+pub(crate) fn introspect_asset(
     engine: &mut Engine,
     spec: AssetSpec,
     span: Span,
@@ -379,6 +397,7 @@ pub fn module() -> Module {
     let mut scope = Scope::new();
     scope.define_elem::<file::FileAsset>();
     scope.define_elem::<sass::SassAsset>();
+    scope.define_elem::<svg::SvgAsset>();
     scope.define_elem::<image::ImageAsset>();
     scope.define_elem::<typst_doc::TypstAsset>();
     Module::new("asset", scope)
@@ -417,6 +436,10 @@ pub struct Built {
     /// ([`image::build`]) — lets the native image rule emit `<img width height>`
     /// for aspect-ratio reservation. `None` for non-image assets.
     pub dimensions: Option<(u32, u32)>,
+    /// The `id` injected on the root `<svg>` element ([`svg::build`]) — what
+    /// `asset.svg(..).elem-id()` resolves to. `None` for every other asset
+    /// type (and for `id: none` svgs).
+    pub elem_id: Option<String>,
 }
 
 impl Built {

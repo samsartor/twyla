@@ -363,26 +363,191 @@ fn set_rule_transcodes_native_images() {
     );
 }
 
-/// Vector images can't be raster-processed, so a native SVG stays a verbatim
-/// fingerprinted copy with no intrinsic-dimension attrs.
+/// A native SVG image routes through the `asset.svg` minify pipeline (not the
+/// raster one): the output is minified and gets no intrinsic-dimension attrs.
 #[test]
-fn native_vector_image_stays_verbatim() {
+fn native_svg_image_routes_through_svg_pipeline() {
     let (ctx, dir) = site(&[("content/main.typ", "#image(\"logo.svg\")")]);
     std::fs::write(
         dir.path().join("content/logo.svg"),
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"></svg>",
+        "<!-- strip me -->\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"></svg>",
     )
     .unwrap();
 
     let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
     assert!(
         assets[0].output_path.ends_with(".svg"),
-        "svg copied verbatim: {}",
+        "svg output: {}",
         assets[0].output_path
+    );
+    let bytes = assets[0].built.emit.read().unwrap();
+    assert!(
+        !String::from_utf8(bytes.to_vec()).unwrap().contains("strip me"),
+        "native svg should be minified (comment stripped)"
     );
     assert!(
         !html.contains("width=\"10\""),
         "vector image should not get raster dimension attrs:\n{html}"
+    );
+}
+
+/// `#set asset.svg(minify: false)` reaches native images too: the markdown-style
+/// `#image("x.svg")` keeps its bytes verbatim under the set rule.
+#[test]
+fn set_rule_disables_native_svg_minify() {
+    let src = "<!-- keep me -->\n<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
+    let (ctx, dir) = site(&[(
+        "content/main.typ",
+        "#set asset.svg(minify: false)\n#image(\"logo.svg\")",
+    )]);
+    std::fs::write(dir.path().join("content/logo.svg"), src).unwrap();
+
+    let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    let bytes = assets[0].built.emit.read().unwrap();
+    assert_eq!(
+        String::from_utf8(bytes.to_vec()).unwrap(),
+        src,
+        "minify: false should pass the source through verbatim"
+    );
+}
+
+/// `asset.svg` minifies and injects a fixed root `id`, inlinable via `.read()`.
+#[test]
+fn svg_asset_minifies_and_sets_root_id() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context raw-html(asset.svg(\"icon.svg\", id: \"logo\").read())",
+        ),
+        (
+            "content/icon.svg",
+            "<!-- gone -->\n<svg xmlns=\"http://www.w3.org/2000/svg\">\n  <circle r=\"5\"/>\n</svg>",
+        ),
+    ]);
+    let (html, _assets) = compile(&RenderWorld::new(&ctx).unwrap());
+
+    assert!(
+        html.contains("id=\"logo\""),
+        "root id not injected:\n{html}"
+    );
+    assert!(!html.contains("gone"), "comment survived minify:\n{html}");
+    assert!(
+        !html.contains("__twyla-asset-pending__") && !html.contains("__twyla-svg-id-pending__"),
+        "placeholder leaked:\n{html}"
+    );
+}
+
+/// `id: auto` derives a stable id and `.elem-id()` resolves it, so a template
+/// can build `<use href="url#id">` — the cross-document `<use>` pattern.
+#[test]
+fn svg_auto_id_resolves_through_elem_id() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context {\n\
+               let icon = asset.svg(\"icon.svg\", id: auto)\n\
+               raw-html(\"<use href=\\\"\" + icon.url() + \"#\" + icon.elem-id() + \"\\\"/>\")\n\
+             }",
+        ),
+        (
+            "content/icon.svg",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"5\"/></svg>",
+        ),
+    ]);
+    let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+
+    assert_eq!(assets.len(), 1, "got {assets:?}");
+    let id = assets[0]
+        .built
+        .elem_id
+        .clone()
+        .expect("auto id recorded on the built asset");
+    assert!(id.starts_with("svg-"), "unexpected auto id: {id}");
+    assert!(
+        html.contains(&format!("#{id}\"")),
+        "page missing use fragment #{id}:\n{html}"
+    );
+    let bytes = String::from_utf8(assets[0].built.emit.read().unwrap().to_vec()).unwrap();
+    assert!(
+        bytes.contains(&format!("id=\"{id}\"")),
+        "emitted svg missing injected id {id}:\n{bytes}"
+    );
+    assert!(
+        !html.contains("__twyla-svg-id-pending__"),
+        "id placeholder leaked:\n{html}"
+    );
+}
+
+/// Minification is best-effort: a source svgm can't parse passes through
+/// verbatim (with a warning) instead of failing the build.
+#[test]
+fn unparsable_svg_passes_through_verbatim() {
+    let src = "<svg><open></svg>";
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context asset.svg(\"bad.svg\").url()",
+        ),
+        ("content/bad.svg", src),
+    ]);
+    let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+
+    let bytes = assets[0].built.emit.read().unwrap();
+    assert_eq!(
+        String::from_utf8(bytes.to_vec()).unwrap(),
+        src,
+        "unparsable svg should pass through verbatim"
+    );
+}
+
+/// ...but an `id` request on an unparsable svg is a hard error: the id can't
+/// be injected, and passing through silently would break `<use>` references.
+#[test]
+fn unparsable_svg_with_id_request_errors() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context asset.svg(\"bad.svg\", id: \"x\").url()",
+        ),
+        ("content/bad.svg", "<svg><open></svg>"),
+    ]);
+    let err = RenderWorld::new(&ctx)
+        .unwrap()
+        .compile_bundle(&mut Resolver::new(&ctx))
+        .err()
+        .expect("id on an unparsable svg should fail the build");
+    assert!(
+        err.to_string().contains("failed to parse"),
+        "expected a parse error, got:\n{err}"
+    );
+}
+
+/// `asset.typst(format: "svg", minify: true)` runs the compiled SVG through
+/// svgm — the output shrinks but is still an SVG.
+#[test]
+fn typst_svg_minify_shrinks_output() {
+    let snippet = |minify: &str| {
+        format!(
+            "#context asset.typst(circle(fill: blue, radius: 6pt), format: \"svg\"{minify}).url()"
+        )
+    };
+
+    let (ctx_plain, _a) = site(&[("content/main.typ", snippet("").leak())]);
+    let (_html, plain) = compile(&RenderWorld::new(&ctx_plain).unwrap());
+    let plain_len = plain[0].built.emit.read().unwrap().len();
+
+    let (ctx_min, _b) = site(&[("content/main.typ", snippet(", minify: true").leak())]);
+    let (_html, minified) = compile(&RenderWorld::new(&ctx_min).unwrap());
+    let min_bytes = minified[0].built.emit.read().unwrap();
+
+    assert!(
+        min_bytes.starts_with(b"<svg"),
+        "minified output should still be an svg"
+    );
+    assert!(
+        min_bytes.len() < plain_len,
+        "minify should shrink the svg: {} !< {plain_len}",
+        min_bytes.len()
     );
 }
 

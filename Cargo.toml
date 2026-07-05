@@ -82,6 +82,11 @@ owo-colors = { version = "4", features = ["supports-colors"] }
 
 iddqd = "0.4.2"
 
+# SVG minifier (svgo port) for `asset.svg`. We call its parse → optimize →
+# serialize stages directly (rather than `optimize_with_config`) so the root
+# `id` attribute can be injected on the parsed tree before serialization.
+svgm-core = "0.3"
+
 [dev-dependencies]
 # Scratch output dir for the `twyla build` integration test (tests/site.rs).
 tempfile = "3"

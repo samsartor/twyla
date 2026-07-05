@@ -317,6 +317,7 @@ pub(crate) fn build(
         ext: Some(out_format.ext().to_owned()),
         stem,
         dimensions,
+        elem_id: None,
     })
 }
 
