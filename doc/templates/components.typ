@@ -143,7 +143,7 @@
 
 // `twyla-reflect.describe` only knows about native functions, types, and
 // symbols. A few reference entries are plain values (currently
-// `sys.twyla_version`), so render those explicitly instead of silently dropping
+// `sys.twyla-version`), so render those explicitly instead of silently dropping
 // them when `describe` returns `none`.
 #let is-reference-value(value) = type(value) == version
 

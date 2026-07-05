@@ -298,13 +298,16 @@ mod tests {
     use crate::html::parse_html;
 
     /// Diff two fragments and render the patch (default 1 line of context).
-    /// Stdout is captured in tests, so owo emits no color — assertions match
-    /// plain `-`/`+` lines.
     fn patch(expected: &str, actual: &str) -> String {
         patch_ctx(expected, actual, 1, 1)
     }
 
     fn patch_ctx(expected: &str, actual: &str, above: usize, below: usize) -> String {
+        // libtest captures output in-process, so the stdout fd is still a tty
+        // when run from a terminal and owo would emit ANSI codes between the
+        // `-`/`+` prefix and the content. Force color off so assertions match
+        // plain lines regardless of where the tests run.
+        owo_colors::set_override(false);
         let e = parse_html(expected);
         let a = parse_html(actual);
         let d = diff(&e, &a).expect_err("expected a divergence");

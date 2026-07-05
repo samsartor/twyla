@@ -44,7 +44,7 @@ fn native_asset_builtin_resolves_with_zero_imports() {
         page.contains("Twyla runtime detected:")
             && page.contains(">true<")
             && page.contains(env!("CARGO_PKG_VERSION")),
-        "sys.twyla_version was not visible through sys; got:\n{page}",
+        "sys.twyla-version was not visible through sys; got:\n{page}",
     );
 
     // And a bare content file still produced a full document shell.
