@@ -91,15 +91,84 @@ try {
   [Built with #html.a(href: "https://github.com/samsartor/twyla")[Twyla]]
 )
 
-// The home-page hero banner.
-#let hero = html.elem("section", attrs: (class: "hero"), {
-  html.div(class: "heroicon", for p in (70deg, 40deg, 20deg) {
-    html.frame(grabber-canvas(
-      theta: 0deg,
-      phi: p,
-      color: grabber-grad,
-    ))
+// The landing-page hero: a simple proposition inside the procedural orbit,
+// followed immediately by a small source → result proof.
+#let hero = html.elem("section", attrs: (class: "hero hero-hybrid"), {
+  html.div(class: "orbit-field", {
+    html.div(class: "orbit-ring orbit-ring-one")
+    html.div(class: "orbit-ring orbit-ring-two")
+    for (i, p) in (18deg, 31deg, 46deg, 62deg, 38deg, 24deg).enumerate() {
+      html.div(
+        class: "orbit-tool orbit-tool-" + str(i + 1),
+        html.frame(grabber-canvas(
+          theta: i * 43deg - 82deg,
+          phi: p,
+          color: grabber-grad,
+        )),
+      )
+    }
   })
-  html.elem("h1", attrs: (class: "hero-title"), "Twyla")
-  html.elem("p", attrs: (class: "hero-tagline"), [The static site generator where everything is Typst.])
+  html.div(class: "hero-copy", {
+    html.elem("h1", attrs: (class: "hero-title"), [
+      Everything is #html.span(class: "hero-accent", "Typst").
+    ])
+    html.elem("p", attrs: (class: "hero-tagline"), [
+      Write content, templates, and site logic in one expressive language.
+      Twyla turns it into fast, static HTML.
+    ])
+    html.div(class: "hero-actions", {
+      html.a(class: "hero-button", href: "#getting-started", [Start with one file])
+      html.a(class: "hero-link", href: "/reference/", [Explore the API →])
+    })
+  })
+  html.div(class: "hero-specimen", {
+    html.div(class: "specimen-source", {
+      html.div(class: "specimen-bar", {
+        html.span(class: "window-dots", [● ● ●])
+        html.span([content/main.typ])
+      })
+      html.elem("pre", attrs: (class: "specimen-code"), {
+        html.span(class: "line-no", "1")
+        html.span(class: "syntax-muted", "#set document(")
+        "\n"
+        html.span(class: "line-no", "2")
+        "  "
+        html.span(class: "syntax-key", "title")
+        ": "
+        html.span(class: "syntax-value", "\"Field Notes\"")
+        ",\n"
+        html.span(class: "line-no", "3")
+        html.span(class: "syntax-muted", ")")
+        "\n"
+        html.span(class: "line-no", "4")
+        "\n"
+        html.span(class: "line-no", "5")
+        html.span(class: "syntax-mark", "=")
+        " Things worth keeping\n"
+        html.span(class: "line-no", "6")
+        "Written entirely in "
+        html.span(class: "syntax-key", "#emph[Typst]")
+        "."
+      })
+      html.div(class: "specimen-status", {
+        html.span([twyla serve])
+        html.span(class: "build-ok", [built in 42ms])
+      })
+    })
+    html.div(class: "specimen-result", {
+      html.div(class: "result-nav", {
+        html.b([Field Notes])
+        html.span([Archive  About])
+      })
+      html.div(class: "result-rule")
+      html.div(class: "result-date", [Issue 04 · July 2026])
+      html.div(class: "result-title", [Things worth keeping])
+      html.p([Written entirely in #html.em([Typst]).])
+      html.div(class: "result-tongs", html.frame(grabber-canvas(
+        theta: -18deg,
+        phi: 42deg,
+        color: grabber-grad,
+      )))
+    })
+  })
 })
