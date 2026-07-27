@@ -6,6 +6,7 @@
 
 #import "theme.typ": *
 #import "components.typ": *
+#import "journey.typ": *
 #import "boxdraw.typ": boxdraw
 
 #let note = frame("Note", blue)

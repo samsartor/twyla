@@ -1,3 +1,5 @@
+#import "/templates/journey.typ": *
+
 #let horizontalrule = context { if target() == "html" { html.hr() } else { line(length: 100%) } }
 
 <twyla>
@@ -24,29 +26,46 @@ personal blog, not your company homepage.
 Your best option (for now) is to compile Twyla from source:
 
 ```
-cargo install https://github.com/samsartor/twyla
+cargo install --git https://github.com/samsartor/twyla
 ```
 
 = Getting Started
 <getting-started>
-All you need to start using twyla is a single file!
+We will grow one small site from a single unstyled file into a complete,
+programmable theme. Each step changes only a little; the preview shows the
+cumulative result.
 
-```tree
-content/
-└ main.typ
+#journey-step(
+  "01",
+  title: [Start with one file],
+  kicker: [A page],
+  files: ("content/main.typ",),
+  code: [
+```example
+#set document(title: "Field Notes")
+
+= Things worth keeping
+
+Hello! This is my new site.
 ```
+  ],
+  preview: preview-one,
+)[
+  A Twyla site needs no configuration file. Run `twyla serve`, open
+  #link("http://localhost:1111")[localhost:1111], and this Typst document is
+  already HTML—with live reload while you write.
+]
 
-If you `twyla serve` and point your browser at
-#link("http://localhost:1111") you will see your `main.typ` as HTML. Go
-ahead and add something, possibly your name? The webpage reloads
-automatically.
-
-To deploy your website, simply run
-`twyla build --base-url https://example.com` and copy the `public` dir
-to the provider of your choice.
-
-Additional pages are just additional files:
-
+#journey-step(
+  "02",
+  title: [Let the site grow],
+  kicker: [More pages],
+  files: (
+    "content/rewriting-my-blog.typ",
+    "content/oops-i-vibecoded-my-blog.typ",
+    "content/how-to-bake-bread.typ",
+  ),
+  code: [
 ```tree
 content/
 ├ main.typ
@@ -54,140 +73,124 @@ content/
 ├ oops-i-vibecoded-my-blog.typ
 └ how-to-bake-bread.typ
 ```
+  ],
+  preview: preview-pages,
+)[
+  Additional pages are just additional files. Twyla maps the content tree to
+  clean URLs, so the project structure remains obvious as the site expands.
+]
 
-For a blog you will probably want to list your other pages on your home
-page. To do that, use the
-#link("https://twyla.dev/reference/#documents")[documents()] iterator:
-
+#journey-step(
+  "03",
+  title: [Turn pages into data],
+  kicker: [Metadata + listings],
+  files: ("content/main.typ", "content/rewriting-my-blog.typ"),
+  code: [
 ```example
-= My Blog
+= Recent notes
 
 #context for doc in documents() {
   if not doc.draft and doc.kind == "post" [
     == #link(doc.url, doc.title)
     #doc.date.display()
-    
-    #doc.description    
-  ]
-}
 
-== Other Stuff
-
-I make bread!
-```
-
-You can see Twyla's main idea in action: _there is no configuration, only code._
-Typst is a real programming language. If you want to create sidebars, listings,
-tags, "recents", whatever ... well that is what for loops are for!
-
-Before you get carried away, please include basic information like `title` and `date`:
-
-```example
-#set document(
-  title: "Rewriting My Blog",
-  date: datetime(year: 2026, month: 4, day: 12),
-  description: [
-    My blog was written in normal everyday Markdown, but as a
-    tech hipster I found that unacceptable...
-  ],
-)
-```
-
-Twyla's #link("https://twyla.dev/reference#document")[document] function
-supports a number of additional features, beyond what are available in normal
-Typst, including an `extra` field you can fill with whatever data you want.
-
-For the purpose of theming you can also add a SCSS file and
-#link("https://typst.app/docs/reference/html")[some HTML];:
-
-```tree
-content/
-├ main.typ
-├ rewriting-my-blog.typ
-├ oops-i-vibecoded-my-blog.typ
-└ how-to-bake-bread.typ
-sass/
-└ main.sass
-```
-
-#horizontalrule
-
-```sass
-.post-header
-  display: flex
-  border: 1px black
-
-.post-title
-  flex: grow
-  size: 2em
-
-.post-date:
-  color: grey  
-```
-
-#horizontalrule
-
-```example
-#context for doc in documents() {
-  if not doc.draft and doc.kind == "post" [
-    html.div(
-      html.div(
-        [#doc.title],
-        class: "post-title",
-        style: "color: " + doc.extra.color,
-      ),
-      html.div(    
-        [#doc.date.display()],
-        class: "post-date",
-      ),
-      class: "post-header",
-    )
-    
     #doc.description
   ]
 }
 ```
+  ],
+  preview: preview-listing,
+)[
+  Add `title`, `date`, and `description` with
+  #link("https://twyla.dev/reference#document")[document()], then use the
+  #link("https://twyla.dev/reference/#documents")[documents()] iterator to
+  build the home page. There is no listing configuration—just a for loop.
+]
 
-If you would like to include an image, you can use either the built-in
-image function or handle it explicitly with Twyla's
-#link("https://twyla.dev/reference/assets")[asset system];:
+#journey-step(
+  "04",
+  title: [Give it a visual system],
+  kicker: [Templates + Sass],
+  files: ("templates/page.typ", "sass/main.sass"),
+  code: [
+```sass
+.post
+  display: grid
+  grid-template-columns: 2rem 1fr auto
+  gap: 1rem
+  padding: 1rem 0
+  border-top: 1px solid #d8d2c5
 
+.post-date
+  color: #a9562e
+```
+  ],
+  preview: preview-styled,
+)[
+  Typst show rules control the markup; Sass controls its presentation. Both
+  are ordinary source files, so a theme can be as small or as ambitious as
+  the site needs.
+]
+
+#journey-step(
+  "05",
+  title: [Bring in real assets],
+  kicker: [Images],
+  files: ("content/audrey.jpg", "content/audrey.typ"),
+  code: [
 ```example
 #image("./audrey.jpg")
 
-#context html.img(src: asset.image("./audrey.jpg", format: "webp", width: 512).url())
+#context html.img(
+  src: asset.image(
+    "./audrey.jpg",
+    format: "webp",
+    width: 512,
+  ).url(),
+)
 ```
+  ],
+  preview: preview-image,
+)[
+  Use Typst's built-in image function, or ask Twyla's
+  #link("https://twyla.dev/reference/assets")[asset system] to resize and
+  convert the source. The generated URL is fingerprinted and ready to publish.
+]
 
-Assets are pretty powerful, you can use them to do all kinds of stuff!
-
+#journey-step(
+  "06",
+  title: [Make the theme programmable],
+  kicker: [Generated artwork],
+  files: ("grabber.typ", "templates/theme.typ"),
+  code: [
 ```example
+#import "/grabber.typ": grabber-canvas
 
-Check out this pretty #context html.img(src: asset.file("icon.svg").url()) icon.
-
-#figure(
-  context raw-html(asset.typst("./_diagram.typ", format: "svg").read()),
-  caption: [A diagram of some sort],
-)
-
-#figure(
-  context html.img(src: asset.typst(circle(), format: "svg").url(), style: "width: 100%"),
-  caption: [A big cirle],
+#context raw-html(
+  asset.typst(
+    grabber-canvas(phi: 35deg),
+    format: "svg",
+  ).read(),
 )
 ```
+  ],
+  preview: preview-advanced,
+)[
+  Assets do not have to start as files. These fireplace tongs are drawn
+  procedurally with #link("https://cetz-package.github.io")[Cetz], rendered
+  by Typst, and emitted by Twyla as SVG. The theme really is part of the
+  program.
+]
 
-Ok, so what is happening there in that last example? Twyla is rendering a
-`circle()` as an SVG, writing that SVG to a generated path in your `public/`
-folder, and then providing the URL to reference as the src of an image _OR_
-inline as an `<svg>` element.
-
-You can find an even cooler example here on Twyla's own website. See the
-little fireplace tongs we use as an icon? Those are drawn procedurally in a
-#link("https://cetz-package.github.io")[Cetz] canvas, and then rendered by Twyla
-as part of the theme, in order to generate the actual favicon URL!
+#html.div(class: "journey-finish", [
+  #html.span(class: "finish-prompt", "$")
+  `twyla build --base-url https://example.com`
+  #html.span(class: "finish-result", [Your complete static site is in `public/`.])
+])
 
 = Customization
 <customization>
-Twyla customization and theming is mainly accomplished using Typt's
+Twyla customization and theming is mainly accomplished using Typst's
 usual
 #link("https://typst.app/docs/reference/styling#show-rules")[show rules];.
 For example, you can replace Twyla's default theme and build your own
