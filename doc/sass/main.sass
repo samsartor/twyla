@@ -783,83 +783,7 @@ body
     min-height: 15rem
     margin-top: 0
 
-// ── Cumulative Getting Started journey ────────────────────────────────────
-
-.journey-step
-  position: relative
-  width: min(72rem, calc(100vw - 2rem))
-  margin: 5rem 50% 0
-  padding-left: 3.6rem
-  transform: translateX(-50%)
-  &::before
-    content: ""
-    position: absolute
-    left: 1rem
-    top: 2.1rem
-    bottom: -5.1rem
-    width: 1px
-    background: linear-gradient(var(--accent), var(--border))
-
-.journey-marker
-  position: absolute
-  left: 0
-  top: .1rem
-  z-index: 2
-  display: grid
-  place-items: center
-  width: 2.1rem
-  height: 2.1rem
-  border: 1px solid var(--accent)
-  border-radius: .28rem
-  color: var(--accent)
-  background: var(--bg)
-  box-shadow: .22rem .22rem 0 color-mix(in srgb, var(--copper) 70%, transparent)
-  font-family: 'Iosevka Web', monospace
-  font-size: .68rem
-
-.journey-heading
-  max-width: 53rem
-
-.journey-kicker
-  color: var(--copper)
-  font-family: 'Iosevka Web', monospace
-  font-size: .68rem
-  font-weight: 700
-  letter-spacing: .1em
-  text-transform: uppercase
-
-.prose .journey-title
-  margin: .35rem 0 .6rem
-  font-size: clamp(1.8rem, 4vw, 2.55rem)
-  letter-spacing: -.05em
-
-.journey-copy
-  max-width: 48rem
-  color: var(--muted)
-  p
-    margin: 0
-
-.journey-files
-  display: flex
-  align-items: center
-  flex-wrap: wrap
-  gap: .4rem
-  margin-top: 1rem
-  font-family: 'Iosevka Web', monospace
-  font-size: .65rem
-
-.files-label
-  margin-right: .2rem
-  color: var(--muted)
-  text-transform: uppercase
-  letter-spacing: .08em
-
-.file-chip
-  padding: .18rem .45rem
-  border: 1px solid var(--border)
-  border-radius: 999px
-  color: var(--fg)
-  background: var(--panel)
+// ── Source → result guide examples ─────────────────────────────────────────
 
 .journey-workspace
   display: grid
@@ -937,10 +861,6 @@ body
 .browser-url
   grid-column: 2
 
-.browser-live
-  justify-self: end
-  color: #6dcbaf
-
 .browser-page
   position: relative
   min-height: 19.3rem
@@ -951,220 +871,196 @@ body
   border-radius: .16rem
   overflow: hidden
 
-.demo-plain
-  font-family: Arial, sans-serif
-  h1
-    margin: 0 0 1rem
-    font-size: 1.65rem
-  p
-    margin: .5rem 0
-  a
-    display: block
-    margin: .7rem 0
-    color: #164e9b
-    text-decoration: underline
+// Project structure sits directly above the exact main.typ that consumes it;
+// executable examples evaluate the same raw source they display.
 
-.demo-one
-  padding-top: 3rem
+.example-workspace
+  margin: 1.5rem 0 2.25rem
 
-.demo-pages
-  hr
-    margin: 1.2rem 0
-    border: 0
-    border-top: 1px solid #bbb
+.project-example
+  margin: 1.4rem 0 2.25rem
 
-.demo-mini-nav
+.project-tree
+  overflow: hidden
+  border: 1px solid #39423e
+  border-radius: .45rem
+  background: var(--bench)
+  box-shadow: .4rem .4rem 0 color-mix(in srgb, var(--border) 72%, transparent)
+
+.project-tree-label
+  min-height: 2.5rem
   display: flex
-  justify-content: space-between
   align-items: center
-  margin-bottom: 2.3rem
-  font-size: .68rem
-  span
-    color: #747970
-    font-family: 'Iosevka Web', monospace
-    font-size: .52rem
-    word-spacing: .7rem
-
-.demo-listing
-  h1
-    font-size: 1.5rem
-
-.demo-post
-  display: grid
-  grid-template-columns: 5.4rem 1fr
-  margin-top: 1rem
-  padding-top: .75rem
-  border-top: 1px solid #cbc8bf
-  font-size: .72rem
-  p
-    grid-column: 2
-    color: #686d65
-    font-size: .64rem
-
-.demo-date
-  color: #8c5140
+  padding: 0 .85rem
+  border-bottom: 1px solid #39423e
+  color: #dfe5df
   font-family: 'Iosevka Web', monospace
-  font-size: .55rem
-
-.browser-styled .browser-page
-  padding: 1.3rem 1.45rem
-  background: #f2eee3
-
-.demo-styled
-  font-family: Georgia, serif
-
-.demo-rule
-  height: 1px
-  margin-top: -1.6rem
-  margin-bottom: 2.1rem
-  background: #c6c2b7
-
-.demo-overline
-  color: #a9562e
-  font-family: 'Iosevka Web', monospace
-  font-size: .5rem
-  letter-spacing: .09em
-  text-transform: uppercase
-
-.demo-styled h1
-  max-width: 11ch
-  margin: .55rem 0 1.4rem
-  font-size: 1.65rem
-  font-weight: 500
-  line-height: 1
-
-.styled-post
-  display: grid
-  grid-template-columns: 1.2rem 1fr auto
-  gap: .65rem
-  padding: .7rem 0
-  border-top: 1px solid #cbc6ba
   font-size: .65rem
-  > span, time
-    color: #a9562e
-    font-family: 'Iosevka Web', monospace
-    font-size: .5rem
-  p
-    margin: .22rem 0 0
-    color: #70736c
-    font-size: .55rem
 
-.image-layout
-  display: grid
-  grid-template-columns: 1.05fr .95fr
-  gap: 1.2rem
-  align-items: center
-  min-height: 14rem
+.project-tree .boxdraw
+  min-height: 0
+  margin: 0
+  border: 0
+  border-radius: 0
+  box-shadow: none
+  background: #111514
+
+.project-listing
+  margin-top: .75rem
+
+.example-workspace .browser-page
+  font-size: .78rem
+  line-height: 1.5
   h1
-    margin-bottom: .7rem
+    margin: 0 0 1.2rem
+    font-size: 1.8rem
+  h2
+    margin: 1.4rem 0 .4rem
+    padding-bottom: .25rem
+    border-bottom: 1px solid #a9a79f
+    font-size: 1.2rem
   p
-    color: #6c7169
-    font-size: .63rem
-    line-height: 1.5
-  img
-    width: 100%
-    height: 12rem
-    object-fit: cover
-    filter: saturate(.78) contrast(1.04)
+    margin: .6rem 0
+  a
+    color: #167d81
 
-.read-more
-  color: #167d81
-  font-family: 'Iosevka Web', monospace
-  font-size: .52rem
-
-.browser-advanced .browser-page
-  color: #e9ece7
-  background: #171a1a
-
-.demo-advanced
-  position: absolute
-  inset: 0
-  padding: 1.4rem
+.image-example .browser-page
+  height: 22rem
+  display: grid
+  grid-template-columns: repeat(2, minmax(0, 1fr))
+  gap: .7rem
+  align-items: center
   overflow: hidden
 
-.demo-advanced .demo-mini-nav
-  position: relative
-  z-index: 2
-  color: #e9ece7
-  span
-    color: #99a099
+.image-example .browser-page picture,
+.image-example .browser-page > img
+  display: block
+  min-width: 0
 
-.advanced-copy
-  position: relative
-  z-index: 2
-  width: 75%
-  margin: 4.2rem auto 0
-  text-align: center
-  h1
-    margin: .55rem auto .8rem
-    font-family: 'Iosevka Web', monospace
-    font-size: 1.55rem
-    line-height: 1
-    letter-spacing: -.05em
-  p
-    color: #9da49d
-    font-size: .62rem
+.image-example .browser-page img
+  display: block
+  width: 100%
+  max-height: 19rem
+  object-fit: cover
 
-.advanced-orbit
-  position: absolute
-  inset: 0
-  opacity: .65
+.generated-example .browser-page
+  height: 25rem
+  overflow-y: auto
 
-.advanced-tool
-  position: absolute
-  svg
-    width: auto !important
-    height: 3.2rem !important
-
-.advanced-tool-1
-  left: -1rem
-  top: 5rem
-.advanced-tool-2
-  right: -.8rem
-  top: 3.5rem
-.advanced-tool-3
-  left: 1.2rem
-  bottom: 1rem
-  transform: scale(.7)
-.advanced-tool-4
-  right: 1.4rem
-  bottom: .8rem
-  transform: scale(.75)
-
-.journey-finish
-  width: min(58rem, calc(100vw - 2rem))
+.generated-example .browser-page > p:first-child
   display: flex
   align-items: center
-  gap: .55rem
-  margin: 5rem 50% 1rem
-  padding: 1rem 1.1rem
-  transform: translateX(-50%)
-  border: 1px solid #39423e
-  border-radius: .4rem
-  color: #e8ece7
-  background: var(--bench)
-  box-shadow: .4rem .4rem 0 color-mix(in srgb, var(--accent) 35%, var(--border))
-  font-family: 'Iosevka Web', monospace
-  font-size: .74rem
-  code
-    padding: 0
-    background: transparent
+  gap: .25rem
 
-.finish-prompt
-  color: var(--copper)
+.generated-example .browser-page > p:first-child img
+  width: 1.4rem
+  height: 1.4rem
 
-.finish-result
-  margin-left: auto
-  color: #70d5be
+.generated-example .browser-page figure
+  margin: 1rem 0
+  text-align: center
+  svg, img
+    width: auto !important
+    max-width: 100%
+    max-height: 15rem
+
+.generated-example .browser-page figcaption
+  color: #686d65
+  font-size: .65rem
+
+// ── Heading rhythm and small registration marks ───────────────────────────
+
+.prose > h1:not(.hero-title)
+  margin: .35rem 0 1.35rem
+  font-size: clamp(2.2rem, 5vw, 2.8rem)
+  letter-spacing: -.055em
+  &::after
+    content: ""
+    display: block
+    width: 2.8rem
+    height: .18rem
+    margin-top: .65rem
+    border-radius: 999px
+    background: linear-gradient(90deg, var(--accent) 0 68%, var(--copper) 68%)
+
+.prose > h2:not(.ref-item)
+  position: relative
+  margin-top: 4.8rem
+  margin-bottom: .7rem
+  padding: 0 0 .55rem 1.2rem
+  border-bottom: 1px solid var(--border)
+  letter-spacing: -.045em
+  &::before
+    content: ""
+    position: absolute
+    left: 0
+    top: .43em
+    width: .48rem
+    height: .48rem
+    border: 1px solid var(--accent)
+    border-radius: .08rem
+    background: var(--bg)
+    box-shadow: .18rem .18rem 0 var(--copper)
+
+.prose > h3:not(.ref-item)
+  margin-top: 2.85rem
+  margin-bottom: .6rem
+  letter-spacing: -.025em
+
+// Reference headings use the same mark, but the connecting rule makes a long
+// API page easier to scan. Nested methods step down in size naturally through
+// their h3/h4 level without changing the component markup.
+.prose .ref-item
+  position: relative
+  display: flex
+  align-items: center
+  gap: .7rem
+  margin: 4.3rem 0 .75rem
+  padding: 0 0 .5rem 1.15rem
+  border-bottom: 1px solid var(--border)
+  letter-spacing: -.035em
+  &::before
+    content: ""
+    position: absolute
+    left: 0
+    top: .42em
+    width: .42rem
+    height: .42rem
+    border-radius: 50%
+    background: var(--accent)
+    box-shadow: .16rem .16rem 0 var(--copper)
+  &::after
+    content: ""
+    width: 2rem
+    height: 1px
+    margin-left: auto
+    background: linear-gradient(90deg, var(--border), transparent)
+
+.prose .ref-item code
+  padding: 0
+  border-radius: 0
+  color: var(--fg)
+  background: transparent
+  font-size: .94em
+  font-weight: 650
+
+.prose h3.ref-item
+  margin-top: 3.55rem
+  font-size: 1.3rem
+  padding-bottom: .42rem
+
+.prose h4.ref-item
+  margin-top: 2.9rem
+  font-size: 1.1rem
+  padding-bottom: .38rem
+  &::before
+    width: .34rem
+    height: .34rem
+
+.prose h2.ref-item
+  font-size: 1.7rem
 
 @media (max-width: 48rem)
-  .journey-step
-    width: calc(100vw - 1rem)
-    padding-left: 2.8rem
-  .journey-marker
-    left: .1rem
-  .journey-step::before
-    left: 1.1rem
   .journey-workspace
     grid-template-columns: 1fr
   .journey-source
@@ -1174,24 +1070,14 @@ body
     min-height: 18rem
   .journey-browser
     min-height: 23rem
-  .journey-finish
-    align-items: flex-start
-    flex-wrap: wrap
-  .finish-result
-    width: 100%
-    margin-left: 1.1rem
+  .image-example .browser-page
+    height: auto
+    min-height: 18rem
+  .prose > h2:not(.ref-item)
+    margin-top: 4rem
+  .prose .ref-item
+    margin-top: 3.45rem
 
 @media (max-width: 30rem)
-  .journey-step
-    padding-left: 2.35rem
-  .journey-marker
-    width: 1.8rem
-    height: 1.8rem
-  .journey-step::before
-    left: 1rem
-  .journey-files
-    align-items: flex-start
-  .files-label
-    width: 100%
   .browser-page
     padding: 1rem
