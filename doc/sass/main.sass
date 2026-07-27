@@ -232,7 +232,6 @@ code, pre, .type, .signature, .param-name, .param-default
   display: block
   max-width: 100%
   overflow-x: auto
-  vertical-align: top
   background: var(--code-bg)
   color: var(--code-fg)
   font-family: 'Iosevka Web', ui-monospace, monospace
@@ -399,10 +398,15 @@ code, pre, .type, .signature, .param-name, .param-default
 // ── Hero ────────────────────────────────────────────────────────────────────
 
 .hero
-  text-align: center
+  position: relative
+  width: 100vw
+  min-height: 50rem
   padding: 3.5rem 0 2.5rem
-  border-bottom: 1px solid var(--border)
-  margin-bottom: 2rem
+  margin: 0 calc(50% - 50vw) 9rem
+  padding: 6.5rem 1.5rem 0
+  background: radial-gradient(circle at 50% 27%, var(--hero-glow), transparent 30%), var(--bg)
+  text-align: center
+  isolation: isolate
 
 .hero-title
   font-family: 'Iosevka Web', monospace
@@ -454,13 +458,8 @@ code, pre, .type, .signature, .param-name, .param-default
   --accent: light-dark(#167d81, #65cdd0)
   --copper: light-dark(#a9562e, #e69361)
   --bench: #0e1111
-  --code-bg: #202524
+  --code-bg: #111514
   --hero-glow: light-dark(rgba(84, 197, 199, .18), rgba(77, 203, 205, .1))
-
-body
-  background-image: linear-gradient(color-mix(in srgb, var(--border) 26%, transparent) 1px, transparent 1px), linear-gradient(90deg, color-mix(in srgb, var(--border) 26%, transparent) 1px, transparent 1px)
-  background-size: 3rem 3rem
-  background-position: center 3.9rem
 
 .site-header
   padding: .85rem max(1.25rem, calc((100vw - 78rem) / 2))
@@ -469,25 +468,10 @@ body
 
 .site-brand
   letter-spacing: -.04em
-  &::before
-    content: "⌁"
-    margin-right: .45rem
-    color: var(--copper)
 
 .content
   max-width: 58rem
   padding-top: 0
-
-.hero-hybrid
-  position: relative
-  width: 100vw
-  min-height: 50rem
-  margin: 0 calc(50% - 50vw) 7rem
-  padding: 6.5rem 1.5rem 0
-  border-bottom: 1px solid var(--border)
-  background: radial-gradient(circle at 50% 27%, var(--hero-glow), transparent 30%), var(--bg)
-  text-align: center
-  isolation: isolate
 
 .hero-copy
   position: relative
@@ -495,7 +479,7 @@ body
   width: min(43rem, 100%)
   margin: 0 auto
 
-.hero-hybrid .hero-title
+.hero .hero-title
   max-width: 11ch
   margin: 0 auto
   font-size: clamp(3.3rem, 7vw, 5.8rem)
@@ -506,7 +490,7 @@ body
 .hero-accent
   color: var(--copper)
 
-.hero-hybrid .hero-tagline
+.hero .hero-tagline
   max-width: 36rem
   margin: 1.45rem auto 0
   color: var(--muted)
@@ -645,7 +629,7 @@ body
   color: #657069
   letter-spacing: .18rem
 
-.specimen-code
+pre.specimen-code
   margin: 0
   padding: 1.2rem 1rem
   color: #e8ece7
@@ -739,15 +723,11 @@ body
     width: auto !important
     height: 6.2rem !important
 
-.prose > p:first-of-type
-  font-size: 1.12rem
-  line-height: 1.75
-
 .prose h2
   margin-top: 3.5rem
   letter-spacing: -.04em
 
-.prose pre, .signature, .boxdraw
+.prose>pre, .signature, .boxdraw
   border: 1px solid #38413e
   border-radius: .35rem
   box-shadow: .4rem .4rem 0 color-mix(in srgb, var(--border) 70%, transparent)
@@ -757,10 +737,9 @@ body
     gap: .8rem
   .site-nav-link:nth-child(1)
     display: none
-  .hero-hybrid
+  .hero
     min-height: 55rem
     padding-top: 5rem
-    margin-bottom: 5rem
   .orbit-field
     height: 31rem
   .orbit-ring-one
@@ -826,7 +805,7 @@ body
 
 .journey-code
   height: calc(100% - 2.5rem)
-  background: #111514
+  background: var(--code-bg)
 
 .prose .journey-code pre, .journey-code .boxdraw
   height: 100%
@@ -841,35 +820,18 @@ body
   line-height: 1.7
 
 .journey-browser
-  height: calc(100% - 2.5rem)
+  height: 100%
   min-height: 22.5rem
-  padding: .75rem
-  background: #171b1a
-
-.browser-bar
-  display: grid
-  grid-template-columns: 1fr auto 1fr
-  align-items: center
-  min-height: 1.7rem
-  color: #78837c
-  font-family: 'Iosevka Web', monospace
-  font-size: .54rem
-
-.browser-dots
-  letter-spacing: .16rem
-
-.browser-url
-  grid-column: 2
-
-.browser-page
-  position: relative
-  min-height: 19.3rem
-  height: calc(100% - 1.7rem)
-  padding: 1.5rem
   color: #292d29
-  background: #f5f2ea
+  background: white
   border-radius: .16rem
   overflow: hidden
+
+.journey-browser iframe
+  width: 100%
+  height: 100%
+  border: none
+  margin-left: 1em
 
 // Project structure sits directly above the exact main.typ that consumes it;
 // executable examples evaluate the same raw source they display.
@@ -908,78 +870,18 @@ body
 .project-listing
   margin-top: .75rem
 
-.example-workspace .browser-page
-  font-size: .78rem
-  line-height: 1.5
-  h1
-    margin: 0 0 1.2rem
-    font-size: 1.8rem
-  h2
-    margin: 1.4rem 0 .4rem
-    padding-bottom: .25rem
-    border-bottom: 1px solid #a9a79f
-    font-size: 1.2rem
-  p
-    margin: .6rem 0
-  a
-    color: #167d81
-
-.image-example .browser-page
-  height: 22rem
-  display: grid
-  grid-template-columns: repeat(2, minmax(0, 1fr))
-  gap: .7rem
-  align-items: center
-  overflow: hidden
-
-.image-example .browser-page picture,
-.image-example .browser-page > img
-  display: block
-  min-width: 0
-
-.image-example .browser-page img
-  display: block
-  width: 100%
-  max-height: 19rem
-  object-fit: cover
-
-.generated-example .browser-page
-  height: 25rem
-  overflow-y: auto
-
-.generated-example .browser-page > p:first-child
-  display: flex
-  align-items: center
-  gap: .25rem
-
-.generated-example .browser-page > p:first-child img
-  width: 1.4rem
-  height: 1.4rem
-
-.generated-example .browser-page figure
-  margin: 1rem 0
-  text-align: center
-  svg, img
-    width: auto !important
-    max-width: 100%
-    max-height: 15rem
-
-.generated-example .browser-page figcaption
-  color: #686d65
-  font-size: .65rem
-
 // ── Heading rhythm and small registration marks ───────────────────────────
 
 .prose > h1:not(.hero-title)
-  margin: .35rem 0 1.35rem
-  font-size: clamp(2.2rem, 5vw, 2.8rem)
+  margin: 2rem 0 0 0
+  font-size: 2rem
   letter-spacing: -.055em
   &::after
     content: ""
     display: block
     width: 2.8rem
     height: .18rem
-    margin-top: .65rem
+    margin-top: .18rem
     border-radius: 999px
     background: linear-gradient(90deg, var(--accent) 0 68%, var(--copper) 68%)
 
@@ -1070,7 +972,7 @@ body
     min-height: 18rem
   .journey-browser
     min-height: 23rem
-  .image-example .browser-page
+  .image-example .journey-browser
     height: auto
     min-height: 18rem
   .prose > h2:not(.ref-item)
@@ -1079,5 +981,5 @@ body
     margin-top: 3.45rem
 
 @media (max-width: 30rem)
-  .browser-page
-    padding: 1rem
+  .journey-browser
+     padding: 1rem

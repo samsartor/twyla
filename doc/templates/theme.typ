@@ -54,7 +54,7 @@ try {
         gt: 3mm
       )
       #context rect(fill: black, height: auto, width: auto, inset: 5mm, radius: 20mm, thing)
-      
+
     ], format: "svg", output: "/favicon.svg").url(),
   )
   html.elem("link", attrs: (rel: "stylesheet", href: "https://bin.samsartor.com/iosevka_27.3.3/iosevka.css"))
@@ -93,7 +93,7 @@ try {
 
 // The landing-page hero: a simple proposition inside the procedural orbit,
 // followed immediately by a small source → result proof.
-#let hero = html.elem("section", attrs: (class: "hero hero-hybrid"), {
+#let hero = html.elem("section", attrs: (class: "hero"), {
   html.div(class: "orbit-field", {
     html.div(class: "orbit-ring orbit-ring-one")
     html.div(class: "orbit-ring orbit-ring-two")
@@ -113,8 +113,7 @@ try {
       Everything is #html.span(class: "hero-accent", "Typst").
     ])
     html.elem("p", attrs: (class: "hero-tagline"), [
-      Write content, templates, and site logic in one expressive language.
-      Twyla turns it into fast, static HTML.
+      Write static site content, templates, and logic in one expressive language.
     ])
     html.div(class: "hero-actions", {
       html.a(class: "hero-button", href: "#getting-started", [Start with one file])

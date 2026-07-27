@@ -2,13 +2,7 @@
 // value and use that same value both for syntax-highlighted source and eval,
 // so the displayed code is exactly what produced the preview.
 
-#let browser-frame(body, class: "") = html.div(class: "journey-browser " + class, {
-  html.div(class: "browser-bar", {
-    html.span(class: "browser-dots", [● ● ●])
-    html.span(class: "browser-url", [localhost:1111])
-  })
-  html.div(class: "browser-page", body)
-})
+#let browser-frame(body, class: "") = context html.div(class: "journey-browser " + class, html.iframe(src: asset.typst(body, format: "html").url()))
 
 #let source-result(
   source,
@@ -59,7 +53,7 @@
   (
     title: [Rewriting My Blog],
     date: datetime(year: 2026, month: 4, day: 12),
-    description: [My blog was written in normal everyday Markdown.],
+    description: [It used to be written in Markdown.],
     url: "#rewriting-my-blog",
     kind: "post",
     draft: false,
@@ -67,7 +61,7 @@
   (
     title: [Oops, I Vibecoded My Blog],
     date: datetime(year: 2026, month: 4, day: 7),
-    description: [A few notes from building the first version.],
+    description: [Where did all those em dashes come from?],
     url: "#oops-i-vibecoded-my-blog",
     kind: "post",
     draft: false,
@@ -75,7 +69,7 @@
   (
     title: [How to Bake Bread],
     date: datetime(year: 2026, month: 4, day: 3),
-    description: [The recipe I learned from that talking rat.],
+    description: [This recipe I learned from a talking rat.],
     url: "#how-to-bake-bread",
     kind: "post",
     draft: false,

@@ -1,4 +1,4 @@
-#import "/templates/journey.typ": *
+#import "_journey.typ": *
 
 #let horizontalrule = context { if target() == "html" { html.hr() } else { line(length: 100%) } }
 #let guide-example(source, scope: (:), ..args) = source-result(
@@ -16,10 +16,6 @@ Content is written in Typst. Your templates are written in Typst. Your
 themes are written in Typst (and in
 #link("https://sass-lang.com/")[SASS];). Everything is Typst! Except
 Twyla itself, which is written in Rust.
-
-For an example, check out my own
-#link("https://samsartor.com")[personal website]
-(#link("https://gitlab.com/samsartor/site")[Source];).
 
 #quote(block: true)[
 Twyla is still in early development, and mostly vibe-coded. Use for your
@@ -84,18 +80,16 @@ page. To do that, use the
 #let listing-example = ```example
 = My Blog
 
+I make bread! And wrote these posts:
+
 #context for doc in documents() {
   if not doc.draft and doc.kind == "post" [
     == #link(doc.url, doc.title)
     #doc.date.display()
-    
+
     #doc.description
   ]
 }
-
-== Other Stuff
-
-I make bread!
 ```
 
 #project-example(
@@ -154,7 +148,7 @@ sass/
   size: 2em
 
 .post-date:
-  color: grey  
+  color: grey
 ```
 
 #horizontalrule
@@ -168,13 +162,13 @@ sass/
         class: "post-title",
         style: "color: " + doc.extra.color,
       ),
-      html.div(    
+      html.div(
         [#doc.date.display()],
         class: "post-date",
       ),
       class: "post-header",
     )
-    
+
     #doc.description
   ]
 }
@@ -246,7 +240,7 @@ HTML from scratch:
 
   show heading.where(level: 1): it => {
     html.h1(smallcaps(it.body), class: "title")
-  }  
+  }
 
   html.elem("html", attrs: (lang: "en"), {
     html.elem("head", {
