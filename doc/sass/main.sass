@@ -458,7 +458,7 @@ code, pre, .type, .signature, .param-name, .param-default
   --accent: light-dark(#167d81, #65cdd0)
   --copper: light-dark(#a9562e, #e69361)
   --bench: #0e1111
-  --code-bg: #111514
+  --code-bg: #0e1111
   --hero-glow: light-dark(rgba(84, 197, 199, .18), rgba(77, 203, 205, .1))
 
 .site-header
@@ -592,7 +592,6 @@ code, pre, .type, .signature, .param-name, .param-default
   position: relative
   z-index: 3
   width: min(49rem, calc(100vw - 2rem))
-  min-height: 22rem
   display: grid
   grid-template-columns: 1fr 1fr
   margin: 3.8rem auto -4.5rem
@@ -608,7 +607,6 @@ code, pre, .type, .signature, .param-name, .param-default
 .specimen-source
   position: relative
   min-width: 0
-  padding-bottom: 2.5rem
   font-family: 'Iosevka Web', monospace
 
 .specimen-bar
@@ -653,16 +651,6 @@ pre.specimen-code
 .syntax-mark
   color: #eb8d5b
 
-.specimen-status
-  position: absolute
-  inset: auto 0 0
-  display: flex
-  justify-content: space-between
-  padding: .6rem .85rem
-  border-top: 1px solid #35403b
-  color: #bbc2bd
-  font-size: .61rem
-
 .build-ok
   color: #70d5be
 
@@ -701,7 +689,6 @@ pre.specimen-code
   text-transform: uppercase
 
 .result-title
-  max-width: 9ch
   margin-top: .55rem
   font-family: Georgia, serif
   font-size: clamp(1.8rem, 3vw, 2.7rem)
@@ -715,10 +702,10 @@ pre.specimen-code
 
 .result-tongs
   position: absolute
-  right: -2.3rem
-  bottom: -.3rem
-  opacity: .78
-  transform: rotate(-10deg)
+  right: -2rem
+  top: 5rem
+  opacity: .6
+  transform: rotate(-170deg)
   svg
     width: auto !important
     height: 6.2rem !important
@@ -738,7 +725,6 @@ pre.specimen-code
   .site-nav-link:nth-child(1)
     display: none
   .hero
-    min-height: 55rem
     padding-top: 5rem
   .orbit-field
     height: 31rem
@@ -753,13 +739,9 @@ pre.specimen-code
   .hero-specimen
     grid-template-columns: 1fr
     width: min(24rem, calc(100vw - 1.5rem))
-    min-height: 33rem
     margin-top: 3rem
     transform: rotate(-.65deg)
-  .specimen-source
-    min-height: 15rem
   .specimen-result
-    min-height: 15rem
     margin-top: 0
 
 // ── Source → result guide examples ─────────────────────────────────────────
@@ -767,7 +749,6 @@ pre.specimen-code
 .journey-workspace
   display: grid
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr)
-  min-height: 25rem
   margin-top: 1.4rem
   color: #e8ece7
   background: var(--bench)
@@ -779,16 +760,16 @@ pre.specimen-code
 .journey-source, .journey-result
   min-width: 0
 
-.journey-source
-  border-right: 1px solid #39423e
+.journey-source-sep
+  width: 90%
+  border-bottom: 1px solid #39423e
 
 .journey-panel-bar
   display: flex
-  justify-content: space-between
+  justify-content: center
   align-items: center
   min-height: 2.5rem
   padding: 0 .85rem
-  border-bottom: 1px solid #39423e
   color: #dfe5df
   font-family: 'Iosevka Web', monospace
   font-size: .65rem
@@ -803,26 +784,19 @@ pre.specimen-code
 .journey-result .panel-meta
   color: #70d5be
 
-.journey-code
-  height: calc(100% - 2.5rem)
+.journey-code pre, .journey-code .boxdraw
   background: var(--code-bg)
-
-.prose .journey-code pre, .journey-code .boxdraw
-  height: 100%
-  min-height: 22.5rem
+  height: calc(100% - 2.5rem)
   margin: 0
   padding: 1.3rem 1.2rem
   border: 0
   border-radius: 0
   box-shadow: none
-  background: transparent
   font-size: clamp(.67rem, 1vw, .78rem)
   line-height: 1.7
 
 .journey-browser
-  height: 100%
-  min-height: 22.5rem
-  color: #292d29
+  height: calc(100% - 2.5rem)
   background: white
   border-radius: .16rem
   overflow: hidden
@@ -966,15 +940,11 @@ pre.specimen-code
   .journey-workspace
     grid-template-columns: 1fr
   .journey-source
-    border-right: 0
     border-bottom: 1px solid #39423e
-  .prose .journey-code pre, .journey-code .boxdraw
-    min-height: 18rem
+  .journey-source-sep
+    width: 100%
   .journey-browser
-    min-height: 23rem
-  .image-example .journey-browser
-    height: auto
-    min-height: 18rem
+    min-height: 50vh
   .prose > h2:not(.ref-item)
     margin-top: 4rem
   .prose .ref-item

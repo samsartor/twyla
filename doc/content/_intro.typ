@@ -179,9 +179,21 @@ image function or handle it explicitly with Twyla's
 #link("https://twyla.dev/reference/assets")[asset system];:
 
 #let image-example = ```example
+Don't talk to me
 #image("./audrey.jpg")
 
-#context html.img(src: asset.image("./audrey.jpg", format: "webp", width: 512).url())
+Or my son
+#context html.img(src: asset.image(
+  "./audrey.jpg",
+  format: "webp",
+  width: 32,
+).url())
+
+#html.style("img {
+  max-width: 256px;
+  width: auto;
+  height: auto;
+}")
 ```
 
 #guide-example(
@@ -194,17 +206,30 @@ image function or handle it explicitly with Twyla's
 Assets are pretty powerful, you can use them to do all kinds of stuff!
 
 #let asset-example = ```example
+#let icon = context html.img(
+  src: asset.file("icon.svg").url(),
+  style: "height: 1.5em; baseline-shift: bottom;"
+)
 
-Check out this pretty #context html.img(src: asset.file("icon.svg").url()) icon.
+Check out this pretty icon: #icon
 
 #figure(
-  context raw-html(asset.typst("./_diagram.typ", format: "svg").read()),
-  caption: [A diagram of some sort],
+  context raw-html(asset.typst(
+    "./_diagram.typ",
+    format: "svg",
+  ).read()),
+  caption: [File as an inline diagram],
 )
 
 #figure(
-  context html.img(src: asset.typst(circle(), format: "svg").url(), style: "width: 100%"),
-  caption: [A big cirle],
+  context block(html.img(
+    src: asset.typst([
+      #set page(width: auto, height: auto, margin: 2mm)
+      #circle(fill: red, stroke: 1mm + blue)
+    ], format: "svg").url(),
+    style: "width: 5em; margin: auto",
+  )),
+  caption: [Link to this circle],
 )
 ```
 

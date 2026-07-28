@@ -113,7 +113,7 @@ try {
       Everything is #html.span(class: "hero-accent", "Typst").
     ])
     html.elem("p", attrs: (class: "hero-tagline"), [
-      Write static site content, templates, and logic in one expressive language.
+      Write static website content, templates, and logic in one expressive language.
     ])
     html.div(class: "hero-actions", {
       html.a(class: "hero-button", href: "#getting-started", [Start with one file])
@@ -134,7 +134,7 @@ try {
         "  "
         html.span(class: "syntax-key", "title")
         ": "
-        html.span(class: "syntax-value", "\"Field Notes\"")
+        html.span(class: "syntax-value", "\"My Blog\"")
         ",\n"
         html.span(class: "line-no", "3")
         html.span(class: "syntax-muted", ")")
@@ -143,31 +143,40 @@ try {
         "\n"
         html.span(class: "line-no", "5")
         html.span(class: "syntax-mark", "=")
-        " Things worth keeping\n"
+        " Fun Facts!\n"
         html.span(class: "line-no", "6")
+        html.span(class: "syntax-muted", "- ")
         "Written entirely in "
         html.span(class: "syntax-key", "#emph[Typst]")
-        "."
-      })
-      html.div(class: "specimen-status", {
-        html.span([twyla serve])
-        html.span(class: "build-ok", [built in 42ms])
+        ".\n"
+        html.span(class: "line-no", "6")
+        html.span(class: "syntax-muted", "- ")
+        "Can show equations like "
+        html.span(class: "syntax-muted", "$")
+        html.span(class: "syntax-value", "sqrt")
+        html.span(class: "syntax-muted", "(")
+        html.span(class: "syntax-value", "b^2 - 4 a c")
+        html.span(class: "syntax-muted", ")$")
+        ".\n"
       })
     })
     html.div(class: "specimen-result", {
-      html.div(class: "result-nav", {
-        html.b([Field Notes])
-        html.span([Archive  About])
-      })
-      html.div(class: "result-rule")
-      html.div(class: "result-date", [Issue 04 · July 2026])
-      html.div(class: "result-title", [Things worth keeping])
-      html.p([Written entirely in #html.em([Typst]).])
       html.div(class: "result-tongs", html.frame(grabber-canvas(
         theta: -18deg,
         phi: 42deg,
         color: grabber-grad,
       )))
+
+      html.div(class: "result-nav", {
+        html.b([My Blog])
+        html.span([Archive  About])
+      })
+      html.div(class: "result-rule")
+      html.div(class: "result-title", [Fun Facts!])
+      [
+      - Written entirely in #emph[Typst]
+      - Can show equations like $sqrt(b^2 - 4 a c)$
+      ]
     })
   })
 })

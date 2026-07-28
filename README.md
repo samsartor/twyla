@@ -4,8 +4,6 @@ Twyla is a static site generator (SSG) similar to [Hugo](https://gohugo.io/) or 
 
 Content is written in Typst. Your templates are written in Typst. Your themes are written in Typst (and in [SASS](https://sass-lang.com/)). Everything is Typst! Except Twyla itself, which is written in Rust.
 
-For an example, check out my own [personal website](https://samsartor.com) ([Source](https://gitlab.com/samsartor/site)).
-
 > Twyla is still in early development, and mostly vibe-coded. Use for your personal blog, not your company homepage.
 
 ## Installing
@@ -13,7 +11,7 @@ For an example, check out my own [personal website](https://samsartor.com) ([Sou
 Your best option (for now) is to compile Twyla from source:
 
 ```
-cargo install https://github.com/samsartor/twyla
+cargo install --git https://github.com/samsartor/twyla
 ```
 
 ## Getting Started
@@ -27,9 +25,21 @@ content/
 
 If you `twyla serve` and point your browser at [http://localhost:1111](http://localhost:1111) you will see your `main.typ` as HTML. Go ahead and add something, possibly your name? The webpage reloads automatically.
 
+```example
+#set document(title: "My Blog")
+
+= My Blog
+
+I make bread!
+```
+
 To deploy your website, simply run `twyla build --base-url https://example.com` and copy the `public` dir to the provider of your choice.
 
 Additional pages are just additional files:
+
+For a blog you will probably want to list your other pages on your home page. To do that, use the [documents()](https://twyla.dev/reference/#documents) iterator:
+
+Project files
 
 ```tree
 content/
@@ -39,23 +49,19 @@ content/
 └ how-to-bake-bread.typ
 ```
 
-For a blog you will probably want to list your other pages on your home page. To do that, use the [documents()](https://twyla.dev/reference/#documents) iterator:
-
 ```example
 = My Blog
+
+I make bread! And wrote these posts:
 
 #context for doc in documents() {
   if not doc.draft and doc.kind == "post" [
     == #link(doc.url, doc.title)
     #doc.date.display()
-    
-    #doc.description    
+
+    #doc.description
   ]
 }
-
-== Other Stuff
-
-I make bread!
 ```
 
 You can see Twyla’s main idea in action: _there is no configuration, only code._ Typst is a real programming language. If you want to create sidebars, listings, tags, “recents”, whatever … well that is what for loops are for!
@@ -74,19 +80,6 @@ Before you get carried away, please include basic information like `title` and `
 ```
 
 Twyla’s [document](https://twyla.dev/reference#document) function supports a number of additional features, beyond what are available in normal Typst, including an `extra` field you can fill with whatever data you want.
-
-Documents can also be created inline. With `output: auto`, Twyla gives the
-child a stable fingerprinted path; an output callback can choose the path from
-the full input hash, extension, and source stem:
-
-```typ
-#let preview = document(output: auto)[A generated page]
-#context html.iframe(src: preview.url())
-
-#document(
-  output: (hash, ext, stem) => "/previews/" + hash + "." + ext,
-)[Another generated page]
-```
 
 For the purpose of theming you can also add a SCSS file and [some HTML](https://typst.app/docs/reference/html):
 
@@ -112,7 +105,7 @@ sass/
   size: 2em
 
 .post-date:
-  color: grey  
+  color: grey
 ```
 
 <hr />
@@ -126,13 +119,13 @@ sass/
         class: "post-title",
         style: "color: " + doc.extra.color,
       ),
-      html.div(    
+      html.div(
         [#doc.date.display()],
         class: "post-date",
       ),
       class: "post-header",
     )
-    
+
     #doc.description
   ]
 }
@@ -141,35 +134,60 @@ sass/
 If you would like to include an image, you can use either the built-in image function or handle it explicitly with Twyla’s [asset system](https://twyla.dev/reference/assets):
 
 ```example
+Don't talk to me
 #image("./audrey.jpg")
 
-#context html.img(src: asset.image("./audrey.jpg", format: "webp", width: 512).url())
+Or my son
+#context html.img(src: asset.image(
+  "./audrey.jpg",
+  format: "webp",
+  width: 32,
+).url())
+
+#html.style("img {
+  max-width: 256px;
+  width: auto;
+  height: auto;
+}")
 ```
 
 Assets are pretty powerful, you can use them to do all kinds of stuff!
 
 ```example
+#let icon = context html.img(
+  src: asset.file("icon.svg").url(),
+  style: "height: 1.5em; baseline-shift: bottom;"
+)
 
-Check out this pretty #context html.img(src: asset.file("icon.svg").url()) icon.
+Check out this pretty icon: #icon
 
 #figure(
-  context raw-html(asset.typst("./_diagram.typ", format: "svg").read()),
-  caption: [A diagram of some sort],
+  context raw-html(asset.typst(
+    "./_diagram.typ",
+    format: "svg",
+  ).read()),
+  caption: [File as an inline diagram],
 )
 
 #figure(
-  context html.img(src: asset.typst(circle(), format: "svg").url(), style: "width: 100%"),
-  caption: [A big cirle],
+  context block(html.img(
+    src: asset.typst([
+      #set page(width: auto, height: auto, margin: 2mm)
+      #circle(fill: red, stroke: 1mm + blue)
+    ], format: "svg").url(),
+    style: "width: 5em; margin: auto",
+  )),
+  caption: [Link to this circle],
 )
 ```
 
 Ok, so what is happening there in that last example? Twyla is rendering a `circle()` as an SVG, writing that SVG to a generated path in your `public/` folder, and then providing the URL to reference as the src of an image _OR_ inline as an `<svg>` element.
 
-You can find an even cooler example here on Twyla’s own website. See little fireplace tongs we use as an icon? Those are drawn procedurally in a [Cetz](https://cetz-package.github.io) canvas, and then rendered by Twyla as part of the theme, in order to generate the actual favicon URL!
+You can find an even cooler example here on Twyla’s own website. See the little fireplace tongs we use as an icon? Those are drawn procedurally in a [Cetz](https://cetz-package.github.io) canvas, and then rendered by Twyla as part of the theme, in order to generate the actual favicon URL!
 
 ## Customization
 
-Twyla customization and theming is mainly accomplished using Typt’s usual [show rules](https://typst.app/docs/reference/styling#show-rules). For example, you can replace Twyla’s default theme and build your own HTML from scratch:
+Twyla customization and theming is mainly accomplished using Typst’s usual [show rules](https://typst.app/docs/reference/styling#show-rules). For example, you can replace Twyla’s default theme and build your own HTML from scratch:
 
 ```example
 #show: body => {
@@ -178,7 +196,7 @@ Twyla customization and theming is mainly accomplished using Typt’s usual [sho
 
   show heading.where(level: 1): it => {
     html.h1(smallcaps(it.body), class: "title")
-  }  
+  }
 
   html.elem("html", attrs: (lang: "en"), {
     html.elem("head", {

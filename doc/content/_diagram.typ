@@ -1,10 +1,9 @@
 #import "@preview/cetz:0.5.2"
 
 #set page(
-  width: 150mm,
-  height: 88mm,
+  width: auto,
+  height: auto,
   margin: 0mm,
-  fill: rgb("f4f0e4"),
 )
 #set text(font: "Iosevka Aile", size: 8pt, fill: rgb("59615b"))
 
@@ -25,10 +24,10 @@
 #align(center + horizon, cetz.canvas({
   import cetz.draw: *
 
-  let left = 1.4
-  let bottom = 1.15
-  let width = 11.5
-  let height = 4.8
+  let left = 0
+  let bottom = 0
+  let width = 10
+  let height = 5
   let map-point(point) = (
     left + point.at(0) / 12 * width,
     bottom + (point.at(1) + 1) / 2 * height,
@@ -98,23 +97,8 @@
   )
 
   content(
-    (left, bottom + height + .7),
-    text(size: 14pt, weight: 650, fill: ink)[A small signal],
-    anchor: "west",
-  )
-  content(
-    (left, bottom + height + .28),
-    text(size: 7pt, fill: teal)[computed in Typst · drawn with Cetz],
-    anchor: "west",
-  )
-  content(
-    (left + width, bottom - .42),
-    text(size: 7pt)[input →],
-    anchor: "east",
-  )
-  content(
-    (left - .35, bottom + height),
-    text(size: 7pt)[output],
+    (width / 2, bottom + .15),
+    text(size: 10pt, fill: teal)[computed in Typst · drawn with Cetz],
     anchor: "south",
   )
 }))

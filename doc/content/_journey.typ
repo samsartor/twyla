@@ -10,22 +10,25 @@
   source-label: "content/main.typ",
   result-label: "Rendered page",
   class: "",
-) = html.div(class: "example-workspace journey-workspace " + class, {
-  html.div(class: "journey-source", {
-    html.div(class: "journey-panel-bar", {
-      html.span([Source])
-      html.span(class: "panel-meta", source-label)
+) = if "twyla-version" in dictionary(sys) {
+  html.div(class: "example-workspace journey-workspace " + class, {
+    html.div(class: "journey-source", {
+      html.div(class: "journey-panel-bar", {
+        html.span(class: "panel-meta", source-label)
+      })
+      html.div(class: "journey-source-sep")
+      html.div(class: "journey-code", source)
     })
-    html.div(class: "journey-code", source)
-  })
-  html.div(class: "journey-result", {
-    html.div(class: "journey-panel-bar", {
-      html.span([Result])
-      html.span(class: "panel-meta", result-label)
+    html.div(class: "journey-result", {
+      html.div(class: "journey-panel-bar", {
+        html.span(class: "panel-meta", result-label)
+      })
+      browser-frame(result)
     })
-    browser-frame(result)
   })
-})
+} else {
+  source
+}
 
 #let project-example(
   tree,
