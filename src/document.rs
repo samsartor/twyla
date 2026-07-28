@@ -1,16 +1,18 @@
 //! The `document` element and `documents()` builtin.
 
 use std::fmt::Debug;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 
-use comemo::Tracked;
+use comemo::{Track, Tracked};
 use ecow::{EcoString, eco_vec};
 use iddqd::IdHashItem;
+use sha2::{Digest, Sha256};
 use typst::diag::{At as _, SourceDiagnostic, SourceResult};
 use typst::engine::Engine;
 use typst::foundations::{
-    Array, Binding, Content, Context, Datetime, Dict, IntoValue as _, NativeElement as _, Packed,
-    Scope, ShowFn, Smart, Str, StyleChain, Value, elem, func, scope,
+    Array, AutoValue, Binding, Content, Context, Datetime, Dict, Func, IntoValue as _,
+    NativeElement as _, Packed, Scope, ShowFn, Smart, Str, StyleChain, Value, cast, elem, func,
+    scope,
 };
 use typst::introspection::{History, Introspect, Introspector, Location};
 use typst::syntax::{FileId, Span};
@@ -38,7 +40,7 @@ use crate::project::{TwylaContext, present_output};
 /// #context link(
 ///     document(
 ///         title: "Page within a page",
-///         output: "subpage/index.html",
+///         output: auto,
 ///     )[Hello from a page within a page!].url(),
 /// )[This is a link to a page within a page]
 /// ```
@@ -54,9 +56,14 @@ pub struct TwylaDocument {
     /// `blog/extra.html`); for an inline `document(..)`, the enclosing page's
     /// output directory. A leading `/` is bundle-root-absolute
     /// (`output: "/feed.xml"`), ignoring that base. When `auto`, a full-file
-    /// page derives its output from the source filename; an inline document
-    /// must set it explicitly.
-    pub output: Smart<EcoString>,
+    /// page derives its output from the source filename and an inline document
+    /// gets a fingerprinted `assets/document-<hash>.html` path.
+    ///
+    /// A function receives the document's full input hash, `"html"`, and its
+    /// source stem (empty for an inline document), and returns a path:
+    /// `(hash, ext, stem) => "previews/" + hash + "." + ext`.
+    #[default(DocumentOutput::Auto)]
+    pub output: DocumentOutput,
 
     /// The page's title.
     pub title: Option<Content>,
@@ -134,7 +141,8 @@ impl TwylaDocument {
             // and then use it to look up the resolved url.
             Some(content) => {
                 let elem = content.to_packed::<TwylaDocument>().unwrap();
-                engine.introspect(ResolvedDocumentIntrospect(request(styles, elem)?))
+                let doc = request(engine, styles, elem)?;
+                engine.introspect(ResolvedDocumentIntrospect(doc))
             }
             // Static: the current page's url.
             None => engine.introspect(DocumentAtIntrospect(context.location().unwrap())),
@@ -146,36 +154,13 @@ impl TwylaDocument {
     }
 }
 
-pub fn request(styles: StyleChain, elem: &Packed<TwylaDocument>) -> SourceResult<ResolvedDocument> {
-    let raw = match elem.output.get_cloned(styles) {
-        Smart::Auto => {
-            return Err(eco_vec![SourceDiagnostic::error(
-                elem.span(),
-                EcoString::from("an inline `document(..)` needs an explicit `output:`"),
-            )]);
-        }
-        Smart::Custom(out) => out,
-    };
-    // A *relative* `output:` resolves against the enclosing page's output
-    // *directory* — the parent output (carried on the chain by the loop) minus
-    // its filename. An absolute (`/`-prefixed) output ignores the anchor. The
-    // anchor is absent only during the discarded metadata-harvest pass, where a
-    // relative output yields `Ok(None)`; we keep `raw` there and the main loop
-    // re-resolves it once the parent output is on the chain.
-    let parent = styles.get_cloned(TwylaDocument::output).custom();
-    let anchor = parent.as_deref().map(parent_dir);
-    let output = match TwylaContext::resolve_output(anchor, raw.as_str()) {
-        Ok(Some(out)) => out,
-        Ok(None) => raw.to_string(),
-        Err(msg) => {
-            return Err(eco_vec![SourceDiagnostic::error(
-                elem.span(),
-                EcoString::from(msg),
-            )]);
-        }
-    };
-    Ok(ResolvedDocument {
-        output,
+pub fn request(
+    engine: &mut Engine,
+    styles: StyleChain,
+    elem: &Packed<TwylaDocument>,
+) -> SourceResult<ResolvedDocument> {
+    let mut doc = ResolvedDocument {
+        output: String::new(),
         title: elem.title.get_cloned(styles),
         date: elem.date.get_cloned(styles),
         description: elem.description.get_cloned(styles),
@@ -188,7 +173,66 @@ pub fn request(styles: StyleChain, elem: &Packed<TwylaDocument>) -> SourceResult
         draft: elem.draft.get(styles),
         body: elem.body.clone(),
         source: elem.span().id(),
-    })
+    };
+
+    let policy = elem.output.get_cloned(styles);
+    let raw = match policy {
+        DocumentOutput::Auto => {
+            EcoString::from(format!("/assets/document-{}.html", doc.fingerprint()))
+        }
+        DocumentOutput::Fixed(out) => out,
+        DocumentOutput::Derive(func) => derive_output(engine, elem.span(), &func, &doc, "")?,
+    };
+    // A *relative* `output:` resolves against the enclosing page's output
+    // *directory* — the parent output (carried on the chain by the loop) minus
+    // its filename. An absolute (`/`-prefixed) output ignores the anchor. The
+    // anchor is absent only during the discarded metadata-harvest pass, where a
+    // relative output yields `Ok(None)`; we keep `raw` there and the main loop
+    // re-resolves it once the parent output is on the chain.
+    let parent = match styles.get_cloned(TwylaDocument::output) {
+        DocumentOutput::Fixed(path) => Some(path),
+        DocumentOutput::Auto | DocumentOutput::Derive(_) => None,
+    };
+    let anchor = parent.as_deref().map(parent_dir);
+    let output = match TwylaContext::resolve_output(anchor, raw.as_str()) {
+        Ok(Some(out)) => out,
+        Ok(None) => raw.to_string(),
+        Err(msg) => {
+            return Err(eco_vec![SourceDiagnostic::error(
+                elem.span(),
+                EcoString::from(msg),
+            )]);
+        }
+    };
+    doc.output = output;
+    Ok(doc)
+}
+
+/// Output policy for a document.
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub enum DocumentOutput {
+    /// Derive the conventional source path for a full-file page, or a
+    /// fingerprinted path for an inline document.
+    Auto,
+    /// Write to this document-relative path.
+    Fixed(EcoString),
+    /// Derive a path from `(full-hash, "html", source-stem)`.
+    Derive(Func),
+}
+
+cast! {
+    DocumentOutput,
+    self => match self {
+        Self::Auto => AutoValue.into_value(),
+        Self::Fixed(v) => v.into_value(),
+        Self::Derive(v) => v.into_value(),
+    },
+    v: AutoValue => {
+        let _ = v;
+        Self::Auto
+    },
+    v: EcoString => Self::Fixed(v),
+    v: Func => Self::Derive(v),
 }
 
 /// The directory portion of an output path — everything before the last `/`, or
@@ -219,7 +263,8 @@ pub struct TwylaSite {
 }
 
 pub const RENDER_INTROSPECTION: ShowFn<TwylaDocument> = |elem, engine, styles| {
-    engine.introspect(ResolvedDocumentIntrospect(request(styles, elem)?));
+    let doc = request(engine, styles, elem)?;
+    engine.introspect(ResolvedDocumentIntrospect(doc));
     Ok(Content::empty())
 };
 
@@ -263,6 +308,30 @@ impl IdHashItem for ResolvedDocument {
 }
 
 impl ResolvedDocument {
+    /// A stable SHA-256 over the inputs that define this document, excluding
+    /// its output path and source location. The first half names `auto`
+    /// documents; the full value is passed to output callbacks.
+    pub fn sha256_hex(&self) -> EcoString {
+        let mut hasher = Sha256Hasher::default();
+        (
+            "twyla-document-v1",
+            &self.title,
+            &self.date,
+            &self.description,
+            &self.kind,
+            &self.extra,
+            &self.draft,
+            &self.body,
+        )
+            .hash(&mut hasher);
+        EcoString::from(hex::encode(hasher.finalize()))
+    }
+
+    fn fingerprint(&self) -> EcoString {
+        let hash = self.sha256_hex();
+        EcoString::from(&hash[..32])
+    }
+
     /// The `documents()` dictionary form of this row.
     pub fn to_dict(&self, ctx: &TwylaContext) -> Dict {
         let mut d = Dict::new();
@@ -277,6 +346,52 @@ impl ResolvedDocument {
         d.insert("kind".into(), self.kind.clone().into_value());
         d.insert("extra".into(), self.extra.clone());
         d
+    }
+}
+
+/// Evaluate a document output callback with the same arguments assets expose.
+pub(crate) fn derive_output(
+    engine: &mut Engine,
+    span: Span,
+    func: &Func,
+    doc: &ResolvedDocument,
+    stem: &str,
+) -> SourceResult<EcoString> {
+    let value = func.call(
+        engine,
+        Context::none().track(),
+        [
+            Str::from(doc.sha256_hex().as_str()),
+            Str::from("html"),
+            Str::from(stem),
+        ],
+    )?;
+    value.cast().map_err(|err| {
+        let mut diag = SourceDiagnostic::error(span, err.message().clone());
+        for hint in err.hints() {
+            diag = diag.with_hint(hint.clone());
+        }
+        eco_vec![diag]
+    })
+}
+
+#[derive(Default)]
+struct Sha256Hasher(Sha256);
+
+impl Sha256Hasher {
+    fn finalize(self) -> [u8; 32] {
+        self.0.finalize().into()
+    }
+}
+
+impl Hasher for Sha256Hasher {
+    fn finish(&self) -> u64 {
+        let digest = self.0.clone().finalize();
+        u64::from_le_bytes(digest[..8].try_into().unwrap())
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
     }
 }
 

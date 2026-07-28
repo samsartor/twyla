@@ -27,7 +27,8 @@ use typst_utils::Protected;
 
 use crate::asset::{AssetReqIntrospect, ResolvedAsset, hash_spec};
 use crate::document::{
-    DOCUMENTS_LIST_KEY, ResolvedDocument, ResolvedDocumentIntrospect, TwylaDocument,
+    DOCUMENTS_LIST_KEY, DocumentOutput, ResolvedDocument, ResolvedDocumentIntrospect,
+    TwylaDocument, derive_output,
 };
 use crate::project::{TwylaContext, present_output};
 use crate::resolver::Resolver;
@@ -356,10 +357,13 @@ fn compile_bundle_loop(
         discover_requests(resolver, world, subsink.introspections())?;
 
         // Surface warnings the asset builds queued (e.g. a best-effort svg
-        // minify that fell back to verbatim). A build only runs on a cache
-        // miss, so each warning fires once per (re)build, not per iteration.
+        // minify that fell back to verbatim). They go straight to the parent
+        // sink: the iteration that discovers/builds an asset normally does not
+        // converge, so its `subsink` is discarded. A build only runs on a cache
+        // miss, and the parent sink deduplicates, so each warning still fires
+        // once per (re)build.
         for warning in resolver.take_warnings() {
-            subsink.warn(warning);
+            sink.warn(warning);
         }
 
         // Rebuild the engine after `subsink.introspections()`'s borrow ends, so
@@ -499,7 +503,7 @@ fn harvest_metadata(
     // Read twyla's `document` fields off the folded child style chains.
     // Each top-of-file `#set document(..)` applies to subsequent siblings,
     // so any realized child carries the page-level values.
-    let mut output = None;
+    let mut output = DocumentOutput::Auto;
     let mut title = None;
     let mut date = None;
     let mut description = None;
@@ -508,10 +512,7 @@ fn harvest_metadata(
     let mut draft = false;
     for (_, cs) in &children {
         if cs.has(TwylaDocument::output) {
-            output = cs
-                .get_cloned(TwylaDocument::output)
-                .custom()
-                .map(String::from);
+            output = cs.get_cloned(TwylaDocument::output);
         }
         if cs.has(TwylaDocument::title) {
             title = cs.get_cloned(TwylaDocument::title);
@@ -533,29 +534,42 @@ fn harvest_metadata(
     // An explicit `output` is resolved relative to the source's folder stem
     // (leading `/` = bundle root); an `auto` output derives from the source path.
     let source = id.vpath().get_with_slash();
+    let mut doc = ResolvedDocument {
+        output: String::new(),
+        title,
+        date,
+        description,
+        kind: kind
+            .unwrap_or_else(|| EcoString::from(ctx.default_kind(id.vpath().get_with_slash()))),
+        extra,
+        draft,
+        body,
+        source: Some(id),
+    };
     let output = match output {
-        Some(raw) => ctx.resolve_document_output(source, &raw).map_err(|msg| {
+        DocumentOutput::Fixed(raw) => ctx.resolve_document_output(source, &raw).map_err(|msg| {
             eco_vec![SourceDiagnostic::error(
                 Span::detached(),
                 eco_format!("in {source}: {msg}"),
             )]
         })?,
-        None => ctx.default_document_output(source),
+        DocumentOutput::Derive(func) => {
+            let stem = std::path::Path::new(source)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("");
+            let raw = derive_output(engine, Span::detached(), &func, &doc, stem)?;
+            ctx.resolve_document_output(source, &raw).map_err(|msg| {
+                eco_vec![SourceDiagnostic::error(
+                    Span::detached(),
+                    eco_format!("in {source}: {msg}"),
+                )]
+            })?
+        }
+        DocumentOutput::Auto => ctx.default_document_output(source),
     };
-    let kind =
-        kind.unwrap_or_else(|| EcoString::from(ctx.default_kind(id.vpath().get_with_slash())));
-
-    Ok(ResolvedDocument {
-        output,
-        title,
-        date,
-        description,
-        kind,
-        extra,
-        draft,
-        body,
-        source: Some(id),
-    })
+    doc.output = output;
+    Ok(doc)
 }
 
 /// The bundle content for the current loop iteration: each file body wrapped as
@@ -578,7 +592,7 @@ fn build_content(files: &[ResolvedDocument], resolver: &Resolver) -> Content {
         let mut styles = Styles::new();
         styles.set(
             TwylaDocument::output,
-            Smart::Custom(present_output(&doc.output).into()),
+            DocumentOutput::Fixed(present_output(&doc.output).into()),
         );
         bodies.push(wrap_document(
             &doc.output,
@@ -601,7 +615,7 @@ fn discovered_sibling(doc: &ResolvedDocument) -> Content {
     // `build_content`.
     styles.set(
         TwylaDocument::output,
-        Smart::Custom(present_output(&doc.output).into()),
+        DocumentOutput::Fixed(present_output(&doc.output).into()),
     );
     styles.set(TwylaDocument::title, doc.title.clone());
     styles.set(TwylaDocument::date, doc.date);
@@ -715,6 +729,95 @@ mod tests {
         assert!(
             main.contains("https://example.com/sub/"),
             "iframe src not resolved to the sub URL:\n{main}"
+        );
+    }
+
+    /// An inline document with `output: auto` is anonymous but stable: it gets
+    /// a fingerprinted root output instead of colliding with its parent page.
+    #[test]
+    fn inline_document_auto_gets_a_fingerprinted_output() {
+        let outputs = compile_outputs(
+            "#context html.elem(\"iframe\", attrs: (\n  \
+               src: document(output: auto)[Auto child body].url(),\n))",
+        );
+
+        let children: Vec<_> = outputs
+            .docs()
+            .filter(|doc| doc.output_path.starts_with("assets/document-"))
+            .collect();
+        assert_eq!(
+            children.len(),
+            1,
+            "unexpected auto documents: {children:#?}"
+        );
+        let child = children[0];
+        assert!(
+            child.output_path.ends_with(".html"),
+            "auto document is not HTML: {}",
+            child.output_path
+        );
+        assert!(
+            child.html.contains("Auto child body"),
+            "auto child body missing:\n{}",
+            child.html
+        );
+
+        let parent = doc_html(&outputs, "index.html");
+        assert!(
+            parent.contains(&format!(
+                "https://example.com/{}",
+                child.output_path.trim_end_matches("index.html")
+            )),
+            "parent does not link to auto child {}:\n{parent}",
+            child.output_path
+        );
+    }
+
+    /// Document output callbacks receive the same `(hash, ext, stem)` tuple as
+    /// assets. Inline documents have no source stem.
+    #[test]
+    fn inline_document_output_callback_receives_hash_ext_and_empty_stem() {
+        let outputs = compile_outputs(
+            "#document(output: (hash, ext, stem) => {\n  \
+               assert.eq(stem, \"\")\n  \
+               \"/previews/\" + hash.slice(0, 8) + \".\" + ext\n\
+             })[Callback child]",
+        );
+
+        let child = outputs
+            .docs()
+            .find(|doc| doc.output_path.starts_with("previews/"))
+            .expect("callback-derived document");
+        let fingerprint = child
+            .output_path
+            .strip_prefix("previews/")
+            .and_then(|path| path.strip_suffix(".html"))
+            .unwrap_or("");
+        assert!(
+            fingerprint.len() == 8 && fingerprint.chars().all(|c| c.is_ascii_hexdigit()),
+            "unexpected callback output: {}",
+            child.output_path
+        );
+        assert!(child.html.contains("Callback child"));
+    }
+
+    /// Full-file callbacks preserve the source-derived stem argument.
+    #[test]
+    fn full_file_document_output_callback_receives_source_stem() {
+        let outputs = compile_outputs(
+            "#set document(output: (hash, ext, stem) => \
+               \"/generated/\" + stem + \"-\" + hash.slice(0, 8) + \".\" + ext)\n\
+             Full callback page",
+        );
+
+        let page = outputs
+            .docs()
+            .find(|doc| doc.output_path.starts_with("generated/main-"))
+            .expect("callback-routed full-file page");
+        assert!(
+            page.output_path.ends_with(".html"),
+            "unexpected callback output: {}",
+            page.output_path
         );
     }
 

@@ -8,6 +8,7 @@ use super::*;
 use crate::project::TwylaContext;
 use crate::render::{Output, RenderWorld};
 use crate::resolver::Resolver;
+use typst::syntax::{RootedPath, VirtualPath, VirtualRoot};
 
 fn site(files: &[(&str, &str)]) -> (TwylaContext, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -41,6 +42,26 @@ fn compile_asset_keys(world: &RenderWorld) -> (String, Vec<String>) {
         .collect();
     keys.sort();
     (html, keys)
+}
+
+fn compile_warnings(world: &RenderWorld) -> Vec<SourceDiagnostic> {
+    let sources: Vec<_> = world
+        .ctx
+        .scan_pages()
+        .unwrap()
+        .into_iter()
+        .map(|path| {
+            FileId::new(RootedPath::new(
+                VirtualRoot::Project,
+                VirtualPath::virtualize(&world.ctx.root, &path).unwrap(),
+            ))
+        })
+        .collect();
+    let mut resolver = Resolver::new(&world.ctx);
+    crate::compile::compile_bundle(&world.ctx, world, &sources, &mut resolver)
+        .warnings
+        .into_iter()
+        .collect()
 }
 
 /// The core of Phase 0/1: an `asset.*().url()` call resolves to a fingerprinted
@@ -949,6 +970,30 @@ fn typst_path_source_compiles_to_html() {
     );
     let body = String::from_utf8(asset.built.emit.read().unwrap().to_vec()).unwrap();
     assert!(body.contains("body text"), "html missing body:\n{body}");
+}
+
+/// Inline content is constructed under Twyla's library before `asset.typst`
+/// lays it out with stock Typst. If it carries a Twyla asset call into that
+/// subcompile, the nested request cannot reach the outer discovery loop. The
+/// escaped placeholder is diagnosed instead of failing silently.
+#[test]
+fn typst_html_warns_when_outer_content_carries_a_nested_twyla_asset() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#let child = context html.img(src: asset.file(\"nested.svg\").url())\n\
+             #context asset.typst(child, format: \"html\").url()",
+        ),
+        ("content/nested.svg", "<svg/>"),
+    ]);
+    let warnings = compile_warnings(&RenderWorld::new(&ctx).unwrap());
+
+    assert!(
+        warnings.iter().any(|warning| warning
+            .message
+            .contains("inside this `asset.typst` document could not be resolved")),
+        "missing nested-asset warning: {warnings:#?}"
+    );
 }
 
 /// A bare `asset.typst(..)` left in markup emits and renders nothing.

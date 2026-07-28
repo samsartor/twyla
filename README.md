@@ -75,6 +75,19 @@ Before you get carried away, please include basic information like `title` and `
 
 Twyla’s [document](https://twyla.dev/reference#document) function supports a number of additional features, beyond what are available in normal Typst, including an `extra` field you can fill with whatever data you want.
 
+Documents can also be created inline. With `output: auto`, Twyla gives the
+child a stable fingerprinted path; an output callback can choose the path from
+the full input hash, extension, and source stem:
+
+```typ
+#let preview = document(output: auto)[A generated page]
+#context html.iframe(src: preview.url())
+
+#document(
+  output: (hash, ext, stem) => "/previews/" + hash + "." + ext,
+)[Another generated page]
+```
+
 For the purpose of theming you can also add a SCSS file and [some HTML](https://typst.app/docs/reference/html):
 
 ```tree

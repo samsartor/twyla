@@ -2,7 +2,7 @@
 // value and use that same value both for syntax-highlighted source and eval,
 // so the displayed code is exactly what produced the preview.
 
-#let browser-frame(body, class: "") = context html.div(class: "journey-browser " + class, html.iframe(src: asset.typst(body, format: "html").url()))
+#let browser-frame(body, class: "") = context html.div(class: "journey-browser " + class, html.iframe(src: document(output: auto)[#body].url()))
 
 #let source-result(
   source,

@@ -295,6 +295,25 @@ pub(crate) fn build(
         }
     };
 
+    if format == Format::Html
+        && bytes
+            .windows(super::ASSET_PENDING.len())
+            .any(|window| window == super::ASSET_PENDING.as_bytes())
+    {
+        warnings.push(
+            SourceDiagnostic::warning(
+                span,
+                "a Twyla asset inside this `asset.typst` document could not be resolved",
+            )
+            .with_hint(
+                "`asset.typst` compiles with stock Typst; content constructed outside it can \
+                 carry Twyla calls into the subcompile, but nested asset requests are not part \
+                 of the surrounding site's discovery loop",
+            )
+            .with_hint("use an inline `document(..)` when the generated HTML needs Twyla assets"),
+        );
+    }
+
     let upstream = collect_upstream(subworld.reads.into_inner().unwrap_or_default(), ctx);
     let bytes = Bytes::new(bytes);
     Ok(Built {
