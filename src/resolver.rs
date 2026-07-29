@@ -266,9 +266,11 @@ impl Resolver {
     ) -> SourceResult<ResolvedAsset> {
         let built = match spec {
             AssetSpec::File { file } => file::build(world, *file, &self.ctx, span)?,
-            AssetSpec::Sass { file, minify } => {
-                sass::build(world, *file, *minify, &self.ctx, span)?
-            }
+            AssetSpec::Sass {
+                source,
+                format,
+                minify,
+            } => sass::build(world, source, *format, *minify, &self.ctx, span)?,
             // `Raw` is in-memory bytes — it can't fail, so it needs no span.
             AssetSpec::Raw { bytes, ext } => raw::build(bytes.clone(), ext.clone()),
             AssetSpec::Svg { source, minify, id } => {

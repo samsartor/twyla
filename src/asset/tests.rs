@@ -297,13 +297,121 @@ fn image_resizes_and_transcodes() {
     );
 }
 
-/// With no `format`, the source format is kept; with no dimensions, the image
-/// is only transcoded. Here: keep PNG, resize to a 30px-wide box.
+/// Processing constructors treat `bytes` as the source itself, while strings
+/// remain paths. Reading the PNG here is only how the Typst test obtains a
+/// byte value; `asset.image` receives no path and therefore has no source stem.
 #[test]
-fn image_keeps_source_format_when_unspecified() {
+fn image_accepts_inline_bytes() {
     let (ctx, dir) = site(&[(
         "content/main.typ",
-        "#context asset.image(\"photo.png\", width: 30).url()",
+        "#let data = read(\"photo.png\", encoding: none)\n\
+         #context asset.image(data, width: 20).url()",
+    )]);
+    std::fs::write(dir.path().join("content/photo.png"), png(40, 20)).unwrap();
+
+    let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    assert_eq!(assets.len(), 1, "got {assets:?}");
+    let asset = &assets[0];
+    assert_eq!(asset.built.stem, None);
+    assert!(asset.output_path.ends_with(".png"));
+    let decoded = ::image::load_from_memory(&asset.built.emit.read().unwrap()).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (20, 10));
+    assert!(
+        asset.built.upstream.is_empty(),
+        "inline image bytes should not be watched as an asset file"
+    );
+}
+
+#[test]
+fn sass_and_svg_accept_inline_bytes() {
+    let (ctx, _dir) = site(&[(
+        "content/main.typ",
+        "#context str(asset.sass(bytes(\"a { b { color: red; } }\"), format: \"scss\").read(encoding: none))\n\
+         #context raw-html(asset.svg(bytes(\"<svg> <circle cx='1'/> </svg>\")).read())",
+    )]);
+
+    let (html, _assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    assert!(
+        html.contains("a b"),
+        "inline SCSS was not compiled:\n{html}"
+    );
+    assert!(
+        html.contains("<svg"),
+        "inline SVG was not processed:\n{html}"
+    );
+}
+
+#[test]
+fn sass_byte_source_requires_a_format() {
+    let (ctx, _dir) = site(&[(
+        "content/main.typ",
+        "#context asset.sass(bytes(\"a { color: red }\")).url()",
+    )]);
+    let err = RenderWorld::new(&ctx)
+        .unwrap()
+        .compile_bundle(&mut Resolver::new(&ctx))
+        .err()
+        .expect("a Sass byte source without a format should fail");
+    let message = err.to_string();
+    assert!(
+        message.contains("require an explicit `format`"),
+        "unexpected diagnostic:\n{message}"
+    );
+}
+
+#[test]
+fn sass_format_auto_detects_file_syntax() {
+    let (ctx, _dir) = site(&[
+        (
+            "content/main.typ",
+            "#context asset.sass(\"theme.sass\", format: auto).read()",
+        ),
+        ("content/theme.sass", "a\n  color: red"),
+    ]);
+
+    let (html, _assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    assert!(
+        html.contains("a{color:red}"),
+        "explicit auto did not detect indented Sass:\n{html}"
+    );
+}
+
+#[test]
+fn raw_emits_inline_text_with_an_extension() {
+    let (ctx, _dir) = site(&[(
+        "content/main.typ",
+        "#context asset.raw(\"a{color:red}\", extension: \"css\").url()",
+    )]);
+
+    let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    assert_eq!(assets.len(), 1, "got {assets:?}");
+    let asset = &assets[0];
+    assert!(asset.output_path.ends_with(".css"));
+    assert_eq!(asset.built.emit.read().unwrap().as_slice(), b"a{color:red}");
+    assert!(asset.built.upstream.is_empty());
+    assert!(html.contains(&asset.url));
+}
+
+#[test]
+fn raw_defaults_to_bin_extension() {
+    let (ctx, _dir) = site(&[(
+        "content/main.typ",
+        "#context asset.raw(bytes((0, 1, 2))).url()",
+    )]);
+
+    let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    assert_eq!(assets.len(), 1, "got {assets:?}");
+    assert!(assets[0].output_path.ends_with(".bin"));
+    assert_eq!(assets[0].built.ext.as_deref(), Some("bin"));
+}
+
+/// `format: auto` keeps the detected source format. Here: keep PNG and resize
+/// to a 30px-wide box.
+#[test]
+fn image_auto_keeps_source_format() {
+    let (ctx, dir) = site(&[(
+        "content/main.typ",
+        "#context asset.image(\"photo.png\", width: 30, format: auto).url()",
     )]);
     std::fs::write(dir.path().join("content/photo.png"), png(60, 60)).unwrap();
 
@@ -403,7 +511,9 @@ fn native_svg_image_routes_through_svg_pipeline() {
     );
     let bytes = assets[0].built.emit.read().unwrap();
     assert!(
-        !String::from_utf8(bytes.to_vec()).unwrap().contains("strip me"),
+        !String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .contains("strip me"),
         "native svg should be minified (comment stripped)"
     );
     assert!(
@@ -505,10 +615,7 @@ fn svg_auto_id_resolves_through_elem_id() {
 fn unparsable_svg_passes_through_verbatim() {
     let src = "<svg><open></svg>";
     let (ctx, _dir) = site(&[
-        (
-            "content/main.typ",
-            "#context asset.svg(\"bad.svg\").url()",
-        ),
+        ("content/main.typ", "#context asset.svg(\"bad.svg\").url()"),
         ("content/bad.svg", src),
     ]);
     let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());

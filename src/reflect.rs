@@ -78,7 +78,11 @@ fn eval_docs(
         };
         errors
             .into_iter()
-            .map(|e| e.with_hint(format!("while evaluating docs for `{label}`, defined at {origin}")))
+            .map(|e| {
+                e.with_hint(format!(
+                    "while evaluating docs for `{label}`, defined at {origin}"
+                ))
+            })
             .collect()
     })
 }
@@ -104,7 +108,12 @@ pub fn describe(
 /// Metadata for a native function: name, title, docs, and its parameters.
 fn describe_func(engine: &mut Engine, func: &Func) -> SourceResult<Dict> {
     let fn_name = func.name().unwrap_or("?");
-    let docs = eval_docs(engine, fn_name, func.def_site(), func.docs().unwrap_or_default())?;
+    let docs = eval_docs(
+        engine,
+        fn_name,
+        func.def_site(),
+        func.docs().unwrap_or_default(),
+    )?;
 
     // Eval each param's docs up front (mutably borrows `engine`, so it can't sit
     // inside the `dict!` iterator closure).
@@ -134,7 +143,12 @@ fn describe_param(
     fn_name: &str,
     param: &NativeParamInfo,
 ) -> SourceResult<Dict> {
-    let docs = eval_docs(engine, &format!("{fn_name}.{}", param.name), param.def_site, param.docs)?;
+    let docs = eval_docs(
+        engine,
+        &format!("{fn_name}.{}", param.name),
+        param.def_site,
+        param.docs,
+    )?;
     let mut dict = dict! {
         "name" => param.name,
         "docs" => docs,

@@ -21,7 +21,8 @@
 use std::io::Cursor;
 
 use super::{
-    AssetSpec, Built, ImageSource, OutputReq, Upstream, emit_or_request, resolve_path, sha256,
+    AssetInput, AssetSource, AssetSpec, Built, OutputReq, Upstream, emit_or_request, resolve_input,
+    sha256,
 };
 use crate::project::TwylaContext;
 use crate::render::Emit;
@@ -31,7 +32,9 @@ use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageEncoder, ImageFormat};
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
-use typst::foundations::{Bytes, Cast, Packed, PathOrStr, ShowFn, StyleChain, elem, func, scope};
+use typst::foundations::{
+    AutoValue, Bytes, Cast, Packed, ShowFn, StyleChain, cast, elem, func, scope,
+};
 use typst::syntax::Span;
 
 /// Pulls in an image file as an asset.
@@ -50,9 +53,10 @@ use typst::syntax::Span;
 /// any image asset in the scope.
 #[elem(scope, name = "image")]
 pub struct ImageAsset {
-    /// Path to the source image, relative to the calling file.
+    /// A source image path (relative to the calling file), or image data as
+    /// bytes.
     #[required]
-    pub path: PathOrStr,
+    pub path: AssetInput,
 
     /// Target width in pixels. With only one of `width`/`height` set the other
     /// is computed to preserve the aspect ratio; with neither, the image is not
@@ -77,10 +81,10 @@ pub struct ImageAsset {
     #[default(Filter::Lanczos)]
     pub filter: Filter,
 
-    /// Output format. `{none}` (the default) keeps the source format; otherwise
-    /// the image is transcoded to the named format.
-    #[default(None)]
-    pub format: Option<Format>,
+    /// Output format. `{auto}` (the default) preserves the detected source
+    /// format; otherwise the image is transcoded to the named format.
+    #[default(Format::Auto)]
+    pub format: Format,
 
     /// Encoder quality, 1–100, for lossy formats (JPEG, WebP, AVIF). Ignored by
     /// PNG and GIF.
@@ -100,7 +104,7 @@ asset_methods!(ImageAsset, spec, output, None);
 /// fields. The element is always file-backed; per-call args override the
 /// `#set asset.image(..)` defaults the field accessors fold in.
 fn spec(elem: &Packed<ImageAsset>, styles: StyleChain) -> HintedStrResult<AssetSpec> {
-    let source = ImageSource::File(resolve_path(&elem.path, elem.span())?);
+    let source = resolve_input(&elem.path, elem.span())?;
     image_spec(
         source,
         elem.width.get(styles),
@@ -122,7 +126,7 @@ fn output(elem: &Packed<ImageAsset>, styles: StyleChain) -> HintedStrResult<Outp
 /// `asset.image("photo.png")` under the same set rules. `source` is whatever the
 /// rule resolved the image to (path- or bytes-backed).
 pub(crate) fn spec_from_styles(
-    source: ImageSource,
+    source: AssetSource,
     styles: StyleChain,
 ) -> HintedStrResult<AssetSpec> {
     image_spec(
@@ -141,12 +145,12 @@ pub(crate) fn spec_from_styles(
 /// rule) so the two stay in lock-step.
 #[allow(clippy::too_many_arguments)]
 fn image_spec(
-    source: ImageSource,
+    source: AssetSource,
     width: Option<i64>,
     height: Option<i64>,
     fit: Fit,
     filter: Filter,
-    format: Option<Format>,
+    format: Format,
     quality: u8,
 ) -> HintedStrResult<AssetSpec> {
     Ok(AssetSpec::Image {
@@ -218,9 +222,37 @@ impl From<Filter> for FilterType {
     }
 }
 
-/// Output image format. `None` on the spec means "keep the source format".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Cast)]
+/// Output image format selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Format {
+    /// Preserve the detected source format.
+    Auto,
+    /// Transcode to an explicit format.
+    Explicit(OutputFormat),
+}
+
+cast! {
+    Format,
+    self => match self {
+        Self::Auto => AutoValue.into_value(),
+        Self::Explicit(v) => v.into_value(),
+    },
+    _v: AutoValue => Self::Auto,
+    v: OutputFormat => Self::Explicit(v),
+}
+
+impl Format {
+    fn explicit(self) -> Option<OutputFormat> {
+        match self {
+            Self::Auto => None,
+            Self::Explicit(format) => Some(format),
+        }
+    }
+}
+
+/// An explicitly selected raster output format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Cast)]
+pub enum OutputFormat {
     Png,
     Jpeg,
     Gif,
@@ -228,28 +260,28 @@ pub enum Format {
     Avif,
 }
 
-impl Format {
+impl OutputFormat {
     /// The output file extension (also the static server's Content-Type key).
     fn ext(self) -> &'static str {
         match self {
-            Format::Png => "png",
-            Format::Jpeg => "jpg",
-            Format::Gif => "gif",
-            Format::Webp => "webp",
-            Format::Avif => "avif",
+            OutputFormat::Png => "png",
+            OutputFormat::Jpeg => "jpg",
+            OutputFormat::Gif => "gif",
+            OutputFormat::Webp => "webp",
+            OutputFormat::Avif => "avif",
         }
     }
 
     /// Map the `image` crate's detected source format to one of ours, for the
-    /// "keep source format" (`format: none`) case. Returns `None` for formats
+    /// `format: auto` case. Returns `None` for formats
     /// we can't re-encode (e.g. an exotic input) — the caller errors.
-    fn from_detected(format: ImageFormat) -> Option<Format> {
+    fn from_detected(format: ImageFormat) -> Option<OutputFormat> {
         match format {
-            ImageFormat::Png => Some(Format::Png),
-            ImageFormat::Jpeg => Some(Format::Jpeg),
-            ImageFormat::Gif => Some(Format::Gif),
-            ImageFormat::WebP => Some(Format::Webp),
-            ImageFormat::Avif => Some(Format::Avif),
+            ImageFormat::Png => Some(OutputFormat::Png),
+            ImageFormat::Jpeg => Some(OutputFormat::Jpeg),
+            ImageFormat::Gif => Some(OutputFormat::Gif),
+            ImageFormat::WebP => Some(OutputFormat::Webp),
+            ImageFormat::Avif => Some(OutputFormat::Avif),
             _ => None,
         }
     }
@@ -266,12 +298,12 @@ impl Format {
 /// native rule can emit `<img width height>`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build(
-    source: &ImageSource,
+    source: &AssetSource,
     width: Option<u32>,
     height: Option<u32>,
     fit: Fit,
     filter: Filter,
-    format: Option<Format>,
+    format: Format,
     quality: u8,
     ctx: &TwylaContext,
     span: Span,
@@ -279,7 +311,7 @@ pub(crate) fn build(
     // Read the source bytes from disk (tracking the file) or take the inline
     // bytes directly.
     let (upstream, stem, bytes) = match source {
-        ImageSource::File(file) => {
+        AssetSource::File(file) => {
             let on_disk = ctx.root.join(file.vpath().get_without_slash());
             let (up, bytes) = Upstream::new_read_bytes(on_disk).map_err(|err| err_at(span, err))?;
             let stem = up
@@ -289,16 +321,16 @@ pub(crate) fn build(
                 .map(str::to_owned);
             (vec![up], stem, bytes)
         }
-        ImageSource::Bytes(bytes) => (Vec::new(), None, bytes.to_vec()),
+        AssetSource::Bytes(bytes) => (Vec::new(), None, bytes.to_vec()),
     };
 
     // Detect the source format up front: it drives both decoding and the
     // "keep source format" default.
     let detected = image::guess_format(&bytes)
         .map_err(|err| err_at(span, format_args!("not a recognized image: {err}")))?;
-    let out_format = match format {
+    let out_format = match format.explicit() {
         Some(f) => f,
-        None => Format::from_detected(detected).ok_or_else(|| {
+        None => OutputFormat::from_detected(detected).ok_or_else(|| {
             err_at(
                 span,
                 format_args!("cannot re-encode {detected:?} images; set an explicit `format`"),
@@ -376,19 +408,19 @@ fn both(
 /// Encode a decoded image to the target format. PNG/JPEG/GIF/AVIF go through the
 /// `image` crate; WebP routes through libwebp for lossy output (see the module
 /// docs).
-fn encode(img: &DynamicImage, format: Format, quality: u8) -> Result<Vec<u8>, EcoString> {
+fn encode(img: &DynamicImage, format: OutputFormat, quality: u8) -> Result<Vec<u8>, EcoString> {
     let mut buf = Vec::new();
     match format {
-        Format::Png => img
+        OutputFormat::Png => img
             .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
             .map_err(|e| eco_format!("PNG encode failed: {e}"))?,
-        Format::Gif => img
+        OutputFormat::Gif => img
             .write_to(&mut Cursor::new(&mut buf), ImageFormat::Gif)
             .map_err(|e| eco_format!("GIF encode failed: {e}"))?,
-        Format::Jpeg => JpegEncoder::new_with_quality(&mut buf, quality)
+        OutputFormat::Jpeg => JpegEncoder::new_with_quality(&mut buf, quality)
             .encode_image(img)
             .map_err(|e| eco_format!("JPEG encode failed: {e}"))?,
-        Format::Avif => AvifEncoder::new_with_speed_quality(&mut buf, 4, quality)
+        OutputFormat::Avif => AvifEncoder::new_with_speed_quality(&mut buf, 4, quality)
             .write_image(
                 img.as_bytes(),
                 img.width(),
@@ -398,7 +430,7 @@ fn encode(img: &DynamicImage, format: Format, quality: u8) -> Result<Vec<u8>, Ec
             .map_err(|e| eco_format!("AVIF encode failed: {e}"))?,
         // `image`'s WebP encoder is lossless-only; libwebp does lossy at the
         // requested quality. `from_image` handles the RGB/RGBA conversion.
-        Format::Webp => {
+        OutputFormat::Webp => {
             let encoder = webp::Encoder::from_image(img)
                 .map_err(|e| eco_format!("WebP encode failed: {e}"))?;
             buf = encoder.encode(quality as f32).to_vec();

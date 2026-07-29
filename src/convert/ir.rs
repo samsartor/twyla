@@ -119,7 +119,12 @@ pub enum Block {
 
 /// Render a document body using Zola's slugification for heading anchors.
 pub fn render(blocks: &[Block]) -> String {
-    Renderer { prefix: "", slug: crate::slug::slugify, base_url: None }.render_blocks(blocks)
+    Renderer {
+        prefix: "",
+        slug: crate::slug::slugify,
+        base_url: None,
+    }
+    .render_blocks(blocks)
 }
 
 /// Render a document body using Hugo/goldmark slugification for heading anchors.
@@ -127,7 +132,12 @@ pub fn render(blocks: &[Block]) -> String {
 /// target to prevent cross-page label conflicts in the typst bundle.
 /// `base_url` is used to resolve Hugo `{{< ref >}}` shortcode links.
 pub fn render_hugo(blocks: &[Block], label_prefix: &str, base_url: Option<&str>) -> String {
-    Renderer { prefix: label_prefix, slug: hugo_slugify, base_url }.render_blocks(blocks)
+    Renderer {
+        prefix: label_prefix,
+        slug: hugo_slugify,
+        base_url,
+    }
+    .render_blocks(blocks)
 }
 
 /// Rendering context — holds per-page state so it doesn't have to be threaded
@@ -381,28 +391,29 @@ impl Renderer<'_> {
                     out.push(')');
                 }
             }
-        Inline::Image { src, alt } => {
-            if src.starts_with("http://") || src.starts_with("https://") {
-                let dict = typst_attrs([("src", src.as_str()), ("alt", alt.as_str())].into_iter());
-                write!(out, "#html.elem(\"img\"{dict})").unwrap();
-            } else if alt.is_empty() {
-                write!(out, "#image(\"{}\")", escape_typst_string(src)).unwrap();
-            } else {
-                write!(
-                    out,
-                    "#image(\"{}\", alt: \"{}\")",
-                    escape_typst_string(src),
-                    escape_typst_string(alt)
-                )
-                .unwrap();
+            Inline::Image { src, alt } => {
+                if src.starts_with("http://") || src.starts_with("https://") {
+                    let dict =
+                        typst_attrs([("src", src.as_str()), ("alt", alt.as_str())].into_iter());
+                    write!(out, "#html.elem(\"img\"{dict})").unwrap();
+                } else if alt.is_empty() {
+                    write!(out, "#image(\"{}\")", escape_typst_string(src)).unwrap();
+                } else {
+                    write!(
+                        out,
+                        "#image(\"{}\", alt: \"{}\")",
+                        escape_typst_string(src),
+                        escape_typst_string(alt)
+                    )
+                    .unwrap();
+                }
             }
+            Inline::SoftBreak => out.push('\n'),
+            Inline::HardBreak => out.push_str(" \\\n"),
+            Inline::Raw(s) => write!(out, "/* TODO twyla-convert: {s} */").unwrap(),
+            Inline::Verbatim(s) => out.push_str(s),
         }
-        Inline::SoftBreak => out.push('\n'),
-        Inline::HardBreak => out.push_str(" \\\n"),
-        Inline::Raw(s) => write!(out, "/* TODO twyla-convert: {s} */").unwrap(),
-        Inline::Verbatim(s) => out.push_str(s),
     }
-}
 
     fn wrap(&self, out: &mut String, open: &str, content: &[Inline], close: &str) {
         out.push_str(open);
@@ -440,9 +451,7 @@ fn indent_continuation(text: &str, pad: &str, out: &mut String) {
 /// `!--TWYLA-HUGO:ref &quot;/path&quot;--` after pulldown-cmark strips the
 /// angle brackets. Returns the resolved URL, or `None` if parsing fails.
 fn parse_hugo_ref_url(dest: &str, base_url: Option<&str>) -> Option<String> {
-    let inner = dest
-        .strip_prefix("!--TWYLA-HUGO:")?
-        .strip_suffix("--")?;
+    let inner = dest.strip_prefix("!--TWYLA-HUGO:")?.strip_suffix("--")?;
     let inner = inner.replace("&quot;", "\"");
     let path_raw = inner.strip_prefix("ref")?.trim().trim_matches('"');
     let (path, anchor) = match path_raw.split_once('#') {

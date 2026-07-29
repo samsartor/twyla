@@ -80,7 +80,11 @@ pub fn import_hugo_md(
     let prefix = derive_page_prefix(route);
     let (summary_md, body) = split_summary(body);
     let summary = summary_md.map(|md| {
-        ir::render_hugo(&parse_blocks(&preprocess_hugo_shortcodes(md)), &prefix, base_url)
+        ir::render_hugo(
+            &parse_blocks(&preprocess_hugo_shortcodes(md)),
+            &prefix,
+            base_url,
+        )
     });
     let blocks = parse_blocks(&preprocess_hugo_shortcodes(&body));
     Ok(assemble(

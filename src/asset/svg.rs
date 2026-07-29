@@ -21,7 +21,8 @@
 //! error.
 
 use super::{
-    AssetSpec, Built, ImageSource, OutputReq, Upstream, emit_or_request, resolve_path, sha256,
+    AssetInput, AssetSource, AssetSpec, Built, OutputReq, Upstream, emit_or_request, resolve_input,
+    sha256,
 };
 use crate::project::TwylaContext;
 use crate::render::Emit;
@@ -29,7 +30,7 @@ use ecow::{EcoString, EcoVec, eco_format, eco_vec};
 use svgm_core::ast::{Attribute, Document, NodeKind};
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{
-    AutoValue, Bytes, NoneValue, Packed, PathOrStr, ShowFn, StyleChain, cast, elem, func, scope,
+    AutoValue, Bytes, NoneValue, Packed, ShowFn, StyleChain, cast, elem, func, scope,
 };
 use typst::loading::Encoding;
 use typst::syntax::Span;
@@ -44,9 +45,9 @@ use typst::syntax::Span;
 /// ```
 #[elem(scope, name = "svg")]
 pub struct SvgAsset {
-    /// Path to the source SVG, relative to the calling file.
+    /// A source SVG path (relative to the calling file), or SVG data as bytes.
     #[required]
-    pub path: PathOrStr,
+    pub path: AssetInput,
 
     /// Minify the output with svgm's default pass set (an svgo port). Part of
     /// the asset key, so minified and verbatim builds of one file are distinct
@@ -111,7 +112,7 @@ const ELEM_ID_PENDING: &str = "__twyla-svg-id-pending__";
 /// fields.
 fn spec(elem: &Packed<SvgAsset>, styles: StyleChain) -> HintedStrResult<AssetSpec> {
     Ok(AssetSpec::Svg {
-        source: ImageSource::File(resolve_path(&elem.path, elem.span())?),
+        source: resolve_input(&elem.path, elem.span())?,
         minify: elem.minify.get(styles),
         id: elem.id.get_cloned(styles),
     })
@@ -125,7 +126,7 @@ fn output(elem: &Packed<SvgAsset>, styles: StyleChain) -> HintedStrResult<Output
 /// parameters come entirely from `#set asset.svg(..)` on the style chain, so a
 /// markdown `![](icon.svg)` minifies under the same set rules. Mirrors
 /// [`image::spec_from_styles`](super::image::spec_from_styles).
-pub(crate) fn spec_from_styles(source: ImageSource, styles: StyleChain) -> AssetSpec {
+pub(crate) fn spec_from_styles(source: AssetSource, styles: StyleChain) -> AssetSpec {
     AssetSpec::Svg {
         source,
         minify: styles.get(SvgAsset::minify),
@@ -168,7 +169,7 @@ cast! {
 /// `id`. When neither transformation applies the bytes pass through verbatim —
 /// `asset.svg(minify: false)` degenerates to a fingerprinted copy.
 pub(crate) fn build(
-    source: &ImageSource,
+    source: &AssetSource,
     minify: bool,
     id: &SvgId,
     ctx: &TwylaContext,
@@ -178,7 +179,7 @@ pub(crate) fn build(
     // Read the source bytes from disk (tracking the file) or take the inline
     // bytes directly — same split as `image::build`.
     let (upstream, stem, bytes) = match source {
-        ImageSource::File(file) => {
+        AssetSource::File(file) => {
             let on_disk = ctx.root.join(file.vpath().get_without_slash());
             let (up, bytes) = Upstream::new_read_bytes(on_disk).map_err(|err| err_at(span, err))?;
             let stem = up
@@ -188,7 +189,7 @@ pub(crate) fn build(
                 .map(str::to_owned);
             (vec![up], stem, bytes)
         }
-        ImageSource::Bytes(bytes) => (Vec::new(), None, bytes.to_vec()),
+        AssetSource::Bytes(bytes) => (Vec::new(), None, bytes.to_vec()),
     };
 
     let out = process(&bytes, minify, id, span, warnings)?;

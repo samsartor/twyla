@@ -38,7 +38,7 @@ use typst_library::visualize::{
 };
 
 use crate::asset::{
-    AssetSpec, ImageSource, OutputReq, image, resolve_image_or_request, resolve_or_request, svg,
+    AssetSource, AssetSpec, OutputReq, image, resolve_image_or_request, resolve_or_request, svg,
 };
 
 /// Install twyla's native HTML rules into a freshly built library's
@@ -67,6 +67,8 @@ pub fn install(rules: &mut NativeRuleMap) {
     rules.register(Target::Paged, crate::asset::image::SHOW_RULE);
     rules.register(Target::Html, crate::asset::svg::SHOW_RULE);
     rules.register(Target::Paged, crate::asset::svg::SHOW_RULE);
+    rules.register(Target::Html, crate::asset::raw::SHOW_RULE);
+    rules.register(Target::Paged, crate::asset::raw::SHOW_RULE);
     rules.register(Target::Html, crate::asset::typst_doc::SHOW_RULE);
     rules.register(Target::Paged, crate::asset::typst_doc::SHOW_RULE);
 }
@@ -198,8 +200,8 @@ const LINK_RULE: ShowFn<LinkElem> = |elem, engine, _| {
 /// resizes per any `#set asset.image(..)` on the chain ([`image::spec_from_styles`])
 /// and emits the output's intrinsic `width`/`height` (from the decode the
 /// pipeline does anyway) for layout reservation. A path-backed image becomes an
-/// [`ImageSource::File`] (read + watched), an inline/byte-source image an
-/// [`ImageSource::Bytes`].
+/// [`AssetSource::File`] (read + watched), an inline/byte-source image an
+/// [`AssetSource::Bytes`].
 ///
 /// **SVG images** route through the `asset.svg` pipeline ([`AssetSpec::Svg`]),
 /// so a markdown `![](icon.svg)` minifies per any `#set asset.svg(..)` on the
@@ -228,16 +230,16 @@ const IMAGE_RULE: ShowFn<ImageElem> = |elem, engine, styles| {
 
     let (src, dimensions) = if raster {
         let img_source = match file {
-            Some(file) => ImageSource::File(file),
-            None => ImageSource::Bytes(loaded.data.clone()),
+            Some(file) => AssetSource::File(file),
+            None => AssetSource::Bytes(loaded.data.clone()),
         };
         let spec = image::spec_from_styles(img_source, styles).at(span)?;
         let resolved = resolve_image_or_request(engine, spec, span);
         (resolved.url, resolved.dimensions)
     } else if is_svg {
         let source = match file {
-            Some(file) => ImageSource::File(file),
-            None => ImageSource::Bytes(loaded.data.clone()),
+            Some(file) => AssetSource::File(file),
+            None => AssetSource::Bytes(loaded.data.clone()),
         };
         let spec = svg::spec_from_styles(source, styles);
         (

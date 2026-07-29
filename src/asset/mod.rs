@@ -109,7 +109,8 @@ pub enum AssetSpec {
         file: FileId,
     },
     Sass {
-        file: FileId,
+        source: AssetSource,
+        format: sass::Format,
         minify: bool,
     },
     Raw {
@@ -119,20 +120,19 @@ pub enum AssetSpec {
         ext: Option<EcoString>,
     },
     Svg {
-        source: ImageSource,
+        source: AssetSource,
         minify: bool,
         /// Root-element `id` request (`none`/`auto`/fixed). Part of the key, so
         /// differently-id'd uses of one file are distinct assets.
         id: svg::SvgId,
     },
     Image {
-        source: ImageSource,
+        source: AssetSource,
         width: Option<u32>,
         height: Option<u32>,
         fit: image::Fit,
         filter: image::Filter,
-        /// `None` keeps the source format.
-        format: Option<image::Format>,
+        format: image::Format,
         quality: u8,
     },
     Typst {
@@ -146,13 +146,42 @@ pub enum AssetSpec {
     },
 }
 
-/// Where a processed image's source bytes come from.
+/// A path-or-string argument names a file; bytes are source data already in
+/// memory. This is the user-facing input type shared by the processing asset
+/// constructors.
 #[derive(Clone, PartialEq, Hash, Debug)]
-pub enum ImageSource {
+pub enum AssetInput {
+    Path(PathOrStr),
+    Bytes(Bytes),
+}
+
+cast! {
+    AssetInput,
+    self => match self {
+        Self::Path(v) => v.into_value(),
+        Self::Bytes(v) => v.into_value(),
+    },
+    // Keep this ordering: strings are paths, never source text.
+    v: PathOrStr => Self::Path(v),
+    v: Bytes => Self::Bytes(v),
+}
+
+/// Where a processing asset's source bytes come from.
+#[derive(Clone, PartialEq, Hash, Debug)]
+pub enum AssetSource {
     /// A project file, read from disk (and watched). Fingerprinted by content.
     File(FileId),
     /// In-memory bytes (an inline image), content-addressed by the bytes.
     Bytes(Bytes),
+}
+
+/// Resolve a constructor input relative to the call site. Inline bytes need no
+/// path resolution and are content-addressed directly in the asset spec.
+pub(crate) fn resolve_input(input: &AssetInput, span: Span) -> HintedStrResult<AssetSource> {
+    Ok(match input {
+        AssetInput::Path(path) => AssetSource::File(resolve_path(path, span)?),
+        AssetInput::Bytes(bytes) => AssetSource::Bytes(bytes.clone()),
+    })
 }
 
 impl Eq for AssetSpec {}
@@ -394,6 +423,7 @@ pub fn module() -> Module {
     scope.define_elem::<sass::SassAsset>();
     scope.define_elem::<svg::SvgAsset>();
     scope.define_elem::<image::ImageAsset>();
+    scope.define_elem::<raw::RawAsset>();
     scope.define_elem::<typst_doc::TypstAsset>();
     Module::new("asset", scope)
 }
