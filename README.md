@@ -23,7 +23,9 @@ content/
 └ main.typ
 ```
 
-If you `twyla serve` and point your browser at [http://localhost:1111](http://localhost:1111) you will see your `main.typ` as HTML. Go ahead and add something, possibly your name? The webpage reloads automatically.
+<hr />
+
+#### content/main.typ
 
 ```example
 #set document(title: "My Blog")
@@ -33,13 +35,11 @@ If you `twyla serve` and point your browser at [http://localhost:1111](http://lo
 I make bread!
 ```
 
-To deploy your website, simply run `twyla build --base-url https://example.com` and copy the `public` dir to the provider of your choice.
+If you `twyla serve` and point your browser at [http://localhost:1111](http://localhost:1111) you will see your `main.typ` as HTML. Go ahead and add something, possibly your name? The webpage reloads automatically.
 
-Additional pages are just additional files:
+To deploy your website, run `twyla build --base-url https://example.com` and copy the `public` dir to the provider of your choice.
 
-For a blog you will probably want to list your other pages on your home page. To do that, use the [documents()](https://twyla.dev/reference/#documents) iterator:
-
-Project files
+Additional pages are additional files:
 
 ```tree
 content/
@@ -48,6 +48,10 @@ content/
 ├ oops-i-vibecoded-my-blog.typ
 └ how-to-bake-bread.typ
 ```
+
+<hr />
+
+#### content/main.typ
 
 ```example
 = My Blog
@@ -64,6 +68,8 @@ I make bread! And wrote these posts:
 }
 ```
 
+For a blog you will probably want to list your other pages on your home page. To do that, use the [documents()](https://twyla.dev/reference/#documents) iterator:
+
 You can see Twyla’s main idea in action: _there is no configuration, only code._ Typst is a real programming language. If you want to create sidebars, listings, tags, “recents”, whatever … well that is what for loops are for!
 
 Before you get carried away, please include basic information like `title` and `date`:
@@ -76,6 +82,9 @@ Before you get carried away, please include basic information like `title` and `
     My blog was written in normal everyday Markdown, but as a
     tech hipster I found that unacceptable...
   ],
+  extra: (
+    color: blue,
+  ),
 )
 ```
 
@@ -95,36 +104,40 @@ sass/
 
 <hr />
 
+#### sass/main.sass
+
 ```sass
 .post-header
   display: flex
-  border: 1px black
+  align-items: end
+  border-bottom: 1px solid grey
 
 .post-title
-  flex: grow
-  size: 2em
+  flex-grow: 1
+  font-size: 1.2em
 
-.post-date:
+.post-date
   color: grey
 ```
 
 <hr />
 
+#### content/main.typ
+
 ```example
 #context for doc in documents() {
   if not doc.draft and doc.kind == "post" [
-    html.div(
+    #html.div({
       html.div(
         [#doc.title],
         class: "post-title",
         style: "color: " + doc.extra.color,
-      ),
+      )
       html.div(
         [#doc.date.display()],
         class: "post-date",
-      ),
-      class: "post-header",
-    )
+      )
+    }, class: "post-header")
 
     #doc.description
   ]
@@ -240,14 +253,16 @@ templates/
 └ post.typ
 ```
 
+<hr />
+
 ```typst
 #import "/templates/post.typ": post-template
-
-#show: post-template.with(theme-color: blue)
 #set document(
   title: "How to Bake Bread",
   description: "The recipe for bread I learned from that talking rat",
 )
+
+#show: post-template.with(theme-color: blue)
 
 == Step 1: Finding Grinded Wheat
 ...

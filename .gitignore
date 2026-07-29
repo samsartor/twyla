@@ -1,5 +1,5 @@
 /target
-/doc/*.pdf
 /doc/public
 /test_site/public
 /.wrangler
+*.pdf

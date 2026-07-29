@@ -714,7 +714,7 @@ pre.specimen-code
   margin-top: 3.5rem
   letter-spacing: -.04em
 
-.prose>pre, .signature, .boxdraw
+.prose>pre, .prose>.signature, .prose>.boxdraw
   border: 1px solid #38413e
   border-radius: .35rem
   box-shadow: .4rem .4rem 0 color-mix(in srgb, var(--border) 70%, transparent)
@@ -784,17 +784,6 @@ pre.specimen-code
 .journey-result .panel-meta
   color: #70d5be
 
-.journey-code pre, .journey-code .boxdraw
-  background: var(--code-bg)
-  height: calc(100% - 2.5rem)
-  margin: 0
-  padding: 1.3rem 1.2rem
-  border: 0
-  border-radius: 0
-  box-shadow: none
-  font-size: clamp(.67rem, 1vw, .78rem)
-  line-height: 1.7
-
 .journey-browser
   height: calc(100% - 2.5rem)
   background: white
@@ -802,7 +791,7 @@ pre.specimen-code
   overflow: hidden
 
 .journey-browser iframe
-  width: 100%
+  width: calc(100% - 2em)
   height: 100%
   border: none
   margin-left: 1em
@@ -944,7 +933,7 @@ pre.specimen-code
   .journey-source-sep
     width: 100%
   .journey-browser
-    min-height: 50vh
+    min-height: 30vh
   .prose > h2:not(.ref-item)
     margin-top: 4rem
   .prose .ref-item

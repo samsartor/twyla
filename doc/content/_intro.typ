@@ -1,11 +1,6 @@
 #import "_journey.typ": *
 
 #let horizontalrule = context { if target() == "html" { html.hr() } else { line(length: 100%) } }
-#let guide-example(source, scope: (:), ..args) = source-result(
-  source,
-  eval(source.text, mode: "markup", scope: scope),
-  ..args,
-)
 
 <twyla>
 Twyla is a static site generator (SSG) similar to #link("https://gohugo.io/")[Hugo] or
@@ -34,73 +29,61 @@ cargo install --git https://github.com/samsartor/twyla
 <getting-started>
 All you need to start using twyla is a single file!
 
-```tree
-content/
-└ main.typ
-```
+#project-example(
+  ```tree
+  content/
+  └ main.typ
+  ```,
+  [=== content/main.typ],
+  ```example
+  #set document(title: "My Blog")
+
+  = My Blog
+
+  I make bread!
+  ```,
+  class: "first-page-example",
+)
 
 If you `twyla serve` and point your browser at
 #link("http://localhost:1111") you will see your `main.typ` as HTML. Go
 ahead and add something, possibly your name? The webpage reloads
 automatically.
 
-#let first-page = ```example
-#set document(title: "My Blog")
-
-= My Blog
-
-I make bread!
-```
-
-#guide-example(
-  first-page,
-  source-label: "content/main.typ",
-  result-label: "localhost:1111",
-  class: "first-page-example",
-)
-
-To deploy your website, simply run
+To deploy your website, run
 `twyla build --base-url https://example.com` and copy the `public` dir
 to the provider of your choice.
 
-Additional pages are just additional files:
+Additional pages are additional files:
 
-#let pages-tree = ```tree
-content/
-├ main.typ
-├ rewriting-my-blog.typ
-├ oops-i-vibecoded-my-blog.typ
-└ how-to-bake-bread.typ
-```
+#project-example(
+  ```tree
+  content/
+  ├ main.typ
+  ├ rewriting-my-blog.typ
+  ├ oops-i-vibecoded-my-blog.typ
+  └ how-to-bake-bread.typ
+  ```,
+  [=== content/main.typ],
+  ```example
+  = My Blog
+
+  I make bread! And wrote these posts:
+
+  #context for doc in documents() {
+    if not doc.draft and doc.kind == "post" [
+      == #link(doc.url, doc.title)
+      #doc.date.display()
+
+      #doc.description
+    ]
+  }
+  ```,
+)
 
 For a blog you will probably want to list your other pages on your home
 page. To do that, use the
 #link("https://twyla.dev/reference/#documents")[documents()] iterator:
-
-#let listing-example = ```example
-= My Blog
-
-I make bread! And wrote these posts:
-
-#context for doc in documents() {
-  if not doc.draft and doc.kind == "post" [
-    == #link(doc.url, doc.title)
-    #doc.date.display()
-
-    #doc.description
-  ]
-}
-```
-
-#project-example(
-  pages-tree,
-  listing-example,
-  eval(
-    listing-example.text,
-    mode: "markup",
-    scope: (documents: guide-documents),
-  ),
-)
 
 You can see Twyla's main idea in action: _there is no configuration, only code._
 Typst is a real programming language. If you want to create sidebars, listings,
@@ -116,6 +99,9 @@ Before you get carried away, please include basic information like `title` and `
     My blog was written in normal everyday Markdown, but as a
     tech hipster I found that unacceptable...
   ],
+  extra: (
+    color: blue,
+  ),
 )
 ```
 
@@ -124,55 +110,53 @@ supports a number of additional features, beyond what are available in normal
 Typst, including an `extra` field you can fill with whatever data you want.
 
 For the purpose of theming you can also add a SCSS file and
-#link("https://typst.app/docs/reference/html")[some HTML];:
+#link("https://typst.app/docs/reference/html")[some HTML]:
 
-```tree
-content/
-├ main.typ
-├ rewriting-my-blog.typ
-├ oops-i-vibecoded-my-blog.typ
-└ how-to-bake-bread.typ
-sass/
-└ main.sass
-```
+#project-example(
+  ```tree
+  content/
+  ├ main.typ
+  ├ rewriting-my-blog.typ
+  ├ oops-i-vibecoded-my-blog.typ
+  └ how-to-bake-bread.typ
+  sass/
+  └ main.sass
+  ```,
+  [=== sass/main.sass],
+  ```sass
+  .post-header
+    display: flex
+    align-items: end
+    border-bottom: 1px solid grey
 
-#horizontalrule
+  .post-title
+    flex-grow: 1
+    font-size: 1.2em
 
-```sass
-.post-header
-  display: flex
-  border: 1px black
+  .post-date
+    color: grey
+  ```,
+  [=== content/main.typ],
+  ```example
+  #context for doc in documents() {
+    if not doc.draft and doc.kind == "post" [
+      #html.div({
+        html.div(
+          [#doc.title],
+          class: "post-title",
+          style: "color: " + doc.extra.color,
+        )
+        html.div(
+          [#doc.date.display()],
+          class: "post-date",
+        )
+      }, class: "post-header")
 
-.post-title
-  flex: grow
-  size: 2em
-
-.post-date:
-  color: grey
-```
-
-#horizontalrule
-
-```example
-#context for doc in documents() {
-  if not doc.draft and doc.kind == "post" [
-    html.div(
-      html.div(
-        [#doc.title],
-        class: "post-title",
-        style: "color: " + doc.extra.color,
-      ),
-      html.div(
-        [#doc.date.display()],
-        class: "post-date",
-      ),
-      class: "post-header",
-    )
-
-    #doc.description
-  ]
-}
-```
+      #doc.description
+    ]
+  }
+  ```,
+)
 
 If you would like to include an image, you can use either the built-in
 image function or handle it explicitly with Twyla's
@@ -196,7 +180,7 @@ Or my son
 }")
 ```
 
-#guide-example(
+#project-example(
   image-example,
   source-label: "content/my-post.typ",
   result-label: "Rendered images",
@@ -233,7 +217,7 @@ Check out this pretty icon: #icon
 )
 ```
 
-#guide-example(
+#project-example(
   asset-example,
   source-label: "content/assets.typ",
   result-label: "Generated assets",
@@ -300,32 +284,33 @@ JS conversion using #link("https://rolldown.rs")[rolldown] as well.
 Instead of stylizing every post separately, you probably want to create
 a common set of templates:
 
-```tree
-content/
-├ main.typ
-├ rewriting-my-blog.typ
-├ oops-i-vibecoded-my-blog.typ
-└ how-to-bake-bread.typ
-sass/
-└ main.sass
-templates/
-├ base.typ
-├ home.typ
-└ post.typ
-```
+#project-example(
+  ```tree
+  content/
+  ├ main.typ
+  ├ rewriting-my-blog.typ
+  ├ oops-i-vibecoded-my-blog.typ
+  └ how-to-bake-bread.typ
+  sass/
+  └ main.sass
+  templates/
+  ├ base.typ
+  ├ home.typ
+  └ post.typ
+  ```,
+  ```typst
+  #import "/templates/post.typ": post-template
+  #set document(
+    title: "How to Bake Bread",
+    description: "The recipe for bread I learned from that talking rat",
+  )
 
-```typst
-#import "/templates/post.typ": post-template
+  #show: post-template.with(theme-color: blue)
 
-#show: post-template.with(theme-color: blue)
-#set document(
-  title: "How to Bake Bread",
-  description: "The recipe for bread I learned from that talking rat",
+  == Step 1: Finding Grinded Wheat
+  ...
+  ```,
 )
-
-== Step 1: Finding Grinded Wheat
-...
-```
 
 Twyla themes can also be arbitrary typst packages. Conventionally, a Twyla theme
 should expose `KIND-template` functions and/or `KIND-default` constants for each
