@@ -33,7 +33,7 @@ use typst_library::Feature;
 use crate::asset::ResolvedAsset;
 use crate::compile::CompiledBundle;
 use crate::document::ResolvedDocument;
-use crate::project::TwylaContext;
+use crate::project::{ContentScan, TwylaContext};
 use crate::resolver::Resolver;
 
 /// The `type` attribute marking a raw-HTML carrier `<script>`. The builtin
@@ -413,8 +413,7 @@ impl RenderWorld {
         })
     }
 
-    /// Paths that the last compile read from disk. Suitable for
-    /// `typst_kit::watcher::Watcher::update`. Drops the virtual main
+    /// Paths that the last compile read from disk. Drops the virtual main
     /// (not a real path).
     pub fn dependencies(&mut self) -> impl Iterator<Item = PathBuf> + '_ {
         let (loader, ids) = self.files.dependencies();
@@ -429,18 +428,33 @@ impl RenderWorld {
     /// would force interior mutability, since `self` is also handed to typst as
     /// `&dyn World` for the duration of the compile.
     pub fn compile_bundle(&self, resolver: &mut Resolver) -> Result<Outputs, RenderError> {
-        // Reads through `FileStore`, so repeated calls hit the comemo
-        // cache. Between compiles, call [`reset`](Self::reset) and
-        // `comemo::evict(..)` to invalidate; for content/ shape changes,
-        // also call [`refresh_main`](Self::refresh_main).
+        self.compile_bundle_with(&self.ctx.scan_content(), resolver)
+    }
 
-        let sources = self.ctx.scan_pages().map_err(setup_err)?;
-        let fileids: Vec<_> = sources
-            .into_iter()
+    /// [`compile_bundle`](Self::compile_bundle) against a [`ContentScan`] the
+    /// caller already took. The dev server scans once and uses the same scan
+    /// for this compile and for its watch set, so a page created mid-compile
+    /// can't be missing from the bundle yet present in what's watched (or vice
+    /// versa).
+    pub fn compile_bundle_with(
+        &self,
+        scan: &ContentScan,
+        resolver: &mut Resolver,
+    ) -> Result<Outputs, RenderError> {
+        // Reads through `FileStore`, so repeated calls hit the comemo
+        // cache. Between compiles, call `files.reset()` and
+        // `comemo::evict(..)` to invalidate.
+
+        if let Some(err) = &scan.error {
+            return Err(setup_err(err.clone()));
+        }
+        let fileids: Vec<_> = scan
+            .pages
+            .iter()
             .map(|path| {
                 FileId::new(RootedPath::new(
                     VirtualRoot::Project,
-                    VirtualPath::virtualize(&self.ctx.root, &path)
+                    VirtualPath::virtualize(&self.ctx.root, path)
                         .expect("all paths should be within the root"),
                 ))
             })
@@ -485,11 +499,11 @@ impl RenderWorld {
             }
         }
 
-        let static_outputs = match self.ctx.static_outputs() {
-            Ok(s) => s,
-            Err(err) => return Err(plain_err(err, RenderErrorKind::Bundle)),
-        };
-        for out in static_outputs {
+        for out in scan
+            .static_files
+            .iter()
+            .filter_map(|path| self.ctx.static_output(path))
+        {
             if let Err(err) = all.insert_unique(out) {
                 return Err(duplication_error(err).0);
             }

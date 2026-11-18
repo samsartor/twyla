@@ -5,25 +5,32 @@
 //! and the asset/document [`Resolver`] — and exposes exactly one operation,
 //! [`rebuild`](DevSession::rebuild): invalidate, compile, and report both the
 //! result and the [`WatchSet`] of paths whose change should trigger the next
-//! rebuild.
+//! rebuild, each with what this compile observed there.
 //!
-//! `serve`'s watcher thread is just `rebuild → watcher.update(watch) → wait`
+//! `serve`'s watcher thread is just `watcher.update(watch) → wait → rebuild`
 //! in a loop; tests drive the same `rebuild` by hand (edit a file, call it
 //! again), so what serve watches and how it recompiles are both testable
 //! without a file watcher or a socket.
 
-use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-use crate::project::TwylaContext;
+use crate::project::{ContentScan, TwylaContext};
 use crate::render::{Outputs, RenderError, RenderErrorKind, RenderWorld, plain_err};
 use crate::resolver::Resolver;
+pub use crate::watch::{Stamp, WatchSet};
 
 /// Persistent compile state for `twyla serve`. See the module docs.
 pub struct DevSession {
     pub world: RenderWorld,
     pub resolver: Resolver,
+    /// The previous rebuild's watch set, unioned into the next one when that
+    /// rebuild fails (see [`rebuild`](Self::rebuild)).
+    last_watch: WatchSet,
+    /// Test hook: panic inside the next compile, after it has run, to
+    /// exercise panic recovery.
+    #[cfg(test)]
+    inject_panic: bool,
 }
 
 /// The outcome of one [`DevSession::rebuild`].
@@ -31,27 +38,17 @@ pub struct Rebuild {
     pub result: Result<Outputs, RenderError>,
     /// What to watch until the next rebuild. Computed whether or not the
     /// compile succeeded, so fixing an error is itself noticed.
+    ///
+    /// The union of four sources, each explicit in [`DevSession::rebuild`]:
+    /// - every path the [`ContentScan`] observed (each directory under
+    ///   `content/` and `static/` by its listing, the roots even when missing),
+    ///   so creating or deleting a page or static file anywhere is noticed;
+    /// - files typst read (`world.dependencies()`);
+    /// - files twyla's asset pass read (each resolved asset's upstream paths);
+    /// - after a *failed* rebuild, everything the previous rebuild watched, so
+    ///   a compile that stopped early (scan error, typst error, panic) never
+    ///   shrinks the watch set.
     pub watch: WatchSet,
-}
-
-/// Every path whose change should trigger a rebuild. Each is watched
-/// non-recursively (files and directories alike); paths that don't exist are
-/// polled by `typst_kit::watcher::Watcher` until they appear.
-///
-/// The union of three sources, each explicit in [`DevSession::rebuild`]:
-/// - files typst read (`world.dependencies()`),
-/// - files twyla's asset pass read (each resolved asset's upstream paths),
-/// - every directory the page scan listed (`content/` and its subdirs), so
-///   creating or deleting a page anywhere under `content/` is noticed.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct WatchSet {
-    pub paths: BTreeSet<PathBuf>,
-}
-
-impl WatchSet {
-    pub fn contains(&self, path: impl AsRef<Path>) -> bool {
-        self.paths.contains(path.as_ref())
-    }
 }
 
 impl DevSession {
@@ -59,6 +56,9 @@ impl DevSession {
         Ok(Self {
             world: RenderWorld::new(ctx)?,
             resolver: Resolver::new(ctx),
+            last_watch: WatchSet::default(),
+            #[cfg(test)]
+            inject_panic: false,
         })
     }
 
@@ -68,25 +68,42 @@ impl DevSession {
     /// Mirrors one iteration of typst's own `typst watch` loop
     /// (`typst-cli/src/watch.rs`): age comemo, mark FileStore slots stale (both
     /// no-ops before the first compile), compile, then collect what to watch.
-    /// The page set is rescanned inside `compile_bundle` every time, so added
-    /// or removed pages need no separate refresh step.
+    /// `content/` and `static/` are rescanned every time, once, and that one
+    /// scan feeds both the compile and the watch set.
     pub fn rebuild(&mut self) -> Rebuild {
         comemo::evict(10);
         self.world.files.reset();
 
+        // Taken before anything is read: a file modified after this instant
+        // may have changed after the compile read it (see `Stamp::after_read`).
+        let started = SystemTime::now();
+        let scan = self.world.ctx.scan_content();
+
         // A panic anywhere in the compile (typst, an asset pipeline, or an
         // invariant `panic!` in `compile_bundle`) would otherwise unwind
         // through serve's watcher thread and end hot reload for the session.
-        // Catch it and report it like any other render error. The resolver
-        // may have been left mid-update, so it's replaced with a fresh one —
-        // losing the asset cache is cheap next to serving stale state. The
-        // world needs no repair: the next rebuild resets its FileStore anyway.
+        // Catch it and report it like any other render error.
+        #[cfg(test)]
+        let inject_panic = std::mem::take(&mut self.inject_panic);
         let world = &self.world;
         let resolver = &mut self.resolver;
-        let result = match catch_unwind(AssertUnwindSafe(|| world.compile_bundle(resolver))) {
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let result = world.compile_bundle_with(&scan, resolver);
+            #[cfg(test)]
+            if inject_panic {
+                panic!("injected test panic");
+            }
+            result
+        }));
+
+        // Collect what this attempt observed *before* any recovery below
+        // discards the world and resolver that hold those observations.
+        let mut watch = self.observed(&scan, started);
+
+        let result = match outcome {
             Ok(result) => result,
             Err(payload) => {
-                self.resolver = Resolver::new(&self.world.ctx);
+                self.reset_after_panic();
                 let msg = payload
                     .downcast_ref::<&str>()
                     .map(|s| s.to_string())
@@ -99,41 +116,59 @@ impl DevSession {
             }
         };
 
-        Rebuild {
-            result,
-            watch: self.watch_set(),
+        if result.is_err() {
+            watch.keep_from(&self.last_watch);
         }
+        self.last_watch = watch.clone();
+        Rebuild { result, watch }
     }
 
-    /// What to watch after the compile that just ran. See [`WatchSet`].
-    fn watch_set(&mut self) -> WatchSet {
-        let mut paths: BTreeSet<PathBuf> = self.world.dependencies().collect();
+    /// What the compile that just ran observed. See [`Rebuild::watch`].
+    fn observed(&mut self, scan: &ContentScan, started: SystemTime) -> WatchSet {
+        let mut watch = WatchSet::default();
+        for (path, stamp) in &scan.observed {
+            watch.insert(path.clone(), stamp.clone());
+        }
+
+        for path in self.world.dependencies().collect::<Vec<_>>() {
+            let stamp = Stamp::after_read(&path, started);
+            watch.insert(path, stamp);
+        }
 
         // Asset upstreams (e.g. sass `@import` partials) are read by twyla's
         // own pass, not typst, so they're not in `world.dependencies()`. Pulled
         // from the resolver, not the published outputs, so that an asset that
         // is only `.read()` (inlined, never emitted as a file) is still watched.
         for asset in self.resolver.resolved_assets() {
-            paths.extend(asset.upstream_paths().map(Path::to_path_buf));
+            for path in asset.upstream_paths() {
+                watch.insert(path.to_path_buf(), Stamp::after_read(path, started));
+            }
         }
+        watch
+    }
 
-        // `content/` itself always, even if it's missing or the scan failed
-        // (the watcher polls missing paths), so creating the first page works.
-        // Then every directory the page scan visits: watching each one
-        // non-recursively sees pages added to any existing subdirectory, and
-        // a new subdirectory shows up as a change to its parent.
-        let ctx = &self.world.ctx;
-        paths.insert(ctx.content_dir());
-        if let Ok(scan) = ctx.scan_content() {
-            paths.extend(scan.dirs);
+    /// After a panic, nothing the compile touched can be trusted: the
+    /// FileStore may hold half-updated slots (and `reset` would keep its
+    /// parsed sources for reuse), the resolver may be mid-update, and comemo
+    /// may have cached results computed from either. Start the next attempt
+    /// from a clean slate — a fresh world (re-enumerating fonts is slow, but
+    /// this is the rare path), a fresh resolver, and an empty comemo cache.
+    fn reset_after_panic(&mut self) {
+        comemo::evict(0);
+        let ctx = self.world.ctx.clone();
+        match RenderWorld::new(&ctx) {
+            Ok(world) => self.world = world,
+            // Can't build a new one: keep the old world (its FileStore is
+            // reset at the start of every rebuild anyway).
+            Err(e) => eprintln!("cannot rebuild compile state after panic: {e}"),
         }
-
-        WatchSet { paths }
+        self.resolver = Resolver::new(&ctx);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::Duration;
 
     use super::*;
@@ -302,5 +337,143 @@ mod tests {
             "broken partial not watched: {:?}",
             r.watch,
         );
+    }
+
+    /// Static files take part in the bundle's conflict check, so a static
+    /// change must rebuild: removing a static file that collides with a page
+    /// clears the error. `static/` itself is watched by its listing.
+    #[test]
+    fn removing_conflicting_static_file_clears_bundle_error() {
+        let (ctx, dir) = site(&[
+            ("content/main.typ", "home"),
+            ("static/index.html", "<p>static</p>"),
+            ("static/site.css", "body {}"),
+        ]);
+        let mut session = DevSession::new(&ctx).unwrap();
+
+        let r1 = session.rebuild();
+        let err = r1.result.err().expect("expected an output conflict");
+        assert!(err.to_string().contains("conflicts"), "{err}");
+        assert!(matches!(
+            r1.watch.paths.get(&ctx.static_dir()),
+            Some(Stamp::Dir { .. })
+        ));
+
+        std::fs::remove_file(dir.path().join("static/index.html")).unwrap();
+        let r2 = session.rebuild();
+        let out = r2.result.unwrap();
+        assert!(out.get("site.css").is_some());
+        assert!(out.get("index.html").is_some());
+    }
+
+    /// A missing `static/` is watched (polled) as missing, so creating it is
+    /// noticed.
+    #[test]
+    fn missing_static_dir_is_watched_as_missing() {
+        let (ctx, _dir) = site(&[("content/main.typ", "home")]);
+        let mut session = DevSession::new(&ctx).unwrap();
+        let r = session.rebuild();
+        assert!(r.result.is_ok());
+        assert_eq!(r.watch.paths.get(&ctx.static_dir()), Some(&Stamp::Missing));
+    }
+
+    /// A scan error (here a dangling symlink in a nested dir) still reports
+    /// every directory the scan visited, plus the broken entry itself, so
+    /// removing the symlink or creating its target is noticed.
+    #[cfg(unix)]
+    #[test]
+    fn scan_error_keeps_partial_dirs_watched() {
+        let (ctx, dir) = site(&[
+            ("content/main.typ", "home"),
+            ("content/posts/2024/old.typ", "old"),
+            ("content/zzz/late.typ", "late"),
+        ]);
+        let content = ctx.content_dir();
+        let link = content.join("posts/2024/broken.typ");
+        std::os::unix::fs::symlink(dir.path().join("nowhere.typ"), &link).unwrap();
+        let mut session = DevSession::new(&ctx).unwrap();
+
+        let r = session.rebuild();
+        assert!(r.result.is_err(), "expected a scan error");
+        for d in [
+            content.clone(),
+            content.join("posts"),
+            content.join("posts/2024"),
+            content.join("zzz"),
+        ] {
+            assert!(r.watch.contains(&d), "{} not watched", d.display());
+        }
+        assert_eq!(r.watch.paths.get(&link), Some(&Stamp::Missing));
+
+        std::fs::remove_file(&link).unwrap();
+        assert!(session.rebuild().result.is_ok());
+    }
+
+    /// A failed rebuild never shrinks the watch set: whatever the previous
+    /// rebuild watched (here, an imported file the failing compile never got
+    /// to) stays watched.
+    #[test]
+    fn failed_rebuild_keeps_previous_watch_set() {
+        let (ctx, dir) = site(&[
+            ("content/main.typ", "#import \"_lib.typ\": x\n#x"),
+            ("content/_lib.typ", "#let x = [lib]"),
+        ]);
+        let lib = ctx.content_dir().join("_lib.typ");
+        let mut session = DevSession::new(&ctx).unwrap();
+        assert!(session.rebuild().watch.contains(&lib));
+
+        // Break main.typ before the import is reached.
+        std::thread::sleep(Duration::from_millis(10));
+        write(
+            dir.path(),
+            "content/main.typ",
+            "#oops-undefined\n#import \"_lib.typ\": x",
+        );
+        let r = session.rebuild();
+        assert!(r.result.is_err());
+        assert!(r.watch.contains(&lib), "{:?}", r.watch);
+    }
+
+    /// A panic mid-compile: the error is reported as a panic, what the failed
+    /// attempt observed (and what the previous rebuild watched) stays watched,
+    /// and the next rebuild starts from fresh state and succeeds.
+    #[test]
+    fn panic_keeps_observations_and_recovers() {
+        let (ctx, dir) = site(&[
+            ("content/main.typ", "#import \"_lib.typ\": x\n#x"),
+            ("content/_lib.typ", "#let x = [v1]"),
+            ("content/style.scss", ".a { color: red; }"),
+            (
+                "content/other.typ",
+                "#context asset.sass(\"style.scss\").url()",
+            ),
+        ]);
+        let content = ctx.content_dir();
+        let mut session = DevSession::new(&ctx).unwrap();
+        let r1 = session.rebuild();
+        r1.result.unwrap();
+        assert!(r1.watch.contains(content.join("style.scss")));
+
+        session.inject_panic = true;
+        let r2 = session.rebuild();
+        let err = r2.result.err().expect("expected the injected panic");
+        assert!(matches!(err.kind, RenderErrorKind::Panic), "{err}");
+        for p in ["main.typ", "_lib.typ", "style.scss"] {
+            assert!(
+                r2.watch.contains(content.join(p)),
+                "{p} dropped: {:?}",
+                r2.watch
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+        write(dir.path(), "content/_lib.typ", "#let x = [v2]");
+        let r3 = session.rebuild();
+        let out = r3.result.unwrap();
+        let html = &out.get("index.html").and_then(|o| match o {
+            crate::render::Output::Doc(d) => Some(d.html.clone()),
+            _ => None,
+        });
+        assert!(html.as_deref().unwrap_or("").contains("v2"), "{html:?}");
     }
 }

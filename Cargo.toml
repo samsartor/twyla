@@ -16,7 +16,7 @@ typst-bundle = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a579
 # directly, hence a direct dep at the same pinned rev.
 typst-eval = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
 typst-html = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
-typst-kit = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358", default-features = false, features = ["scan-fonts", "embedded-fonts", "watcher", "system-packages", "system-downloader", "emit-diagnostics"] }
+typst-kit = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358", default-features = false, features = ["scan-fonts", "embedded-fonts", "system-packages", "system-downloader", "emit-diagnostics"] }
 typst-library = { git = "https://github.com/samsartor/typst", rev = "ab7d2a91a5797fc43761e32fb05d7ebab1725358" }
 # `asset.typst` compiles a stock-typst document in-process and serializes it to
 # the requested format: paged layout (`typst-layout`'s `PagedDocument`) feeds
@@ -34,10 +34,9 @@ ecow = "0.2"
 sha2 = "0.10"
 hex = "0.4"
 
-# Path-aware file watcher for `static/` (serve hot-reload). The typst
-# watcher only signals "something changed"; this one surfaces the changed
-# path so the browser can swap a single asset in place. Already in the
-# tree transitively via typst-kit.
+# File watching for `twyla serve` (src/watch.rs). twyla's own watcher on
+# top of notify replaces typst-kit's, which only signals "something changed"
+# and doesn't survive directory recreation or a dead backend.
 notify = "8"
 
 # HTML AST diff harness (porting verification)

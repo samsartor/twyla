@@ -15,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::watch::Stamp;
 use crate::{asset, render::Output};
 
 /// Everything a twyla command needs to operate on a project. Cheap to
@@ -149,35 +150,85 @@ impl TwylaContext {
     /// (`foo/bar.typ` → `foo/bar/index.html`, `foo/main.typ` →
     /// `foo/index.html`).
     pub fn scan_pages(&self) -> Result<Vec<PathBuf>, String> {
-        Ok(self.scan_content()?.pages)
+        let scan = self.scan_content();
+        match scan.error {
+            Some(err) => Err(err),
+            None => Ok(scan.pages),
+        }
     }
 
-    /// The same walk as [`scan_pages`](Self::scan_pages), also reporting every
-    /// directory it read. `serve` watches each of those (non-recursively) so a
-    /// page created in an existing subdirectory, or a new subdirectory, triggers
-    /// a rebuild — the routed-page set depends on the directory listings, not
-    /// just on the files typst read.
-    pub fn scan_content(&self) -> Result<ContentScan, String> {
+    /// The single walk of the site's input trees that a compile depends on:
+    /// the routed pages under `content/` (see [`scan_pages`](Self::scan_pages))
+    /// and every file under `static/` — plus what the walk *observed* along
+    /// the way, so `serve` can watch exactly those paths.
+    ///
+    /// `serve` hands this one scan to
+    /// [`compile_bundle_with`](crate::render::RenderWorld::compile_bundle_with)
+    /// *and* uses it for the watch set, so the two can't disagree about which
+    /// directories existed. Never fails outright: on an error the scan keeps
+    /// walking, records the first error, and still reports everything it saw,
+    /// so a broken subdirectory stays watched and fixing it is noticed.
+    pub fn scan_content(&self) -> ContentScan {
         let mut scan = ContentScan::default();
-        scan_pages_into(&self.content_dir(), &mut scan)?;
-        scan.pages.sort();
-        scan.dirs.sort();
-        Ok(scan)
-    }
-
-    /// Every file under `static/` as an [`Output::Static`], keyed by its
-    /// root-relative `/`-separated path (`static/site.css` → `site.css`).
-    /// A missing `static/` yields nothing.
-    pub fn static_outputs(&self) -> Result<impl Iterator<Item = Output>, String> {
-        let mut paths = Vec::new();
+        let mut errors = Vec::new();
+        scan_tree(
+            &self.content_dir(),
+            &mut scan.observed,
+            &mut scan.pages,
+            &mut errors,
+            is_routed_page,
+        );
+        // `static/` is optional: absent means no static files, not an error.
+        // It's still observed (as missing), so creating it is noticed.
         let static_dir = self.static_dir();
         if static_dir.is_dir() {
-            scan_all_into(&static_dir, &mut paths)?;
+            scan_tree(
+                &static_dir,
+                &mut scan.observed,
+                &mut scan.static_files,
+                &mut errors,
+                |_| true,
+            );
+        } else {
+            scan.observed
+                .push((static_dir.clone(), Stamp::now(&static_dir)));
         }
-        Ok(paths.into_iter().filter_map(move |path| {
-            let rel = path.strip_prefix(&static_dir).ok()?;
-            Some(Output::Static(path_key(rel), path))
-        }))
+        scan.pages.sort();
+        scan.static_files.sort();
+        scan.observed.sort_by(|a, b| a.0.cmp(&b.0));
+        scan.error = errors.into_iter().next();
+        scan
+    }
+
+    /// Every file under `static/` as an [`Output::Static`]. A missing
+    /// `static/` yields nothing.
+    pub fn static_outputs(&self) -> Result<Vec<Output>, String> {
+        let static_dir = self.static_dir();
+        let (mut files, mut errors) = (Vec::new(), Vec::new());
+        if static_dir.is_dir() {
+            scan_tree(
+                &static_dir,
+                &mut Vec::new(),
+                &mut files,
+                &mut errors,
+                |_| true,
+            );
+        }
+        if let Some(err) = errors.into_iter().next() {
+            return Err(err);
+        }
+        files.sort();
+        Ok(files
+            .iter()
+            .filter_map(|path| self.static_output(path))
+            .collect())
+    }
+
+    /// One `static/` file as an [`Output::Static`], keyed by its root-relative
+    /// `/`-separated path (`static/site.css` → `site.css`).
+    pub fn static_output(&self, path: &Path) -> Option<Output> {
+        let rel = path.strip_prefix(self.static_dir()).ok()?;
+        Some(Output::Static(path_key(rel), path.to_path_buf()))
     }
 
     /// Bundle-relative directory compiled HTML files are emitted into, e.g.
@@ -355,59 +406,89 @@ impl TwylaContext {
     }
 }
 
-/// Result of [`TwylaContext::scan_content`]: the routed pages, plus every
-/// directory that was listed to find them (`content/` itself included).
+/// Result of [`TwylaContext::scan_content`].
 #[derive(Debug, Default)]
 pub struct ContentScan {
+    /// Routed pages under `content/`, sorted.
     pub pages: Vec<PathBuf>,
-    pub dirs: Vec<PathBuf>,
+    /// Every file under `static/`, sorted.
+    pub static_files: Vec<PathBuf>,
+    /// Every path whose state the result depends on, with what was seen: each
+    /// directory listed (by its listing), each root that was missing, and each
+    /// entry that couldn't be stat'ed (e.g. a dangling symlink, as missing —
+    /// so creating its target is noticed). Sorted by path.
+    pub observed: Vec<(PathBuf, Stamp)>,
+    /// The first error hit, if any. The rest of the scan is still filled in
+    /// (best effort) so the dev server can keep watching it.
+    pub error: Option<String>,
 }
 
-/// Recursively collect `*.typ` pages under `dir` into `out.pages`, and each
-/// directory listed into `out.dirs`. Skips files whose stem starts with `_`
-/// (private/partial convention); recurses every subdirectory. Traversal order
-/// is unspecified — the caller sorts.
-fn scan_pages_into(dir: &Path, out: &mut ContentScan) -> Result<(), String> {
-    out.dirs.push(dir.to_path_buf());
-    let entries = fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+/// Pages are `*.typ` files whose stem doesn't start with `_` (the
+/// private/partial convention).
+fn is_routed_page(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()) == Some("typ")
+        && path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|stem| !stem.starts_with('_'))
+}
+
+/// Recursively collect the files under `dir` that pass `keep` into `files`,
+/// recording each directory's listing (and anything unreadable) in
+/// `observed`. Never stops early: errors are pushed to `errors` and the walk
+/// continues with whatever it can still read. Order is unspecified — the
+/// caller sorts.
+fn scan_tree(
+    dir: &Path,
+    observed: &mut Vec<(PathBuf, Stamp)>,
+    files: &mut Vec<PathBuf>,
+    errors: &mut Vec<String>,
+    keep: fn(&Path) -> bool,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            errors.push(format!("cannot read {}: {e}", dir.display()));
+            observed.push((dir.to_path_buf(), Stamp::now(dir)));
+            return;
+        }
+    };
+    let mut names = Vec::new();
+    let mut listing_complete = true;
+    let mut subdirs = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|e| format!("scan error: {e}"))?;
-        let path = entry.path();
-        let meta =
-            fs::metadata(&path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
-        if meta.is_dir() {
-            scan_pages_into(&path, out)?;
-            continue;
-        }
-        if path.extension().and_then(|s| s.to_str()) != Some("typ") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                errors.push(format!("scan error in {}: {e}", dir.display()));
+                listing_complete = false;
+                continue;
+            }
         };
-        if stem.starts_with('_') {
-            continue;
-        }
-        out.pages.push(path);
-    }
-    Ok(())
-}
-
-/// Recursively collect all files into `out`.
-fn scan_all_into(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("scan error: {e}"))?;
+        names.push(entry.file_name());
         let path = entry.path();
-        let meta =
-            fs::metadata(&path).map_err(|e| format!("cannot stat {}: {e}", path.display()))?;
-        if meta.is_dir() {
-            scan_all_into(&path, out)?;
-            continue;
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => subdirs.push(path),
+            Ok(_) => {
+                if keep(&path) {
+                    files.push(path);
+                }
+            }
+            Err(e) => {
+                errors.push(format!("cannot stat {}: {e}", path.display()));
+                observed.push((path, Stamp::Missing));
+            }
         }
-        out.push(path);
     }
-    Ok(())
+    let stamp = if listing_complete {
+        Stamp::dir_listing(names)
+    } else {
+        Stamp::Unknown
+    };
+    observed.push((dir.to_path_buf(), stamp));
+    for sub in subdirs {
+        scan_tree(&sub, observed, files, errors, keep);
+    }
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@
 //!   Output is scaffolding, not a maintained md↔typ sync.
 //! - [`serve`] — zero-flag dev server.
 //! - [`session`] — the dev server's persistent rebuild step + watch set.
+//! - [`watch`] — the dev server's file watcher (path-aware, race-checked).
 
 pub mod asset;
 pub mod build;
@@ -29,3 +30,4 @@ pub mod rules;
 pub mod serve;
 pub mod session;
 pub mod slug;
+pub mod watch;
