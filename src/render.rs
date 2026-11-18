@@ -71,6 +71,10 @@ pub enum RenderErrorKind {
     Compile,
     /// The bundle didn't contain the expected HTML documents.
     Bundle,
+    /// The compile panicked. Caught by the dev server's
+    /// [`DevSession`](crate::session::DevSession) so a twyla bug shows up in
+    /// the browser instead of killing hot reload.
+    Panic,
 }
 
 impl RenderError {
@@ -342,8 +346,9 @@ fn emit_warnings(world: &dyn DiagnosticWorld, warnings: &[SourceDiagnostic]) {
 ///
 /// Wraps a [`FileStore`] (which handles source/byte caching, dependency
 /// tracking via slot-access flags, and in-place stale-source reuse on
-/// reset). For `twyla serve`, one instance lives behind a mutex across
-/// requests so the comemo cache survives between compiles. For one-shot
+/// reset). For `twyla serve`, one instance lives in a
+/// [`DevSession`](crate::session::DevSession) so the comemo cache survives
+/// between compiles. For one-shot
 /// CLI commands, we just build one, compile, drop.
 pub struct RenderWorld {
     pub ctx: TwylaContext,

@@ -149,10 +149,20 @@ impl TwylaContext {
     /// (`foo/bar.typ` → `foo/bar/index.html`, `foo/main.typ` →
     /// `foo/index.html`).
     pub fn scan_pages(&self) -> Result<Vec<PathBuf>, String> {
-        let mut paths = Vec::new();
-        scan_pages_into(&self.content_dir(), &mut paths)?;
-        paths.sort();
-        Ok(paths)
+        Ok(self.scan_content()?.pages)
+    }
+
+    /// The same walk as [`scan_pages`](Self::scan_pages), also reporting every
+    /// directory it read. `serve` watches each of those (non-recursively) so a
+    /// page created in an existing subdirectory, or a new subdirectory, triggers
+    /// a rebuild — the routed-page set depends on the directory listings, not
+    /// just on the files typst read.
+    pub fn scan_content(&self) -> Result<ContentScan, String> {
+        let mut scan = ContentScan::default();
+        scan_pages_into(&self.content_dir(), &mut scan)?;
+        scan.pages.sort();
+        scan.dirs.sort();
+        Ok(scan)
     }
 
     /// Every file under `static/` as an [`Output::Static`], keyed by its
@@ -345,10 +355,20 @@ impl TwylaContext {
     }
 }
 
-/// Recursively collect `*.typ` pages under `dir` into `out`. Skips files
-/// whose stem starts with `_` (private/partial convention); recurses every
-/// subdirectory. Directory traversal order is unspecified — the caller sorts.
-fn scan_pages_into(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+/// Result of [`TwylaContext::scan_content`]: the routed pages, plus every
+/// directory that was listed to find them (`content/` itself included).
+#[derive(Debug, Default)]
+pub struct ContentScan {
+    pub pages: Vec<PathBuf>,
+    pub dirs: Vec<PathBuf>,
+}
+
+/// Recursively collect `*.typ` pages under `dir` into `out.pages`, and each
+/// directory listed into `out.dirs`. Skips files whose stem starts with `_`
+/// (private/partial convention); recurses every subdirectory. Traversal order
+/// is unspecified — the caller sorts.
+fn scan_pages_into(dir: &Path, out: &mut ContentScan) -> Result<(), String> {
+    out.dirs.push(dir.to_path_buf());
     let entries = fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("scan error: {e}"))?;
@@ -368,7 +388,7 @@ fn scan_pages_into(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
         if stem.starts_with('_') {
             continue;
         }
-        out.push(path);
+        out.pages.push(path);
     }
     Ok(())
 }

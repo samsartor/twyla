@@ -9,6 +9,7 @@
 //! - [`import`] — generate a typst draft from a zola markdown post.
 //!   Output is scaffolding, not a maintained md↔typ sync.
 //! - [`serve`] — zero-flag dev server.
+//! - [`session`] — the dev server's persistent rebuild step + watch set.
 
 pub mod asset;
 pub mod build;
@@ -26,4 +27,5 @@ pub mod render;
 pub mod resolver;
 pub mod rules;
 pub mod serve;
+pub mod session;
 pub mod slug;

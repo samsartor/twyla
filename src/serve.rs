@@ -1,24 +1,25 @@
 //! Minimal dev server with hot recompile.
 //!
 //! One thread for accepts, one for the file watcher. Requests are served
-//! sequentially out of the last successful compile; the watcher rebuilds
-//! the bundle in the background when typst sources, templates, or
-//! `content/` directory contents change.
+//! sequentially out of the last compile; the watcher rebuilds the bundle
+//! in the background when typst sources, asset sources, or the contents of
+//! any directory under `content/` change.
 //!
 //! Architecture
 //! ------------
 //!
-//! - A single persistent [`RenderWorld`] (typst compile state + comemo
-//!   cache) lives behind `Arc<Mutex<..>>`. It is locked only by the
-//!   watcher thread — request handlers never compile.
+//! - A single persistent [`DevSession`] (the typst world + comemo cache and
+//!   the asset/document resolver) is created on the main thread for the
+//!   warm-up compile, then moved into the watcher thread — the only place
+//!   that compiles. Request handlers never compile.
 //! - The most recent compile result lives in `Arc<Mutex<LastOutput>>`.
 //!   Request handlers lock it briefly to clone the matching doc's HTML.
-//! - The watcher thread loops: collect `world.dependencies()` + the
-//!   `content/` directory → `watcher.update(..)` → `wait()` → on event:
-//!   `refresh_main()` (rescan content/ + regen virtual main),
-//!   `reset()` (mark FileStore slots stale), `comemo::evict(10)` (age
-//!   memoized entries), `compile_bundle()` (incremental on warm cache),
-//!   publish result. Mirrors typst's own `typst watch` loop.
+//! - The watcher thread loops: `watcher.update(watch_set)` → `wait()` →
+//!   [`DevSession::rebuild`] (reset FileStore, age comemo, rescan
+//!   `content/`, compile, collect the next [`WatchSet`]) → publish →
+//!   broadcast reload. Mirrors typst's own `typst watch` loop. Watcher
+//!   failures recreate the watcher; compile panics become error pages.
+//! - A second, path-aware watcher on `static/` pushes in-place asset swaps.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -35,8 +36,8 @@ use owo_colors::{AnsiColors, OwoColorize, Stream, Style};
 
 use crate::asset::ResolvedAsset;
 use crate::project::TwylaContext;
-use crate::render::{Emit, Output, Outputs, RenderError, RenderWorld};
-use crate::resolver::Resolver;
+use crate::render::{Emit, Output, Outputs, RenderError};
+use crate::session::{DevSession, Rebuild, WatchSet};
 
 /// All of serve's own logging goes to stderr; color follows that stream's tty.
 const OUT: Stream = Stream::Stderr;
@@ -136,12 +137,12 @@ fn print_banner(
 }
 
 pub fn run(serve: Serve) -> io::Result<()> {
-    // Build the persistent world and run the warm-up compile on the
+    // Build the persistent session and run the warm-up compile on the
     // foreground thread. Doing it before bind means a startup error is
     // reported on stderr before any browser sees it, and the first
     // request after bind hits a warm cache.
-    let world = match RenderWorld::new(&serve.ctx) {
-        Ok(w) => Arc::new(Mutex::new(w)),
+    let mut session = match DevSession::new(&serve.ctx) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!(
                 "  {} setup failed",
@@ -158,29 +159,25 @@ pub fn run(serve: Serve) -> io::Result<()> {
     let listener = TcpListener::bind(serve.addr)?;
     let local = listener.local_addr()?;
 
-    // The asset resolver persists across recompiles (its store seeds each
-    // compile's map; `revalidate` evicts changed sources). Lives here, moves
-    // into the watcher thread — the only place that compiles.
-    let mut resolver = Resolver::new(&serve.ctx);
-
     let warm_start = Instant::now();
-    let initial = world.lock().unwrap().compile_bundle(&mut resolver);
+    let Rebuild {
+        result: initial,
+        watch,
+    } = session.rebuild();
     print_banner(local, &serve.ctx.root, &initial, warm_start.elapsed());
 
     let last_output: Arc<LastOutput> = Arc::new(Mutex::new(initial));
     let reload_clients: Arc<ReloadClients> = Arc::new(Mutex::new(Vec::new()));
 
-    // Spawn the typst watcher thread. It owns the world from this point
-    // on for compile purposes; request handlers only read `last_output`.
+    // Spawn the typst watcher thread. The session moves into it — it's the
+    // only place that compiles; request handlers only read `last_output`.
     // After each recompile it broadcasts a full-reload event.
-    let content_dir = serve.ctx.content_dir();
     {
-        let world = Arc::clone(&world);
         let last_output = Arc::clone(&last_output);
         let reload_clients = Arc::clone(&reload_clients);
         thread::Builder::new()
             .name("twyla-watcher".to_string())
-            .spawn(move || run_watcher(world, last_output, content_dir, reload_clients, resolver))
+            .spawn(move || run_watcher(session, watch, last_output, reload_clients))
             .map_err(io::Error::other)?;
     }
 
@@ -223,74 +220,56 @@ pub fn run(serve: Serve) -> io::Result<()> {
     Ok(())
 }
 
-/// Background recompile loop. Mirrors typst's own `typst watch` shape
-/// (`typst-cli/src/watch.rs`) — update watched paths from last compile,
-/// wait, reset, evict, recompile — but the compile feeds `last_output`
-/// for request handlers to read rather than writing to disk.
+/// Background recompile loop: `watcher.update(watch)` → `wait()` →
+/// [`DevSession::rebuild`] → publish → repeat. All the compile logic, and the
+/// choice of what to watch, lives in the session (shared with tests); this
+/// loop only adds the file watcher, logging, and publishing.
+///
+/// The loop never exits on its own: a watcher failure is logged and the
+/// watcher recreated (with a short backoff), and a compile panic comes back
+/// from `rebuild` as an ordinary error. Silently losing hot reload is worse
+/// than a noisy log.
 fn run_watcher(
-    world: Arc<Mutex<RenderWorld>>,
+    mut session: DevSession,
+    mut watch: WatchSet,
     last_output: Arc<LastOutput>,
-    content_dir: PathBuf,
     reload_clients: Arc<ReloadClients>,
-    mut resolver: Resolver,
 ) {
-    let mut watcher = match Watcher::new(None) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!(
-                "twyla serve: cannot start file watcher ({e}). \
-                 File changes will not trigger recompiles."
-            );
-            return;
-        }
-    };
-
+    let mut watcher: Option<Watcher> = None;
+    let mut backoff = WATCHER_BACKOFF_MIN;
     loop {
-        // Subscribe to the latest dep set + always to `content/`
-        // (non-recursive directory watch picks up create/delete of
-        // top-level posts that weren't in the dep list).
-        let mut paths: Vec<PathBuf> = {
-            let mut w = world.lock().unwrap();
-            let mut v: Vec<PathBuf> = w.dependencies().collect();
-            v.push(content_dir.clone());
-            v
+        // (Re)create the watcher if the last attempt failed. A fresh watcher
+        // has no subscriptions, so the `update` below re-watches everything.
+        let w = match &mut watcher {
+            Some(w) => w,
+            None => match Watcher::new(None) {
+                Ok(w) => watcher.insert(w),
+                Err(e) => {
+                    watcher_failed(&format!("cannot start file watcher: {e}"), &mut backoff);
+                    continue;
+                }
+            },
         };
-        // Asset upstreams (e.g. sass `@import` partials) are read by twyla's
-        // own pass, not typst, so they're not in `world.dependencies()` — add
-        // them explicitly or an edit to a partial wouldn't trigger a recompile.
-        // Pulled from the resolver, not the published outputs, so that an asset
-        // that is only `.read()` (inlined, never emitted as a file) still has
-        // its source watched.
-        for asset in resolver.resolved_assets() {
-            paths.extend(asset.upstream_paths().map(Path::to_path_buf));
+        // `update` can fail if a path vanishes between its exists-check and
+        // the watch call; `wait` on a backend error. Either way, drop this
+        // watcher and retry with a new one rather than ending hot reload.
+        if let Err(e) = w.update(watch.paths.iter().cloned()) {
+            watcher_failed(&format!("watcher update failed: {e}"), &mut backoff);
+            watcher = None;
+            continue;
         }
-        if let Err(e) = watcher.update(paths) {
-            eprintln!(
-                "  {}",
-                format!("watcher update failed: {e}").if_supports_color(OUT, |s| s.red())
-            );
-            return;
+        if let Err(e) = w.wait() {
+            watcher_failed(&format!("watcher wait failed: {e}"), &mut backoff);
+            watcher = None;
+            continue;
         }
-        if let Err(e) = watcher.wait() {
-            eprintln!(
-                "  {}",
-                format!("watcher wait failed: {e}").if_supports_color(OUT, |s| s.red())
-            );
-            return;
-        }
+        backoff = WATCHER_BACKOFF_MIN;
 
-        // Some watched path changed. Refresh the main (in case
-        // content/ shape changed), reset FileStore, age comemo, and
-        // recompile. Publish the result.
+        // Some watched path changed: rebuild and publish.
         let start = Instant::now();
-        let result = {
-            comemo::evict(10);
-            let mut w = world.lock().unwrap();
-            w.files.reset();
-            w.compile_bundle(&mut resolver)
-        };
+        let rebuild = session.rebuild();
         let elapsed = start.elapsed();
-        match &result {
+        match &rebuild.result {
             Ok(site) => eprintln!(
                 "  {}  rebuilt in {elapsed:.1?} ({} pages, {} assets)",
                 "✓".if_supports_color(OUT, |s| s.style(Style::new().green().bold())),
@@ -302,13 +281,29 @@ fn run_watcher(
                 "✗".if_supports_color(OUT, |s| s.style(Style::new().red().bold())),
             ),
         }
-        *last_output.lock().unwrap() = result;
+        watch = rebuild.watch;
+        *last_output.lock().unwrap() = rebuild.result;
 
         // Tell every connected browser to reload. We signal on *every*
         // publish, including compile errors, so that fixing broken typst
         // reloads the error page back to a working one.
         broadcast(&reload_clients, "reload");
     }
+}
+
+/// Backoff between watcher-recovery attempts, doubling up to the max so a
+/// persistently broken watcher logs a few times a minute rather than spinning.
+const WATCHER_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const WATCHER_BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+/// Log a watcher failure and sleep before the retry.
+fn watcher_failed(msg: &str, backoff: &mut Duration) {
+    eprintln!(
+        "  {}",
+        format!("{msg} (retrying in {backoff:.1?})").if_supports_color(OUT, |s| s.red())
+    );
+    thread::sleep(*backoff);
+    *backoff = (*backoff * 2).min(WATCHER_BACKOFF_MAX);
 }
 
 /// Dedicated `notify` watcher for `static/`. The typst watcher only
