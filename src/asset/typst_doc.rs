@@ -30,20 +30,26 @@
 //! through a one-line synthetic `main` (`#__twyla_inline`). `svg`/`png`/`pdf`
 //! compile to a [`PagedDocument`] and serialize via `typst_svg` / `typst_render`
 //! / `typst_pdf`; `html` compiles to an [`HtmlDocument`] like the rest of the
-//! site. Every file the sub-compile reads is recorded into the asset's
-//! `upstream` set (the typst-native analogue of sass's `RecordingFs`), so
-//! editing the document or any of its imports re-triggers a rebuild.
+//! site. Project files the sub-compile loads (the document, its imports,
+//! images it embeds) are read *by the sub-world itself*, through the
+//! resolver's [`DepRecorder`] — not through the live world's `FileStore` — so
+//! each lands in the asset's ledger deps with the stamp and hash of exactly
+//! the bytes the compile used (the typst-native analogue of sass's
+//! `RecordingFs`), and nothing stays resident once the build is done. Editing
+//! the document or any of its imports re-triggers a rebuild. Package files
+//! still come from the live world: they're immutable.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use super::{AssetSpec, Built, OutputReq, Upstream, emit_or_request, sha256};
+use super::{AssetSpec, Built, OutputReq, emit_or_request, sha256};
+use crate::ledger::DepRecorder;
 use crate::project::TwylaContext;
 use crate::render::Emit;
 use comemo::Tracked;
 use ecow::{EcoString, eco_format, eco_vec};
-use typst::diag::{FileResult, HintedStrResult, SourceDiagnostic, SourceResult, Warned};
+use typst::diag::{FileError, FileResult, HintedStrResult, SourceDiagnostic, SourceResult, Warned};
 use typst::foundations::{
     Bytes, Cast, Content, Datetime, Duration, IntoValue, Packed, PathOrStr, ShowFn, StyleChain,
     cast, elem, func, scope,
@@ -211,7 +217,7 @@ impl Format {
 /// file/font/package loading delegated to the live `world`. A path source
 /// compiles the real project file as `main`; an inline content value is bound
 /// into the stock global scope and compiled through a one-line synthetic
-/// `main`. Every file the sub-compile reads is recorded into `upstream`.
+/// `main`. Every project file the sub-compile reads goes through `rec`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build(
     world: Tracked<dyn World + '_>,
@@ -221,6 +227,7 @@ pub(crate) fn build(
     minify: bool,
     ctx: &TwylaContext,
     span: Span,
+    rec: &DepRecorder,
     warnings: &mut Vec<SourceDiagnostic>,
 ) -> SourceResult<Built> {
     // A stock library: the standard typst stdlib (with the HTML feature, needed
@@ -262,7 +269,9 @@ pub(crate) fn build(
         library: LazyHash::new(library),
         main_id,
         main_src,
-        reads: Mutex::new(HashSet::new()),
+        root: &ctx.root,
+        rec,
+        loaded: Mutex::new(HashMap::new()),
     };
 
     let bytes = match format {
@@ -314,12 +323,10 @@ pub(crate) fn build(
         );
     }
 
-    let upstream = collect_upstream(subworld.reads.into_inner().unwrap_or_default(), ctx);
     let bytes = Bytes::new(bytes);
     Ok(Built {
         sha256: sha256(&bytes),
         emit: Emit::Bytes(bytes),
-        upstream,
         ext: Some(format.ext().to_owned()),
         stem,
         dimensions: None,
@@ -346,21 +353,6 @@ fn compile_html(world: &TypstWorld) -> SourceResult<HtmlDocument> {
     output
 }
 
-/// Turn the sub-compile's recorded file reads into the asset's `upstream` set.
-/// Only project files are watched (package files are immutable), mirroring
-/// `AssetResolver::doc_source`.
-fn collect_upstream(reads: HashSet<FileId>, ctx: &TwylaContext) -> Vec<Upstream> {
-    reads
-        .into_iter()
-        .filter_map(|id| match id.root() {
-            VirtualRoot::Project => Some(Upstream::new_lazy(
-                ctx.root.join(id.vpath().get_without_slash()),
-            )),
-            VirtualRoot::Package(_) => None,
-        })
-        .collect()
-}
-
 /// A spanned error from any `Display` payload.
 fn err_at(span: Span, msg: impl std::fmt::Display) -> ecow::EcoVec<SourceDiagnostic> {
     eco_vec![SourceDiagnostic::error(
@@ -371,8 +363,8 @@ fn err_at(span: Span, msg: impl std::fmt::Display) -> ecow::EcoVec<SourceDiagnos
 
 /// A [`World`] for an `asset.typst` sub-compile: serves a stock library + a
 /// `main` (a synthetic source for inline content, or the real project file for
-/// a path source) and delegates everything else to the live world, recording
-/// every file id it reads so they become the asset's `upstream` set.
+/// a path source), reads project files itself through the recorder, and
+/// delegates packages, fonts and the date to the live world.
 ///
 /// Owns the stock library (it returns a reference, so it can't be borrowed
 /// across the `Tracked` boundary — the same reason `SnippetWorld` clones). The
@@ -382,9 +374,47 @@ struct TypstWorld<'a> {
     library: LazyHash<Library>,
     main_id: FileId,
     /// `Some` for an inline-content compile (the synthetic main); `None` for a
-    /// path source (the real file is served through `world`).
+    /// path source (the real file is read like any other project file).
     main_src: Option<Source>,
-    reads: Mutex<HashSet<FileId>>,
+    /// The project root project-file ids resolve against.
+    root: &'a Path,
+    rec: &'a DepRecorder,
+    /// Project files loaded so far, so each is read (and recorded) once per
+    /// build — typst asks for the same file many times. Dropped with the
+    /// sub-world when the build ends.
+    loaded: Mutex<HashMap<FileId, FileResult<Loaded>>>,
+}
+
+/// A loaded project file: its bytes, and its parsed source once asked for.
+#[derive(Clone)]
+struct Loaded {
+    bytes: Bytes,
+    source: Option<Source>,
+}
+
+impl TypstWorld<'_> {
+    /// Load a project file through the recorder, once per build.
+    fn load(&self, id: FileId, as_source: bool) -> FileResult<Loaded> {
+        let mut loaded = self.loaded.lock().unwrap();
+        let entry = loaded.entry(id).or_insert_with(|| {
+            let path = self.root.join(id.vpath().get_without_slash());
+            self.rec
+                .read(&path)
+                .map(|bytes| Loaded {
+                    bytes: Bytes::new(bytes),
+                    source: None,
+                })
+                .map_err(|err| FileError::from_io(err, &path))
+        });
+        if as_source
+            && let Ok(file) = entry
+            && file.source.is_none()
+        {
+            let text = std::str::from_utf8(&file.bytes).map_err(|_| FileError::InvalidUtf8)?;
+            file.source = Some(Source::new(id, text.into()));
+        }
+        entry.clone()
+    }
 }
 
 impl World for TypstWorld<'_> {
@@ -403,8 +433,10 @@ impl World for TypstWorld<'_> {
         {
             return Ok(src.clone());
         }
-        self.reads.lock().unwrap().insert(id);
-        self.world.source(id)
+        match id.root() {
+            VirtualRoot::Project => Ok(self.load(id, true)?.source.expect("parsed by load")),
+            VirtualRoot::Package(_) => self.world.source(id),
+        }
     }
     fn file(&self, id: FileId) -> FileResult<Bytes> {
         if id == self.main_id
@@ -412,8 +444,10 @@ impl World for TypstWorld<'_> {
         {
             return Ok(Bytes::new(src.text().as_bytes().to_vec()));
         }
-        self.reads.lock().unwrap().insert(id);
-        self.world.file(id)
+        match id.root() {
+            VirtualRoot::Project => Ok(self.load(id, false)?.bytes),
+            VirtualRoot::Package(_) => self.world.file(id),
+        }
     }
     fn font(&self, index: usize) -> Option<Font> {
         self.world.font(index)

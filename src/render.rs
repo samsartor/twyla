@@ -8,7 +8,7 @@
 //! compile once, and drop it.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{fmt, fs, io};
 
 use iddqd::{IdHashItem, IdHashMap, id_upcast};
@@ -33,6 +33,7 @@ use typst_library::Feature;
 use crate::asset::ResolvedAsset;
 use crate::compile::CompiledBundle;
 use crate::document::ResolvedDocument;
+use crate::ledger::{self, Dep};
 use crate::project::{ContentScan, TwylaContext};
 use crate::resolver::Resolver;
 
@@ -381,6 +382,7 @@ impl RenderWorld {
 
         let loader = TwylaLoader {
             root: ctx.root.clone(),
+            observed: Mutex::new(Vec::new()),
             packages: SystemPackages::new(SystemDownloader::new(concat!(
                 "twyla/",
                 env!("CARGO_PKG_VERSION"),
@@ -413,11 +415,14 @@ impl RenderWorld {
         })
     }
 
-    /// Paths that the last compile read from disk. Drops the virtual main
-    /// (not a real path).
-    pub fn dependencies(&mut self) -> impl Iterator<Item = PathBuf> + '_ {
-        let (loader, ids) = self.files.dependencies();
-        ids.filter_map(|id| loader.resolve(id).ok())
+    /// Every file load (project or package, successful or not) since the
+    /// last call, as ledger [`Dep`]s stamped at load time. After
+    /// `files.reset()`, every file the next compile depends on — including
+    /// ones comemo answers from cache, which it re-validates by asking for
+    /// the file again — is loaded once more, so calling this after a compile
+    /// yields exactly that compile's typst dependencies.
+    pub fn take_loads(&self) -> Vec<Dep> {
+        std::mem::take(&mut *self.files.loader().observed.lock().unwrap())
     }
 
     /// Compile every routed page in the bundle.
@@ -579,45 +584,63 @@ fn install_sys(global: &mut Scope) {
     global.bind("sys".into(), Binding::detached(sys));
 }
 
-/// FileLoader for [`FileStore`]. Serves the (empty) virtual main from
-/// memory and every other id from the on-disk project root.
+/// FileLoader for [`FileStore`]: serves project files from the on-disk
+/// project root and package files from the package dirs, recording every
+/// load into the ledger as it happens.
 pub struct TwylaLoader {
     root: PathBuf,
+    /// Every load since the last [`RenderWorld::take_loads`], stamped (and
+    /// hashed — the file is in memory anyway) at load time, including failed
+    /// ones (so a missing import is polled until it appears). The dev server
+    /// builds the typst part of its watch set from these, instead of
+    /// stat'ing dependencies after the compile (which can't see a file that
+    /// changed in between).
+    observed: Mutex<Vec<Dep>>,
     /// Serves packages from the  standard data/cache dirs, downloading from
     /// Typst Universe on a cache miss.
     packages: SystemPackages,
 }
 
-impl TwylaLoader {
-    /// Resolve a file id to its on-disk path. Returns
-    /// [`FileError::NotFound`] for the virtual main (no real path) so
-    /// callers iterating dependencies can `filter_map` it away.
-    /// Package ids resolve through [`SystemPackages`] (data/cache dirs,
-    /// then download from Universe), mirroring the typst CLI.
-    fn resolve(&self, id: FileId) -> FileResult<PathBuf> {
-        let vpath = id.vpath();
-        match id.root() {
-            VirtualRoot::Project => Ok(self.root.join(vpath.get_without_slash())),
-            VirtualRoot::Package(spec) => Ok(self.packages.obtain(spec)?.resolve(vpath)),
-        }
+impl FileLoader for TwylaLoader {
+    fn load(&self, id: FileId) -> FileResult<Bytes> {
+        let path = match id.root() {
+            VirtualRoot::Project => self.root.join(id.vpath().get_without_slash()),
+            // Packages resolve to a (possibly just-downloaded) cache dir.
+            VirtualRoot::Package(spec) => match self.packages.obtain(spec) {
+                Ok(root) => root.resolve(id.vpath()),
+                Err(err) => {
+                    // A missing local package: record where it would be, so
+                    // installing it is noticed. (Universe packages are
+                    // downloaded on demand; nothing local to wait for.)
+                    if spec.namespace != "preview"
+                        && let Some(data) = self.packages.data()
+                    {
+                        let dir = data
+                            .path()
+                            .join(format!("{}/{}/{}", spec.namespace, spec.name, spec.version));
+                        self.record(ledger::observe_probe(&dir));
+                    }
+                    return Err(err.into());
+                }
+            },
+        };
+        let (dep, result) = ledger::observe_read(&path);
+        self.record(dep);
+        result.map(Bytes::new).map_err(|err| {
+            // `read` on a directory: typst's own loader reports this
+            // specially (`FsRoot::load`); match it.
+            if path.is_dir() {
+                FileError::IsDirectory
+            } else {
+                FileError::from_io(err, &path)
+            }
+        })
     }
 }
 
-impl FileLoader for TwylaLoader {
-    fn load(&self, id: FileId) -> FileResult<Bytes> {
-        // Packages resolve to a (possibly just-downloaded) cache dir and
-        // load through `FsRoot` so the path-escape guard applies; project
-        // files read directly from the resolved on-disk path.
-        if let VirtualRoot::Package(spec) = id.root() {
-            return self.packages.obtain(spec)?.load(id.vpath());
-        }
-        let path = self.resolve(id)?;
-        std::fs::read(&path)
-            .map(Bytes::new)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => FileError::NotFound(path),
-                _ => FileError::Other(Some(e.to_string().into())),
-            })
+impl TwylaLoader {
+    fn record(&self, dep: Dep) {
+        self.observed.lock().unwrap().push(dep);
     }
 }
 

@@ -78,7 +78,6 @@ pub(crate) mod svg;
 pub(crate) mod typst_doc;
 
 use std::hash::{Hash, Hasher};
-use std::path::Path;
 
 use comemo::Tracked;
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
@@ -94,8 +93,8 @@ use typst::loading::{Encoding, Readable};
 use typst::syntax::{FileId, Span};
 use typst_utils::hash128;
 
+use crate::ledger::Dep;
 use crate::render::Emit;
-use crate::resolver::Upstream;
 
 // ---------------------------------------------------------------------------
 // Keys: AssetSpec -> AssetRequest -> Asset
@@ -446,11 +445,10 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
 /// output path, and URL (all shared logic).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Built {
-    /// How the bytes reach the output.
+    /// How the bytes reach the output. The only way to get at them: use
+    /// [`Emit::read`] / [`Emit::write_to`], not the variants (a future
+    /// on-disk cache will back every asset with a file).
     pub emit: Emit,
-    /// Every on-disk file the build read (entry + transitive imports). Drives
-    /// invalidation and the watcher's dependency set.
-    pub upstream: Vec<Upstream>,
     /// SHA-256 of the *output* bytes (the fingerprint).
     pub sha256: [u8; 32],
     /// Output extension (`css` for sass, the source ext for a copy)
@@ -528,6 +526,15 @@ pub struct ResolvedAsset {
     /// part of the asset's resolved identity, and the resolved record flows
     /// through introspection convergence, which must not churn as usage grows.
     pub outputs: Vec<OutputReq>,
+    /// Every file the build touched, recorded at access time by the
+    /// resolver's [`DepRecorder`](crate::ledger::DepRecorder). Drives
+    /// revalidation and the dev server's watch set. Excluded from
+    /// [`Hash`]/[`PartialEq`]: provenance, not output — a `touch` re-stamps
+    /// it without changing what the asset resolves to.
+    pub deps: Vec<Dep>,
+    /// Warnings the build raised, re-emitted on every compile that uses the
+    /// asset. Excluded from [`Hash`]/[`PartialEq`] like `deps`.
+    pub warnings: Vec<SourceDiagnostic>,
 }
 
 // Identity is the resolved result (spec → built → path → url), *not* `outputs`
@@ -578,11 +585,6 @@ impl ResolvedAsset {
             .find(|resolution| &resolution.policy == policy)
             .map(|resolution| resolution.url.as_str())
             .unwrap_or(self.url.as_str())
-    }
-
-    /// The on-disk source files this asset depends on — for the serve watcher.
-    pub fn upstream_paths(&self) -> impl Iterator<Item = &Path> {
-        self.built.upstream.iter().map(|u| u.path.as_path())
     }
 }
 

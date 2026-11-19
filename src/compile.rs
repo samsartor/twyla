@@ -80,8 +80,9 @@ fn compile_bundle_impl(
     sources: &[FileId],
     resolver: &mut Resolver,
 ) -> SourceResult<CompiledBundle> {
-    // Evict assets whose sources changed since the last compile (no-op on the
-    // first compile / a fresh resolver). What survives seeds this compile.
+    // Evict cached assets (built or failed) whose ledger deps changed since the
+    // last compile (no-op on the first compile / a fresh resolver). What
+    // survives seeds this compile.
     resolver.revalidate();
     // Asset *usage* (which assets are linked vs only inlined) is recomputed from
     // this compile's requests, so a dropped `.url()` stops emitting the file.
@@ -356,12 +357,13 @@ fn compile_bundle_loop(
         // requested (recorded as introspections), growing the resolver's stores.
         discover_requests(resolver, world, subsink.introspections())?;
 
-        // Surface warnings the asset builds queued (e.g. a best-effort svg
-        // minify that fell back to verbatim). They go straight to the parent
-        // sink: the iteration that discovers/builds an asset normally does not
-        // converge, so its `subsink` is discarded. A build only runs on a cache
-        // miss, and the parent sink deduplicates, so each warning still fires
-        // once per (re)build.
+        // Surface the warnings of the assets this pass requested (e.g. a
+        // best-effort svg minify that fell back to verbatim) — stored with
+        // each cached entry and queued on every request, so a cached asset
+        // warns on every compile, not just the one that built it. They go
+        // straight to the parent sink: the iteration that discovers/builds an
+        // asset normally does not converge, so its `subsink` is discarded. The
+        // parent sink deduplicates, so each fires once per compile.
         for warning in resolver.take_warnings() {
             sink.warn(warning);
         }

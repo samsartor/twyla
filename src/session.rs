@@ -13,8 +13,8 @@
 //! without a file watcher or a socket.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::SystemTime;
 
+use crate::ledger::Dep;
 use crate::project::{ContentScan, TwylaContext};
 use crate::render::{Outputs, RenderError, RenderErrorKind, RenderWorld, plain_err};
 use crate::resolver::Resolver;
@@ -43,8 +43,12 @@ pub struct Rebuild {
     /// - every path the [`ContentScan`] observed (each directory under
     ///   `content/` and `static/` by its listing, the roots even when missing),
     ///   so creating or deleting a page or static file anywhere is noticed;
-    /// - files typst read (`world.dependencies()`);
-    /// - files twyla's asset pass read (each resolved asset's upstream paths);
+    /// - every file typst loaded ([`RenderWorld::take_loads`]), stamped at
+    ///   load time — failed loads too, so a missing import is polled;
+    /// - every ledger dep of the asset pass ([`Resolver::asset_deps`]):
+    ///   reads, existence probes (a missing sass import candidate is polled
+    ///   as missing) and directory listings, of built *and failed* assets,
+    ///   stamped at access time;
     /// - after a *failed* rebuild, everything the previous rebuild watched, so
     ///   a compile that stopped early (scan error, typst error, panic) never
     ///   shrinks the watch set. Those retained paths are stamped as they are
@@ -75,10 +79,9 @@ impl DevSession {
     pub fn rebuild(&mut self) -> Rebuild {
         comemo::evict(10);
         self.world.files.reset();
-
-        // Taken before anything is read: a file modified after this instant
-        // may have changed after the compile read it (see `Stamp::after_read`).
-        let started = SystemTime::now();
+        // Start this compile's load log empty (a one-shot `compile_bundle`
+        // outside `rebuild` may have left loads behind).
+        self.world.take_loads();
         let scan = self.world.ctx.scan_content();
 
         // A panic anywhere in the compile (typst, an asset pipeline, or an
@@ -100,7 +103,7 @@ impl DevSession {
 
         // Collect what this attempt observed *before* any recovery below
         // discards the world and resolver that hold those observations.
-        let mut watch = self.observed(&scan, started);
+        let mut watch = self.observed(&scan);
 
         let result = match outcome {
             Ok(result) => result,
@@ -120,31 +123,33 @@ impl DevSession {
 
         if result.is_err() {
             watch.keep_from(&self.last_watch);
+            watch.failed = true;
         }
         self.last_watch = watch.clone();
         Rebuild { result, watch }
     }
 
     /// What the compile that just ran observed. See [`Rebuild::watch`].
-    fn observed(&mut self, scan: &ContentScan, started: SystemTime) -> WatchSet {
+    /// Every stamp here was taken when the compile touched the path, never
+    /// after the fact.
+    fn observed(&mut self, scan: &ContentScan) -> WatchSet {
         let mut watch = WatchSet::default();
         for (path, stamp) in &scan.observed {
             watch.insert(path.clone(), stamp.clone());
         }
-
-        for path in self.world.dependencies().collect::<Vec<_>>() {
-            let stamp = Stamp::after_read(&path, started);
-            watch.insert(path, stamp);
+        for dep in self.world.take_loads() {
+            observe(&mut watch, &dep);
         }
-
-        // Asset upstreams (e.g. sass `@import` partials) are read by twyla's
-        // own pass, not typst, so they're not in `world.dependencies()`. Pulled
-        // from the resolver, not the published outputs, so that an asset that
-        // is only `.read()` (inlined, never emitted as a file) is still watched.
-        for asset in self.resolver.resolved_assets() {
-            for path in asset.upstream_paths() {
-                watch.insert(path.to_path_buf(), Stamp::after_read(path, started));
-            }
+        // Asset deps are read by twyla's own asset pass, not typst. Pulled
+        // from the resolver's cache, not the published outputs, so that an
+        // asset that's only `.read()` (inlined, never emitted as a file) and
+        // one whose build failed are still watched — plus whatever a build
+        // that panicked touched before it did.
+        for dep in self.resolver.asset_deps() {
+            observe(&mut watch, dep);
+        }
+        for dep in &self.resolver.interrupted_build_deps() {
+            observe(&mut watch, dep);
         }
         watch
     }
@@ -168,10 +173,17 @@ impl DevSession {
     }
 }
 
+/// Add one ledger observation to the watch set: its access-time stamp, plus
+/// its content hash when the stamp alone can't vouch for it (racy).
+fn observe(watch: &mut WatchSet, dep: &Dep) {
+    let racy_hash = if dep.is_racy() { dep.sha256 } else { None };
+    watch.observe(dep.path.clone(), dep.stamp.clone(), racy_hash);
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     use super::*;
 
@@ -292,14 +304,12 @@ mod tests {
         assert!(html.contains("hello-fixed"), "{html}");
     }
 
-    /// KNOWN BUG (fixed by the dep-ledger revision): an asset whose build
-    /// fails never lands in the resolver, so its `upstream` — the only record
-    /// of the files twyla's own asset pass read — is lost, and those files drop
-    /// out of the watch set. Editing the broken stylesheet (or the broken
-    /// partial it imports) to fix it then doesn't trigger a rebuild; serve is
-    /// stuck on the error page until some *typst* dependency changes.
+    /// Regression (fixed by the dependency ledger): an asset whose build
+    /// failed used to drop the files it read (they were only recorded in the
+    /// successful build's output), so they fell out of the watch set, and
+    /// fixing the broken stylesheet didn't trigger a rebuild. Now the
+    /// resolver owns the recorder and caches the failure with its deps.
     #[test]
-    #[ignore = "fixed by dep-ledger revision"]
     fn sass_error_keeps_source_watched() {
         let (ctx, _dir) = site(&[
             (
@@ -318,10 +328,9 @@ mod tests {
         );
     }
 
-    /// Same known bug, via a broken `@use`d partial: the partial is only ever
-    /// recorded in the failed asset's (discarded) upstream.
+    /// Same regression, via a broken `@use`d partial: grass reads it through
+    /// the recording fs, so the failed entry's deps include it.
     #[test]
-    #[ignore = "fixed by dep-ledger revision"]
     fn sass_partial_error_keeps_partial_watched() {
         let (ctx, _dir) = site(&[
             (
@@ -477,5 +486,391 @@ mod tests {
             _ => None,
         });
         assert!(html.as_deref().unwrap_or("").contains("v2"), "{html:?}");
+    }
+
+    // ---- dependency ledger ------------------------------------------------
+
+    fn write_bytes(root: &Path, rel: &str, contents: &[u8]) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn set_mtime(path: &Path, mtime: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    /// An mtime well outside the ledger's racy window, so a stamp alone
+    /// vouches for the file (tests asserting "no content reads" need this:
+    /// a file written moments ago is re-hashed on every check).
+    fn age(path: &Path) {
+        set_mtime(path, SystemTime::now() - Duration::from_secs(3600));
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let img = ::image::RgbImage::from_pixel(width, height, ::image::Rgb([10, 120, 200]));
+        let mut buf = Vec::new();
+        ::image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                ::image::ImageFormat::Png,
+            )
+            .unwrap();
+        buf
+    }
+
+    /// One asset failure mode: the site starts broken at `offending`, which
+    /// must be watched as `expect` says; applying `fix` must make the next
+    /// rebuild succeed.
+    struct Failure {
+        name: &'static str,
+        files: Vec<(&'static str, Vec<u8>)>,
+        offending: &'static str,
+        expect: fn(&Stamp) -> bool,
+        fix: Vec<(&'static str, Vec<u8>)>,
+    }
+
+    fn is_file(stamp: &Stamp) -> bool {
+        matches!(stamp, Stamp::File { .. })
+    }
+
+    fn is_missing(stamp: &Stamp) -> bool {
+        *stamp == Stamp::Missing
+    }
+
+    /// The core bug the ledger fixes: for every asset kind and failure mode,
+    /// the file that broke the build is watched (with the stamp the build
+    /// saw), and fixing *only that file* makes the next rebuild succeed.
+    #[test]
+    fn asset_failures_keep_offending_path_watched_and_recover() {
+        let page = |src: &str| src.as_bytes().to_vec();
+        let cases = vec![
+            Failure {
+                name: "sass syntax error in entry",
+                files: vec![
+                    (
+                        "content/main.typ",
+                        page("#context asset.sass(\"main.scss\").url()"),
+                    ),
+                    ("content/main.scss", page(".a { color: ")),
+                ],
+                offending: "content/main.scss",
+                expect: is_file,
+                fix: vec![("content/main.scss", page(".a { color: red; }"))],
+            },
+            Failure {
+                name: "sass error in a partial",
+                files: vec![
+                    (
+                        "content/main.typ",
+                        page("#context asset.sass(\"main.scss\").url()"),
+                    ),
+                    (
+                        "content/main.scss",
+                        page("@use \"partial\";\n.a { color: red; }"),
+                    ),
+                    ("content/_partial.scss", page(".b { color: ")),
+                ],
+                offending: "content/_partial.scss",
+                expect: is_file,
+                fix: vec![("content/_partial.scss", page(".b { color: blue; }"))],
+            },
+            Failure {
+                name: "unresolved sass @use",
+                files: vec![
+                    (
+                        "content/main.typ",
+                        page("#context asset.sass(\"main.scss\").url()"),
+                    ),
+                    (
+                        "content/main.scss",
+                        page("@use \"missing\";\n.a { color: red; }"),
+                    ),
+                ],
+                offending: "content/_missing.scss",
+                expect: is_missing,
+                fix: vec![("content/_missing.scss", page(".m { color: green; }"))],
+            },
+            Failure {
+                name: "unresolved sass @import in a subdir",
+                files: vec![
+                    (
+                        "content/main.typ",
+                        page("#context asset.sass(\"css/main.scss\").url()"),
+                    ),
+                    (
+                        "content/css/main.scss",
+                        page("@import \"lib/vars\";\n.a { color: $c; }"),
+                    ),
+                ],
+                offending: "content/css/lib/_vars.scss",
+                expect: is_missing,
+                fix: vec![("content/css/lib/_vars.scss", page("$c: red;"))],
+            },
+            Failure {
+                name: "missing asset.file source",
+                files: vec![(
+                    "content/main.typ",
+                    page("#context asset.file(\"data.txt\").url()"),
+                )],
+                offending: "content/data.txt",
+                expect: is_missing,
+                fix: vec![("content/data.txt", page("data"))],
+            },
+            Failure {
+                name: "image decode failure",
+                files: vec![
+                    (
+                        "content/main.typ",
+                        page("#context asset.image(\"photo.png\", width: 4).url()"),
+                    ),
+                    ("content/photo.png", page("not an image")),
+                ],
+                offending: "content/photo.png",
+                expect: is_file,
+                fix: vec![("content/photo.png", png(8, 8))],
+            },
+            Failure {
+                name: "missing svg",
+                files: vec![(
+                    "content/main.typ",
+                    page("#context asset.svg(\"icon.svg\").url()"),
+                )],
+                offending: "content/icon.svg",
+                expect: is_missing,
+                fix: vec![(
+                    "content/icon.svg",
+                    page(
+                        "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"1\" height=\"1\"/></svg>",
+                    ),
+                )],
+            },
+            Failure {
+                name: "typst asset with an error in an imported file",
+                files: vec![
+                    (
+                        "content/main.typ",
+                        page("#context asset.typst(\"/assets/doc.typ\", format: \"svg\").url()"),
+                    ),
+                    ("assets/doc.typ", page("#import \"_dep.typ\": x\n#x")),
+                    ("assets/_dep.typ", page("#let x = { oops-undefined }")),
+                ],
+                offending: "assets/_dep.typ",
+                expect: is_file,
+                fix: vec![("assets/_dep.typ", page("#let x = [fixed]"))],
+            },
+        ];
+
+        for case in cases {
+            let (ctx, dir) = site(&[]);
+            for (rel, contents) in &case.files {
+                write_bytes(dir.path(), rel, contents);
+            }
+            let offending = ctx.root.join(case.offending);
+            let mut session = DevSession::new(&ctx).unwrap();
+
+            let r1 = session.rebuild();
+            assert!(r1.result.is_err(), "{}: expected a build error", case.name);
+            assert!(r1.watch.failed, "{}", case.name);
+            let stamp = r1.watch.paths.get(&offending).unwrap_or_else(|| {
+                panic!(
+                    "{}: {} not watched: {:#?}",
+                    case.name,
+                    offending.display(),
+                    r1.watch.paths.keys()
+                )
+            });
+            assert!(
+                (case.expect)(stamp),
+                "{}: unexpected stamp {stamp:?}",
+                case.name
+            );
+
+            // A second failing rebuild re-reports the cached failure without
+            // rebuilding, and still watches the path.
+            let builds = session.resolver.stats.builds;
+            let r2 = session.rebuild();
+            assert!(r2.result.is_err(), "{}", case.name);
+            assert!(r2.watch.contains(&offending), "{}", case.name);
+            assert_eq!(
+                session.resolver.stats.builds, builds,
+                "{}: rebuilt a cached failure",
+                case.name
+            );
+
+            std::thread::sleep(Duration::from_millis(10));
+            for (rel, contents) in &case.fix {
+                write_bytes(dir.path(), rel, contents);
+            }
+            // The watcher's recheck would see the fix...
+            assert!(
+                !r2.watch.paths[&offending].matches_now(&offending),
+                "{}: fix not visible to the watcher",
+                case.name
+            );
+            // ...and the rebuild it triggers succeeds.
+            let r3 = session.rebuild();
+            if let Err(err) = &r3.result {
+                panic!("{}: still failing after the fix:\n{err}", case.name);
+            }
+            assert!(!r3.watch.failed);
+        }
+    }
+
+    /// The I/O budget of a warm rebuild: editing a page that uses no assets
+    /// reads no asset source (stats only), and `touch`ing an image re-hashes
+    /// it once without re-running its pipeline.
+    #[test]
+    fn warm_rebuild_reads_no_asset_sources() {
+        let (ctx, dir) = site(&[
+            (
+                "content/main.typ",
+                "#context asset.image(\"photo.png\", width: 4).url()\n\
+                 #context asset.sass(\"main.scss\").url()\n\
+                 #context asset.file(\"data.txt\").url()",
+            ),
+            ("content/main.scss", "@use \"partial\";\n.a { color: red; }"),
+            ("content/_partial.scss", ".b { color: blue; }"),
+            ("content/data.txt", "data"),
+            ("content/other.typ", "other v1"),
+        ]);
+        write_bytes(dir.path(), "content/photo.png", &png(8, 8));
+        for f in ["photo.png", "main.scss", "_partial.scss", "data.txt"] {
+            age(&ctx.content_dir().join(f));
+        }
+        let mut session = DevSession::new(&ctx).unwrap();
+        let out1 = session.rebuild().result.unwrap();
+        let cold = session.resolver.stats;
+        assert_eq!(cold.builds, 3);
+
+        write(dir.path(), "content/other.typ", "other v2");
+        session.rebuild().result.unwrap();
+        assert_eq!(
+            session.resolver.stats, cold,
+            "warm rebuild touched asset sources"
+        );
+
+        // `touch`: same bytes, new mtime. One re-hash, no rebuild, same output.
+        let photo = ctx.content_dir().join("photo.png");
+        set_mtime(&photo, SystemTime::now() - Duration::from_secs(1800));
+        let out2 = session.rebuild().result.unwrap();
+        let stats = session.resolver.stats;
+        assert_eq!(stats.builds, cold.builds, "touch rebuilt the image");
+        assert_eq!(stats.content_reads, cold.content_reads + 1);
+        let images = |out: &Outputs| -> Vec<String> {
+            let mut v: Vec<_> = out
+                .assets()
+                .filter(|a| a.output_path.ends_with(".png"))
+                .map(|a| a.output_path.clone())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(images(&out1), images(&out2));
+
+        // Restamped: the next rebuild doesn't re-hash it again.
+        session.rebuild().result.unwrap();
+        assert_eq!(session.resolver.stats, stats);
+    }
+
+    /// A same-length rewrite that keeps the mtime the build saw (racy:
+    /// written within the filesystem-granularity window of the read) is
+    /// caught on the next rebuild by its hash.
+    #[test]
+    fn racy_same_length_rewrite_rebuilds() {
+        let (ctx, _dir) = site(&[
+            (
+                "content/main.typ",
+                "#context asset.sass(\"main.scss\").read()",
+            ),
+            ("content/main.scss", ".a { color: red; }"),
+        ]);
+        let scss = ctx.content_dir().join("main.scss");
+        let mut session = DevSession::new(&ctx).unwrap();
+        // Racy = modified within the window *of the read*. On a loaded test
+        // machine the read can happen seconds after the write, so pin the
+        // mtime slightly ahead instead: racy however long the compile takes.
+        set_mtime(&scss, SystemTime::now() + Duration::from_secs(30));
+        let r1 = session.rebuild();
+        let html = |out: &Outputs| out.docs().next().unwrap().html.clone();
+        assert!(html(&r1.result.unwrap()).contains("red"));
+        let Some(Stamp::File { mtime, .. }) = r1.watch.paths.get(&scss).cloned() else {
+            panic!("{:?}", r1.watch)
+        };
+        assert!(
+            r1.watch.racy.contains_key(&scss),
+            "fresh file not marked racy"
+        );
+
+        std::fs::write(&scss, ".a { color: tan; }").unwrap();
+        set_mtime(&scss, mtime);
+        assert!(
+            r1.watch.paths[&scss].matches_now(&scss),
+            "stamp sees nothing"
+        );
+
+        let r2 = session.rebuild();
+        assert!(html(&r2.result.unwrap()).contains("tan"));
+    }
+
+    /// Asset warnings belong to the cached entry: a compile that reuses the
+    /// asset reports them again (they used to vanish after the first).
+    #[test]
+    fn cached_asset_warnings_are_re_emitted() {
+        use typst::syntax::{FileId, RootedPath, VirtualPath, VirtualRoot};
+        let (ctx, _dir) = site(&[
+            ("content/main.typ", "#context asset.svg(\"bad.svg\").url()"),
+            ("content/bad.svg", "<svg><open></svg>"),
+        ]);
+        let world = RenderWorld::new(&ctx).unwrap();
+        let main = FileId::new(RootedPath::new(
+            VirtualRoot::Project,
+            VirtualPath::new("content/main.typ").unwrap(),
+        ));
+        let mut resolver = Resolver::new(&ctx);
+        for round in 0..2 {
+            let warned = crate::compile::compile_bundle(&ctx, &world, &[main], &mut resolver);
+            assert!(warned.output.is_ok(), "round {round}");
+            assert!(
+                warned.warnings.iter().any(|w| w.message.contains("svg")),
+                "round {round}: warning missing: {:?}",
+                warned.warnings
+            );
+        }
+        assert_eq!(resolver.stats.builds, 1);
+    }
+
+    /// A panic in the middle of an asset build: what the build touched so far
+    /// is still watched.
+    #[test]
+    fn asset_build_panic_keeps_its_deps_watched() {
+        let (ctx, _dir) = site(&[
+            (
+                "content/main.typ",
+                "#context asset.sass(\"main.scss\").url()",
+            ),
+            ("content/main.scss", "@use \"partial\";\n.a { color: red; }"),
+            ("content/_partial.scss", ".b { color: blue; }"),
+        ]);
+        let mut session = DevSession::new(&ctx).unwrap();
+        session.resolver.inject_build_panic = true;
+        let r1 = session.rebuild();
+        assert!(matches!(
+            r1.result.err().unwrap().kind,
+            RenderErrorKind::Panic
+        ));
+        for f in ["main.scss", "_partial.scss"] {
+            assert!(
+                r1.watch.contains(ctx.content_dir().join(f)),
+                "{f}: {:?}",
+                r1.watch
+            );
+        }
+        assert!(session.rebuild().result.is_ok());
     }
 }

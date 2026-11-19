@@ -49,7 +49,8 @@
 //!   re-checks paths it newly subscribes.
 //!
 //! [`Stamp`] and [`WatchSet`] are plain data keyed by absolute paths (no typst
-//! `FileId`s) so the planned dependency ledger can reuse or extend them.
+//! `FileId`s); the stamps come from [`crate::ledger`], taken at the moment the
+//! compile read each path.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
@@ -83,17 +84,13 @@ pub enum Stamp {
     /// unreadable directory that stays unreadable has not changed, and
     /// treating it as changed would rebuild forever.
     Unreadable,
-    /// The observation can't be trusted (the file may have changed while the
-    /// compile was reading it, or a directory listing was cut short). Never
-    /// matches, so re-checking it always reports a change.
+    /// The observation can't be trusted: the file changed while the compile
+    /// was reading it (see [`crate::ledger`]'s racy-read guard). Never
+    /// matches, so re-checking it always reports a change. Only produced by
+    /// an actual change, never by a stable state, so it forces at most one
+    /// extra rebuild per change rather than a loop.
     Unknown,
 }
-
-/// How far an mtime may lag the wall clock. Linux stamps files from a coarse
-/// clock (one jiffy, 1–10ms), so an edit made just after a compile started
-/// can carry an mtime slightly *before* the start. Generous on purpose; the
-/// cost of a false positive is one extra rebuild.
-const MTIME_SLACK: Duration = Duration::from_millis(50);
 
 impl Stamp {
     /// Observe `path` as it is right now. Follows symlinks, like the compile.
@@ -114,26 +111,6 @@ impl Stamp {
                 len: meta.len(),
             },
             Err(_) => Stamp::Unknown,
-        }
-    }
-
-    /// Observe a file the compile read at some point after `started`.
-    ///
-    /// The stamp is taken *after* the compile, so an edit that landed between
-    /// the read and now would be baked into the stamp and never noticed. Such
-    /// an edit necessarily has an mtime at or after `started`, so any file
-    /// modified since the compile began is recorded as [`Stamp::Unknown`]
-    /// (forcing one re-check rebuild) instead.
-    ///
-    /// TODO(revision 2, dependency ledger): this is still sampled *after* the
-    /// compile, so a file deleted (or restored with an old mtime) between the
-    /// read and this call is stamped as the compile never saw it. The ledger
-    /// will record the stamp and a content hash in the loader, at read time,
-    /// and this function goes away.
-    pub fn after_read(path: &Path, started: SystemTime) -> Stamp {
-        match Stamp::now(path) {
-            Stamp::File { mtime, .. } if mtime + MTIME_SLACK >= started => Stamp::Unknown,
-            stamp => stamp,
         }
     }
 
@@ -173,6 +150,19 @@ fn read_dir_names(dir: &Path) -> io::Result<Vec<OsString>> {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WatchSet {
     pub paths: BTreeMap<PathBuf, Stamp>,
+    /// Content hashes of files whose stamp is *racy* (modified within
+    /// [`RACY_WINDOW`](crate::ledger::RACY_WINDOW) of being read, so a
+    /// same-length rewrite could keep the stamp). When [`Watcher::update`]
+    /// re-checks such a path and its stamp still matches, it re-hashes it.
+    /// A matching hash is a stable answer, so a racy file (even one with an
+    /// mtime in the future) never forces a rebuild by itself.
+    pub racy: BTreeMap<PathBuf, [u8; 32]>,
+    /// The compile that produced this set failed. A failure can be fixed by
+    /// a change no stamp captures — `chmod` on an unreadable dependency — so
+    /// while this is set the watcher also treats metadata-only events as
+    /// changes. (When the build succeeds, metadata events stay ignored, as
+    /// they're noise: editors and backup tools touch them constantly.)
+    pub failed: bool,
 }
 
 impl WatchSet {
@@ -180,10 +170,40 @@ impl WatchSet {
         self.paths.contains_key(path.as_ref())
     }
 
-    /// Record an observation. A later observation of the same path replaces
-    /// an earlier one.
+    /// Record an observation, replacing any earlier one of the same path.
     pub fn insert(&mut self, path: PathBuf, stamp: Stamp) {
+        self.racy.remove(&path);
         self.paths.insert(path, stamp);
+    }
+
+    /// Merge one of several observations of `path` made during one compile
+    /// (a file both typst and an asset read, or a sass probe followed by the
+    /// read). Agreeing observations merge; disagreeing ones mean the path
+    /// changed mid-compile, so neither can be trusted and the result is
+    /// [`Stamp::Unknown`] (one recheck). `racy_hash` is the content hash for
+    /// a racy read (see [`WatchSet::racy`]).
+    pub fn observe(&mut self, path: PathBuf, stamp: Stamp, racy_hash: Option<[u8; 32]>) {
+        match self.paths.get(&path) {
+            Some(seen) if *seen != stamp => {
+                self.racy.remove(&path);
+                self.paths.insert(path, Stamp::Unknown);
+            }
+            _ => {
+                if let Some(hash) = racy_hash {
+                    match self.racy.get(&path) {
+                        Some(seen) if *seen != hash => {
+                            self.racy.remove(&path);
+                            self.paths.insert(path, Stamp::Unknown);
+                            return;
+                        }
+                        _ => {
+                            self.racy.insert(path.clone(), hash);
+                        }
+                    }
+                }
+                self.paths.insert(path, stamp);
+            }
+        }
     }
 
     /// Add every path of `older` that this set doesn't have, stamped as it
@@ -296,6 +316,8 @@ pub struct Watcher<B: Backend = RecommendedWatcher> {
     /// Changes found by `update`'s re-check; the next `wait` returns them
     /// without blocking.
     pending: ChangedPaths,
+    /// [`WatchSet::failed`] of the last `update`: metadata events count.
+    metadata_relevant: bool,
 }
 
 /// How long to wait for a shortly following event before ending a batch.
@@ -339,6 +361,7 @@ impl<B: Backend> Watcher<B> {
             polled: BTreeMap::new(),
             warned: BTreeSet::new(),
             pending: ChangedPaths::default(),
+            metadata_relevant: false,
         }
     }
 
@@ -353,6 +376,7 @@ impl<B: Backend> Watcher<B> {
     /// panicked); the watcher should then be replaced.
     pub fn update(&mut self, set: &WatchSet) -> Result<Vec<String>, String> {
         let mut warnings = Vec::new();
+        self.metadata_relevant = set.failed;
         for seen in self.watched.values_mut() {
             *seen = false;
         }
@@ -390,7 +414,12 @@ impl<B: Backend> Watcher<B> {
             } else {
                 self.polled.insert(path.clone(), Probe::now(path));
             }
-            if !observed.matches_now(path) {
+            let changed = !observed.matches_now(path)
+                || set
+                    .racy
+                    .get(path)
+                    .is_some_and(|hash| crate::ledger::observe_hash(path).1.ok() != Some(*hash));
+            if changed {
                 self.pending.paths.insert(path.clone());
             }
         }
@@ -476,7 +505,8 @@ impl<B: Backend> Watcher<B> {
             changed.unknown = true;
             return Ok(());
         }
-        if !is_relevant(&event.kind) {
+        let metadata = matches!(event.kind, EventKind::Modify(ModifyKind::Metadata(_)));
+        if !is_relevant(&event.kind) && !(metadata && self.metadata_relevant) {
             return Ok(());
         }
         if changes_identity(&event.kind) {
@@ -555,7 +585,8 @@ fn disconnected() -> String {
 }
 
 /// Whether an event kind can affect a compile. Same filter as typst's watcher:
-/// content and namespace changes count; access and metadata-only changes don't.
+/// content and namespace changes count; access and metadata-only changes don't
+/// (except after a failed build — see [`WatchSet::failed`]).
 fn is_relevant(kind: &EventKind) -> bool {
     match kind {
         EventKind::Any | EventKind::Create(_) | EventKind::Remove(_) => true,

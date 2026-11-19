@@ -318,7 +318,7 @@ fn image_accepts_inline_bytes() {
     let decoded = ::image::load_from_memory(&asset.built.emit.read().unwrap()).unwrap();
     assert_eq!((decoded.width(), decoded.height()), (20, 10));
     assert!(
-        asset.built.upstream.is_empty(),
+        asset.deps.is_empty(),
         "inline image bytes should not be watched as an asset file"
     );
 }
@@ -389,7 +389,7 @@ fn raw_emits_inline_text_with_an_extension() {
     let asset = &assets[0];
     assert!(asset.output_path.ends_with(".css"));
     assert_eq!(asset.built.emit.read().unwrap().as_slice(), b"a{color:red}");
-    assert!(asset.built.upstream.is_empty());
+    assert!(asset.deps.is_empty());
     assert!(html.contains(&asset.url));
 }
 
@@ -883,7 +883,7 @@ fn separate_compiles_each_resolve() {
 }
 
 /// Editing a sass source and recompiling the *same* (persistent) world must
-/// re-resolve to a new fingerprint — proving mtime revalidation evicts the
+/// re-resolve to a new fingerprint — proving ledger revalidation evicts the
 /// stale entry and the epoch bump lets re-discovery through even when the map
 /// returns to a previously-cached (empty) state.
 #[test]
@@ -1120,7 +1120,7 @@ fn bare_typst_asset_emits_and_vanishes() {
 
 /// Editing a typst asset's source file (or an import) revalidates it to a new
 /// fingerprint on a warm rebuild — proving the sub-compile's file reads are
-/// harvested into `upstream` and drive invalidation, like sass partials.
+/// recorded as ledger deps and drive invalidation, like sass partials.
 #[test]
 fn editing_typst_source_revalidates_to_new_fingerprint() {
     let (ctx, dir) = site(&[

@@ -11,6 +11,7 @@
 //! - [`serve`] — zero-flag dev server.
 //! - [`session`] — the dev server's persistent rebuild step + watch set.
 //! - [`watch`] — the dev server's file watcher (path-aware, race-checked).
+//! - [`ledger`] — what each build read from disk, recorded at access time.
 
 pub mod asset;
 pub mod build;
@@ -22,6 +23,7 @@ pub mod document;
 pub mod examples;
 pub mod html;
 pub mod import;
+pub mod ledger;
 pub mod project;
 pub mod reflect;
 pub mod render;

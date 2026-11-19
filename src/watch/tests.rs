@@ -286,14 +286,6 @@ fn stamps() {
     fs::write(&file, "v22").unwrap();
     assert!(!s1.matches_now(&file));
 
-    // A file modified after the compile started can't be trusted.
-    let long_ago = SystemTime::now() - Duration::from_secs(3600);
-    assert_eq!(Stamp::after_read(&file, long_ago), Stamp::Unknown);
-    let later = SystemTime::now() + Duration::from_secs(3600);
-    assert!(matches!(
-        Stamp::after_read(&file, later),
-        Stamp::File { .. }
-    ));
     assert!(!Stamp::Unknown.matches_now(&file));
 
     // Directory stamps track names only, in any order.
@@ -454,6 +446,171 @@ fn refused_path_is_polled_and_others_stay_watched() {
     fs::set_permissions(&b, fs::Permissions::from_mode(0o000)).unwrap();
     let changed = w.wait().unwrap();
     assert_eq!(changed.paths, BTreeSet::from([b]));
+}
+
+fn set_mtime(path: &Path, mtime: SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+}
+
+/// A temp-dir site for session-driven watcher tests.
+fn session_site(
+    files: &[(&str, &str)],
+) -> (PathBuf, tempfile::TempDir, crate::session::DevSession) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("content")).unwrap();
+    for (rel, contents) in files {
+        fs::write(root.join(rel), contents).unwrap();
+    }
+    let ctx = crate::project::TwylaContext::new(&root, None).unwrap();
+    let session = crate::session::DevSession::new(&ctx).unwrap();
+    (root, dir, session)
+}
+
+/// Regression (rev 1c): a dependency with an mtime in the future (clock skew)
+/// used to be stamped `Unknown` on every rebuild, which never matches, so
+/// every `update` queued another rebuild — a tight loop with no filesystem
+/// change. With read-time stamps it's merely *racy*: the watcher verifies it
+/// by hash, which matches, so the loop goes idle (here: immediately; the
+/// contract is at most one extra rebuild).
+#[test]
+fn future_mtime_dependency_goes_idle() {
+    let (root, _dir, mut session) = session_site(&[
+        (
+            "content/main.typ",
+            "#import \"_lib.typ\": x\n#x\n#context asset.sass(\"main.scss\").url()",
+        ),
+        ("content/_lib.typ", "#let x = [lib]"),
+        ("content/main.scss", ".a { color: red; }"),
+    ]);
+    let future = SystemTime::now() + Duration::from_secs(3600);
+    for f in ["content/_lib.typ", "content/main.scss"] {
+        set_mtime(&root.join(f), future);
+    }
+    // Refused paths are polled, the case the review found looping.
+    let (mut w, _tx, _log) = fake_with({
+        let mut f = Fake::default();
+        f.refuse = vec![
+            root.join("content/_lib.typ"),
+            root.join("content/main.scss"),
+        ];
+        f
+    });
+
+    let mut extra = 0;
+    for round in 0..3 {
+        let r = session.rebuild();
+        assert!(r.result.is_ok(), "round {round}");
+        w.update(&r.watch).unwrap();
+        let mut polled = ChangedPaths::default();
+        w.poll(&mut polled);
+        assert!(
+            polled.is_empty(),
+            "round {round}: poll saw a change: {polled:?}"
+        );
+        if !w.pending.is_empty() {
+            extra += 1;
+            w.pending = ChangedPaths::default();
+        }
+    }
+    assert!(extra <= 1, "{extra} extra rebuilds: not idle");
+    assert_eq!(session.resolver.stats.builds, 1, "asset rebuilt");
+}
+
+/// A racy file (modified within the filesystem-granularity window of its
+/// read) rewritten with the same length *and* mtime before the watcher
+/// subscribes: the stamp can't see it, the re-hash does.
+#[test]
+fn racy_rewrite_before_subscribe_is_reported() {
+    let (root, _dir, mut session) = session_site(&[
+        ("content/main.typ", "#import \"_lib.typ\": x\n#x"),
+        ("content/_lib.typ", "#let x = [aaa]"),
+    ]);
+    let lib = root.join("content/_lib.typ");
+    // Pinned ahead so it's racy however slowly the compile runs.
+    let mtime = SystemTime::now() + Duration::from_secs(30);
+    set_mtime(&lib, mtime);
+    let r = session.rebuild();
+    assert!(r.watch.racy.contains_key(&lib), "{r:?}", r = r.watch);
+
+    fs::write(&lib, "#let x = [bbb]").unwrap();
+    set_mtime(&lib, mtime);
+    let (mut w, _tx, _log) = fake();
+    w.update(&r.watch).unwrap();
+    assert!(w.pending.paths.contains(&lib), "{:?}", w.pending);
+}
+
+/// Regression (rev 1c): a subscribed dependency becomes unreadable, the
+/// build fails on it, then `chmod` restores it. That's a metadata-only event,
+/// which the watcher filters as noise — so nothing ever rebuilt. While the
+/// last build failed, metadata events count; and the asset ledger retries a
+/// read that failed on an existing file even though its stamp is unchanged.
+#[cfg(unix)]
+#[test]
+fn permission_restore_after_failed_build_rebuilds() {
+    use notify::event::MetadataKind;
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, _dir, mut session) = session_site(&[
+        (
+            "content/main.typ",
+            "#context asset.sass(\"main.scss\").url()",
+        ),
+        ("content/main.scss", ".a { color: red; }"),
+        ("content/other.typ", "#import \"_lib.typ\": x\n#x"),
+        ("content/_lib.typ", "#let x = [lib]"),
+    ]);
+    let r1 = session.rebuild();
+    assert!(r1.result.is_ok());
+    let (mut w, _tx, _log) = fake();
+    w.update(&r1.watch).unwrap();
+    let metadata = |p: &Path| {
+        event(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)),
+            p,
+        )
+    };
+
+    // A successful build: metadata events are noise.
+    let mut changed = ChangedPaths::default();
+    w.handle_event(metadata(&root.join("content/main.scss")), &mut changed)
+        .unwrap();
+    assert!(changed.is_empty(), "{changed:?}");
+
+    for broken in ["content/main.scss", "content/_lib.typ"] {
+        let path = root.join(broken);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&path).is_ok() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            return; // running as root: permissions aren't enforced
+        }
+        // `chmod` alone changes no stamp, so a cached asset stays valid
+        // (rightly: its bytes didn't change). Also bump the mtime so the next
+        // build re-reads the file and fails on it.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        set_mtime(&path, SystemTime::now() - Duration::from_secs(60));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let r = session.rebuild();
+        assert!(r.result.is_err(), "{broken}: expected a read failure");
+        assert!(r.watch.failed);
+        assert!(r.watch.contains(&path), "{broken} not watched");
+        w.update(&r.watch).unwrap();
+        assert!(w.pending.is_empty(), "{broken}: {:?}", w.pending);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut changed = ChangedPaths::default();
+        w.handle_event(metadata(&path), &mut changed).unwrap();
+        assert!(changed.paths.contains(&path), "{broken}: chmod ignored");
+
+        let r = session.rebuild();
+        assert!(r.result.is_ok(), "{broken}: still failing after chmod");
+        w.update(&r.watch).unwrap();
+    }
 }
 
 /// A panic from `unwatch` (best-effort elsewhere) kills the watcher: `update`

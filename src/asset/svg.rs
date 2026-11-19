@@ -21,9 +21,9 @@
 //! error.
 
 use super::{
-    AssetInput, AssetSource, AssetSpec, Built, OutputReq, Upstream, emit_or_request, resolve_input,
-    sha256,
+    AssetInput, AssetSource, AssetSpec, Built, OutputReq, emit_or_request, resolve_input, sha256,
 };
+use crate::ledger::DepRecorder;
 use crate::project::TwylaContext;
 use crate::render::Emit;
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
@@ -174,22 +174,22 @@ pub(crate) fn build(
     id: &SvgId,
     ctx: &TwylaContext,
     span: Span,
+    rec: &DepRecorder,
     warnings: &mut Vec<SourceDiagnostic>,
 ) -> SourceResult<Built> {
     // Read the source bytes from disk (tracking the file) or take the inline
     // bytes directly — same split as `image::build`.
-    let (upstream, stem, bytes) = match source {
+    let (stem, bytes) = match source {
         AssetSource::File(file) => {
             let on_disk = ctx.root.join(file.vpath().get_without_slash());
-            let (up, bytes) = Upstream::new_read_bytes(on_disk).map_err(|err| err_at(span, err))?;
-            let stem = up
-                .path
+            let bytes = rec.read(&on_disk).map_err(|err| err_at(span, err))?;
+            let stem = on_disk
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .map(str::to_owned);
-            (vec![up], stem, bytes)
+            (stem, bytes)
         }
-        AssetSource::Bytes(bytes) => (Vec::new(), None, bytes.to_vec()),
+        AssetSource::Bytes(bytes) => (None, bytes.to_vec()),
     };
 
     let out = process(&bytes, minify, id, span, warnings)?;
@@ -203,7 +203,6 @@ pub(crate) fn build(
     Ok(Built {
         sha256: sha256(&out),
         emit: Emit::Bytes(out),
-        upstream,
         ext: Some("svg".to_owned()),
         stem,
         dimensions: None,

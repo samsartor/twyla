@@ -480,10 +480,14 @@ fn scan_tree(
             }
         }
     }
+    // A listing cut short by an error is recorded as `Unreadable`, not
+    // `Unknown`: if the error persists, `Stamp::now` sees `Unreadable` too and
+    // the watcher goes idle (an `Unknown` would never match and rebuild in a
+    // loop); if it was transient, the next listing differs and rebuilds once.
     let stamp = if listing_complete {
         Stamp::dir_listing(names)
     } else {
-        Stamp::Unknown
+        Stamp::Unreadable
     };
     observed.push((dir.to_path_buf(), stamp));
     for sub in subdirs {
