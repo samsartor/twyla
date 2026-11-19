@@ -185,13 +185,16 @@ fn site_files() -> Files {
         ),
     );
     // A second entry with the same options, on another page: one group
-    // with `app.ts`, sharing `util/v.ts` as a chunk. And a `split: false`
-    // entry, a group of its own.
+    // with `app.ts`, sharing `util/v.ts` as a chunk. It also imports a
+    // `?raw` and a `?url` file. And a `split: false` entry, a group of its
+    // own.
     add(
         "site/scripts/post.ts",
         text(
             "import { v } from \"@util/v\";\n\
-             console.log(\"post\", v);\n",
+             import notes from \"../data/notes.txt?raw\";\n\
+             import pic from \"../images/pic.png?url\";\n\
+             console.log(\"post\", v, notes, pic);\n",
         ),
     );
     add(

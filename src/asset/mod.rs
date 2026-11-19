@@ -500,10 +500,23 @@ pub struct Companion {
     pub emit: Emit,
     /// SHA-256 of the emitted bytes.
     pub sha256: [u8; 32],
-    /// A JS chunk the asset imports (statically or dynamically), as opposed
-    /// to a sourcemap. An entry with chunk companions can't be inlined with
-    /// `.read()`: its relative chunk imports wouldn't resolve.
-    pub chunk: bool,
+    pub kind: CompanionKind,
+}
+
+/// What a [`Companion`] is, which decides when it must be emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompanionKind {
+    /// A JS chunk the asset imports (statically or dynamically). An entry
+    /// with chunk companions can't be inlined with `.read()`: its relative
+    /// chunk imports wouldn't resolve.
+    Chunk,
+    /// A sourcemap. Not needed by an inlined (`.read()`) entry, whose
+    /// sourcemap directive is stripped.
+    SourceMap,
+    /// A file the code references by its absolute URL (an `asset.js`
+    /// `?url` import). Needed even by an inlined entry, so it's emitted
+    /// whenever its asset is used at all.
+    File,
 }
 
 impl Built {

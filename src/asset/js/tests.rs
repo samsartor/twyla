@@ -572,6 +572,10 @@ fn non_js_imports_are_refused() {
         ]);
         let err = compile_err(&ctx);
         assert!(err.contains("only bundles JavaScript"), "{import}: {err}");
+        assert!(
+            err.contains("`?raw`") && err.contains("`?url`"),
+            "no hint: {err}"
+        );
     }
 }
 
@@ -1518,4 +1522,556 @@ fn a_tsconfig_error_doesnt_stop_the_other_partitions() {
     assert_eq!(stats.rolldown_builds, 1, "two/ still bundled: {stats:?}");
     assert!(err.contains("tsconfig"), "{err}");
     assert!(err.contains("v.ts"), "two/'s error missing: {err}");
+}
+
+// -- import queries: ?raw, ?url, ?inline ---------------------------------------
+
+/// A project whose `main.js` is `main` and whose page links it (`URL ..`)
+/// and links `asset.file("/logo.png")` (`FILE ..`), plus `files`.
+fn query_project(main: &str, files: &[(&str, &[u8])]) -> (TwylaContext, tempfile::TempDir) {
+    let (ctx, dir) = project(&[
+        (
+            "content/main.typ",
+            "#context [URL #asset.js(\"/main.js\", minify: false).url()]",
+        ),
+        ("main.js", main),
+    ]);
+    for (rel, bytes) in files {
+        let path = ctx.root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    (ctx, dir)
+}
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\nnot really a png";
+
+#[test]
+fn raw_imports_the_file_as_a_string() {
+    let (ctx, _dir) = query_project(
+        "import shader from './shader.glsl?raw';\n\
+         import source from './typed.ts?raw';\n\
+         console.log(shader, source);\n",
+        &[
+            ("shader.glsl", b"void main() { SHADER_BODY; }\n"),
+            ("typed.ts", b"const typed: number = 1;\n"),
+        ],
+    );
+    let outputs = compile(&ctx).unwrap();
+    let code = entry(&outputs);
+    assert!(code.contains("void main() { SHADER_BODY; }"), "{code}");
+    assert!(
+        code.contains("const typed: number = 1;"),
+        "raw .ts must be untransformed:\n{code}"
+    );
+    assert_eq!(keys(&outputs).len(), 1, "nothing else emitted");
+}
+
+#[test]
+fn raw_of_invalid_utf8_is_an_error() {
+    let (ctx, _dir) = query_project(
+        "import b from './bin.dat?raw';\nconsole.log(b);\n",
+        &[("bin.dat", &[0xff, 0xfe, 0x00])],
+    );
+    let err = compile_err(&ctx);
+    assert!(err.contains("bin.dat?raw` isn't valid UTF-8"), "{err}");
+}
+
+/// The URL in the bundle is byte-for-byte `asset.file(..).url()`, and with
+/// both used, the file is emitted once.
+#[test]
+fn url_matches_asset_file() {
+    for base_url in [None, Some("https://example.com/site")] {
+        let (mut ctx, _dir) = project(&[
+            (
+                "content/main.typ",
+                "#context [URL #asset.js(\"/main.js\", minify: false).url()]\n\n\
+                 #context [FILE #asset.file(\"/img/logo.png\").url()]",
+            ),
+            (
+                "main.js",
+                "import logo from './img/logo.png?url';\nconsole.log(logo);\n",
+            ),
+        ]);
+        std::fs::create_dir_all(ctx.root.join("img")).unwrap();
+        std::fs::write(ctx.root.join("img/logo.png"), PNG).unwrap();
+        ctx.base_url = base_url.map(str::to_string);
+        let outputs = compile(&ctx).unwrap();
+        let html = html(&outputs);
+        let file_url = html
+            .split("FILE ")
+            .nth(1)
+            .and_then(|rest| rest.split('<').next())
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(file_url.contains("/assets/logo-"), "{html}");
+        let code = entry(&outputs);
+        assert!(
+            code.contains(&format!("\"{file_url}\"")),
+            "{file_url} not in:\n{code}"
+        );
+        let logos: Vec<String> = keys(&outputs)
+            .into_iter()
+            .filter(|k| k.contains("logo-"))
+            .collect();
+        assert_eq!(logos.len(), 1, "{logos:?}");
+    }
+}
+
+/// A `?url` file is emitted with the entry that imports it, alone; and
+/// with an entry that's only `.read()` (inlined), since the inlined code
+/// references it by its absolute URL.
+#[test]
+fn url_files_are_emitted_with_their_entry() {
+    for page in [
+        "#context [URL #asset.js(\"/main.js\").url()]",
+        "#context html.elem(\"script\", asset.js(\"/main.js\").read())",
+    ] {
+        let (ctx, _dir) = project(&[
+            ("content/main.typ", page),
+            (
+                "main.js",
+                "import logo from './logo.png?url';\nconsole.log(logo);\n",
+            ),
+        ]);
+        std::fs::write(ctx.root.join("logo.png"), PNG).unwrap();
+        let outputs = compile(&ctx).unwrap();
+        let logos: Vec<String> = keys(&outputs)
+            .into_iter()
+            .filter(|k| k.starts_with("assets/logo-") && k.ends_with(".png"))
+            .collect();
+        assert_eq!(logos.len(), 1, "{page}: {:?}", keys(&outputs));
+        let bytes = match outputs.get(&logos[0]) {
+            Some(Output::Companion { emit, .. }) => emit.read().unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(bytes.as_slice(), PNG);
+        assert!(html(&outputs).contains(&format!("/{}", logos[0])) || page.contains(".url()"));
+    }
+}
+
+/// Two entries of one group importing one `?url` file: emitted once, a
+/// companion of exactly the entries that reach it (here through a shared
+/// chunk), not of a third that doesn't.
+#[test]
+fn url_files_follow_exactly_the_entries_that_reach_them() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            "#context [#asset.js(\"/a.js\", minify: false).url() \
+             #asset.js(\"/b.js\", minify: false).url() \
+             #asset.js(\"/c.js\", minify: false).url()]",
+        ),
+        (
+            "a.js",
+            "import { logo } from './shared.js';\nconsole.log('A', logo);\n",
+        ),
+        (
+            "b.js",
+            "import { logo } from './shared.js';\nconsole.log('B', logo);\n",
+        ),
+        ("c.js", "console.log('C');\n"),
+        (
+            "shared.js",
+            "import logo from './logo.png?url';\nexport { logo };\n",
+        ),
+    ]);
+    std::fs::write(ctx.root.join("logo.png"), PNG).unwrap();
+    let world = RenderWorld::new(&ctx).unwrap();
+    let mut resolver = Resolver::new(&ctx);
+    let outputs = world.compile_bundle(&mut resolver).unwrap();
+    let logos: Vec<String> = keys(&outputs)
+        .into_iter()
+        .filter(|k| k.ends_with(".png"))
+        .collect();
+    assert_eq!(logos.len(), 1, "{:?}", keys(&outputs));
+    for asset in resolver.resolved_assets() {
+        let stem = asset.built.stem.clone().unwrap();
+        let has = asset.built.companions.iter().any(|c| c.path == logos[0]);
+        assert_eq!(has, stem != "c", "{stem}");
+        assert!(
+            !asset.preload.iter().any(|p| p.ends_with(".png")),
+            "?url files aren't preloads"
+        );
+    }
+}
+
+#[test]
+fn inline_is_a_data_url_with_the_files_mime_type() {
+    use base64::Engine as _;
+    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>";
+    let (ctx, _dir) = query_project(
+        "import icon from './icon.svg?inline';\n\
+         import blob from './blob.xyz?inline';\n\
+         console.log(icon, blob);\n",
+        &[("icon.svg", svg), ("blob.xyz", b"\x00\x01")],
+    );
+    let outputs = compile(&ctx).unwrap();
+    let code = entry(&outputs);
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    assert!(
+        code.contains(&format!("data:image/svg+xml;base64,{}", b64(svg))),
+        "{code}"
+    );
+    assert!(
+        code.contains(&format!(
+            "data:application/octet-stream;base64,{}",
+            b64(b"\x00\x01")
+        )),
+        "{code}"
+    );
+    assert_eq!(keys(&outputs).len(), 1, "nothing else emitted");
+}
+
+#[test]
+fn unknown_or_combined_queries_are_errors() {
+    for (import, shown) in [("./x.txt?foo", "`?foo`"), ("./x.txt?raw&url", "`?raw&url`")] {
+        let (ctx, _dir) = query_project(
+            &format!("import x from '{import}';\nconsole.log(x);\n"),
+            &[("x.txt", b"x")],
+        );
+        let err = compile_err(&ctx);
+        assert!(
+            err.contains(&format!("unsupported import query {shown}"))
+                && err.contains("`?raw`, `?url` and `?inline`"),
+            "{import}: {err}"
+        );
+    }
+}
+
+#[test]
+fn queried_files_outside_the_project_fail() {
+    let (ctx, _dir) = project(&[
+        ("content/main.typ", &page("asset.js(\"/main.js\")")),
+        (
+            "main.js",
+            "import x from '../outside.txt?raw';\nconsole.log(x);\n",
+        ),
+        ("../outside.txt", "OUTSIDE_SECRET"),
+    ]);
+    let err = compile_err(&ctx);
+    assert!(err.contains("can't resolve `../outside.txt?raw`"), "{err}");
+    assert!(!err.contains("OUTSIDE_SECRET"));
+}
+
+/// A queried import is its own module: distinct from the plain import of
+/// the same file, and one module for every specifier of the same file with
+/// the same query.
+#[test]
+fn queried_imports_are_distinct_modules_and_dedupe() {
+    let (ctx, _dir) = query_project(
+        "import { v } from './lib/dep.js';\n\
+         import one from './lib/dep.js?raw';\n\
+         import two from './lib/../lib/dep.js?raw';\n\
+         console.log(v, one, two);\n",
+        &[("lib/dep.js", b"export const v = 'DEP' + 'VALUE';\n")],
+    );
+    let code = entry(&outputs_of(&ctx));
+    // The plain import is bundled as code; the raw one as a string, once.
+    assert_eq!(
+        code.matches("export const v = 'DEP' + 'VALUE';").count(),
+        1,
+        "{code}"
+    );
+    assert!(
+        code.contains("\"DEPVALUE\""),
+        "the plain import is code:\n{code}"
+    );
+    // Module ids are root-relative: the output doesn't depend on where the
+    // project is.
+    assert!(
+        !code.contains(&ctx.root.display().to_string()),
+        "absolute path in:\n{code}"
+    );
+}
+
+fn outputs_of(ctx: &TwylaContext) -> Outputs {
+    compile(ctx).unwrap()
+}
+
+#[test]
+fn editing_a_queried_file_revalidates() {
+    let (ctx, _dir) = query_project(
+        "import t from './note.txt?raw';\n\
+         import u from './logo.png?url';\n\
+         import d from './icon.svg?inline';\n\
+         console.log(t, u, d);\n",
+        &[
+            ("note.txt", b"NOTE_ONE"),
+            ("logo.png", PNG),
+            ("icon.svg", b"<svg/>"),
+        ],
+    );
+    let mut session = DevSession::new(&ctx).unwrap();
+    assert!(rebuild_entry(&mut session).unwrap().contains("NOTE_ONE"));
+    for (file, contents) in [
+        ("note.txt", "NOTE_TWO"),
+        ("logo.png", "another png"),
+        ("icon.svg", "<svg><g/></svg>"),
+    ] {
+        edit(&ctx.root, file, contents);
+        let warm = tree(&session.rebuild().result.unwrap());
+        assert_eq!(warm, tree(&compile(&ctx).unwrap()), "after editing {file}");
+    }
+}
+
+#[test]
+fn queries_write_nothing() {
+    let (ctx, _dir) = query_project(
+        "import t from './note.txt?raw';\n\
+         import u from './logo.png?url';\n\
+         import d from './icon.svg?inline';\n\
+         console.log(t, u, d);\n",
+        &[
+            ("note.txt", b"NOTE"),
+            ("logo.png", PNG),
+            ("icon.svg", b"<svg/>"),
+        ],
+    );
+    let listing = |root: &Path| -> Vec<std::path::PathBuf> {
+        let mut all = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path.clone());
+                }
+                all.push(path);
+            }
+        }
+        all.sort();
+        all
+    };
+    let before = listing(&ctx.root);
+    compile(&ctx).unwrap();
+    assert_eq!(listing(&ctx.root), before);
+}
+
+// -- queried imports resolve through the sandbox ---------------------------------
+
+/// A serve rebuild, which must equal a cold build of the project as it is
+/// now (both by output tree).
+fn assert_warm_is_cold(session: &mut DevSession, ctx: &TwylaContext, what: &str) {
+    let warm = session.rebuild().result.map(|o| tree(&o));
+    let cold = compile(ctx).map(|o| tree(&o));
+    match (warm, cold) {
+        (Ok(warm), Ok(cold)) => assert_eq!(warm, cold, "{what}: {:?}", names(&warm)),
+        (Err(warm), Err(_)) => panic!("{what}: both failed: {warm}"),
+        (warm, cold) => panic!(
+            "{what}: warm ok = {}, cold ok = {}",
+            warm.is_ok(),
+            cold.is_ok()
+        ),
+    }
+}
+
+/// Resolving a queried import never reads outside the root: a
+/// `package.json` above the project whose `browser` field would remap the
+/// import is never seen, and every dep the build records is inside the
+/// root, including the resolver's probes for the queried file.
+#[test]
+fn query_resolution_stays_in_the_sandbox() {
+    let (ctx, dir) = query_project(
+        "import t from './note.txt?raw';\nconsole.log(t);\n",
+        &[("note.txt", b"INSIDE_NOTE"), ("evil.txt", b"EVIL_NOTE")],
+    );
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{ "name": "outside", "browser": { "./site/note.txt": "./site/evil.txt" } }"#,
+    )
+    .unwrap();
+    let world = RenderWorld::new(&ctx).unwrap();
+    let mut resolver = Resolver::new(&ctx);
+    let outputs = world.compile_bundle(&mut resolver).unwrap();
+    let code = entry(&outputs);
+    assert!(
+        code.contains("INSIDE_NOTE") && !code.contains("EVIL"),
+        "{code}"
+    );
+    let deps: Vec<_> = resolver.asset_deps().map(|d| d.path.clone()).collect();
+    for dep in &deps {
+        assert!(
+            dep.starts_with(&ctx.root),
+            "dep outside the root: {}",
+            dep.display()
+        );
+    }
+    let note = ctx.root.join("note.txt");
+    assert!(deps.contains(&note), "no dep on note.txt: {deps:?}");
+}
+
+#[test]
+fn creating_a_missing_queried_file_is_noticed() {
+    let (ctx, _dir) = query_project("import t from './note.txt?raw';\nconsole.log(t);\n", &[]);
+    let mut session = DevSession::new(&ctx).unwrap();
+    assert!(session.rebuild().result.is_err());
+    edit(&ctx.root, "note.txt", "NOW_HERE");
+    assert_warm_is_cold(&mut session, &ctx, "after creating note.txt");
+}
+
+/// `?url` through a symlink in the project: named after the link (like
+/// `asset.file`), and retargeting the link (old target untouched) is
+/// noticed.
+#[cfg(unix)]
+#[test]
+fn url_through_a_symlink() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            "#context [URL #asset.js(\"/main.js\", minify: false).url()]\n\n\
+             #context [FILE #asset.file(\"/logo.png\").url()]",
+        ),
+        (
+            "main.js",
+            "import logo from './logo.png?url';\nconsole.log(logo);\n",
+        ),
+        ("one.png", "first png"),
+        ("two.png", "second png"),
+    ]);
+    let link = ctx.root.join("logo.png");
+    std::os::unix::fs::symlink(ctx.root.join("one.png"), &link).unwrap();
+    let outputs = compile(&ctx).unwrap();
+    let pngs: Vec<String> = keys(&outputs)
+        .into_iter()
+        .filter(|k| k.ends_with(".png"))
+        .collect();
+    assert_eq!(pngs.len(), 1, "one name for both: {pngs:?}");
+    assert!(pngs[0].starts_with("assets/logo-"), "{pngs:?}");
+    assert!(entry(&outputs).contains(&format!("/{}", pngs[0])));
+
+    let mut session = DevSession::new(&ctx).unwrap();
+    session.rebuild().result.unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(ctx.root.join("two.png"), &link).unwrap();
+    assert_warm_is_cold(&mut session, &ctx, "after retargeting logo.png");
+}
+
+#[test]
+fn package_exports_changes_reach_queried_imports() {
+    let (ctx, _dir) = query_project(
+        "import t from 'pkg/data?raw';\nconsole.log(t);\n",
+        &[
+            (
+                "node_modules/pkg/package.json",
+                br#"{ "name": "pkg", "exports": { "./data": "./one.txt" } }"#,
+            ),
+            ("node_modules/pkg/one.txt", b"DATA_ONE"),
+            ("node_modules/pkg/two.txt", b"DATA_TWO"),
+        ],
+    );
+    let mut session = DevSession::new(&ctx).unwrap();
+    assert!(rebuild_entry(&mut session).unwrap().contains("DATA_ONE"));
+    edit(
+        &ctx.root,
+        "node_modules/pkg/package.json",
+        r#"{ "name": "pkg", "exports": { "./data": "./two.txt" } }"#,
+    );
+    assert_warm_is_cold(&mut session, &ctx, "after editing exports");
+    assert!(rebuild_entry(&mut session).unwrap().contains("DATA_TWO"));
+}
+
+#[test]
+fn tsconfig_paths_apply_to_queried_imports() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            "#context [URL #asset.js(\"/main.ts\", minify: false).url()]",
+        ),
+        (
+            "main.ts",
+            "import t from '@text/note.txt?raw';\nconsole.log(t);\n",
+        ),
+        (
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "paths": { "@text/*": ["./one/*"] } } }"#,
+        ),
+        ("one/note.txt", "FROM_ONE"),
+        ("two/note.txt", "FROM_TWO"),
+    ]);
+    let mut session = DevSession::new(&ctx).unwrap();
+    assert!(rebuild_entry(&mut session).unwrap().contains("FROM_ONE"));
+    edit(
+        &ctx.root,
+        "tsconfig.json",
+        r#"{ "compilerOptions": { "paths": { "@text/*": ["./two/*"] } } }"#,
+    );
+    assert_warm_is_cold(&mut session, &ctx, "after editing tsconfig");
+    assert!(rebuild_entry(&mut session).unwrap().contains("FROM_TWO"));
+}
+
+// -- the query splitter ------------------------------------------------------------
+
+#[test]
+fn query_specifier_forms() {
+    let ok = |import: &str, files: &[(&str, &[u8])], expect: &str| {
+        let (ctx, _dir) = query_project(
+            &format!("import t from '{import}';\nconsole.log(t);\n"),
+            files,
+        );
+        let code = entry(&compile(&ctx).unwrap());
+        assert!(code.contains(expect), "{import}:\n{code}");
+    };
+    // A `:` inside a file name isn't a scheme.
+    ok("./a:b.txt?raw", &[("a:b.txt", b"COLON_FILE")], "COLON_FILE");
+    // Percent escapes stay literal in relative paths.
+    ok(
+        "./a%20b.txt?raw",
+        &[("a%20b.txt", b"PERCENT_FILE"), ("a b.txt", b"SPACE_FILE")],
+        "PERCENT_FILE",
+    );
+    // A bare package subpath goes through `exports`.
+    ok(
+        "pkg/data?raw",
+        &[
+            (
+                "node_modules/pkg/package.json",
+                br#"{ "name": "pkg", "exports": { "./data": "./real/data.txt" } }"#,
+            ),
+            ("node_modules/pkg/real/data.txt", b"EXPORTED_DATA"),
+        ],
+        "EXPORTED_DATA",
+    );
+    // A leading `#` is a package import, not a fragment.
+    ok(
+        "#internal/x.txt?raw",
+        &[
+            (
+                "package.json",
+                br##"{ "name": "site", "imports": { "#internal/*": "./internal/*" } }"##,
+            ),
+            ("internal/x.txt", b"PACKAGE_IMPORT"),
+        ],
+        "PACKAGE_IMPORT",
+    );
+
+    let err = |import: &str, expect: &str| {
+        let (ctx, _dir) = query_project(
+            &format!("import t from '{import}';\nconsole.log(t);\n"),
+            &[("a.txt", b"A")],
+        );
+        let err = compile_err(&ctx);
+        assert!(err.contains(expect), "{import}: {err}");
+    };
+    err("./a.txt?raw=", "unsupported import query `?raw=`");
+    err("./a.txt?raw=value", "unsupported import query `?raw=value`");
+    err("./a.txt?raw#part", "can't have a `#` fragment");
+    err("./a.txt#part?raw", "can't have a `#` fragment");
+}
+
+#[test]
+fn inline_mime_types_ignore_extension_case() {
+    let (ctx, _dir) = query_project(
+        "import a from './icon.SVG?inline';\nimport b from './note.txt?inline';\n\
+         console.log(a, b);\n",
+        &[("icon.SVG", b"<svg/>"), ("note.txt", b"hi")],
+    );
+    let code = entry(&compile(&ctx).unwrap());
+    assert!(code.contains("\"data:image/svg+xml;base64,"), "{code}");
+    assert!(
+        code.contains("\"data:text/plain;charset=utf-8;base64,aGk=\""),
+        "{code}"
+    );
 }

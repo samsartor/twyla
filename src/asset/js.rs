@@ -67,8 +67,8 @@ use typst::loading::{Encoding, Readable};
 use typst::syntax::VirtualRoot;
 
 use super::{
-    AssetInput, AssetSpec, Built, Companion, OutputReq, decode, decode_empty, emit_or_request,
-    introspect_asset, resolve_or_request, resolve_path, sha256,
+    AssetInput, AssetSpec, Built, Companion, CompanionKind, OutputReq, decode, decode_empty,
+    emit_or_request, introspect_asset, resolve_or_request, resolve_path, sha256,
 };
 use crate::ledger::DepRecorder;
 use crate::project::TwylaContext;
@@ -88,8 +88,36 @@ use crate::render::Emit;
 ///
 /// Every file the bundle reads must be inside the project: imports that
 /// reach outside it (including through a symlink) fail to resolve. Only
-/// JavaScript, TypeScript, JSON and text modules can be imported — not CSS
-/// or images (use the other `asset` types for those).
+/// JavaScript, TypeScript, JSON and text modules can be imported as code.
+/// Any other file can be imported with a query, as in Vite:
+///
+/// - `import shader from "./shader.glsl?raw"`: the file's contents, as a
+///   string (any file, including a `.ts` file, whose source isn't compiled;
+///   it must be valid UTF-8).
+/// - `import logo from "./logo.png?url"`: the file's URL. The file is
+///   emitted exactly as `asset.file` would emit it by default, at the same
+///   URL (always that default fingerprinted name: an `output:` given to an
+///   `asset.file` of the same file doesn't apply), along with every entry
+///   whose code imports it (also when the entry is only inlined with
+///   `.read()`: the URL is absolute, so it works from anywhere). A file
+///   imported by a relative path through a symlink is named after the link,
+///   like `asset.file` names it; one reached through a package or a
+///   `paths` alias is named after the file the link points to.
+/// - `import icon from "./icon.svg?inline"`: the file as a `data:` URL
+///   (`data:image/svg+xml;base64,…`), with its type from its extension.
+///
+/// An import takes exactly one of these queries, and no `#` fragment
+/// (a leading `#`, a package import like `#internal/x.txt?raw`, is fine);
+/// anything else is an error. For TypeScript, declare them once, e.g. in a `queries.d.ts`:
+///
+/// ```ts
+/// declare module "*?raw" { const source: string; export default source; }
+/// declare module "*?url" { const url: string; export default url; }
+/// declare module "*?inline" { const url: string; export default url; }
+/// ```
+///
+/// Stylesheets are better loaded with `asset.sass` (or `asset.file`) and
+/// linked from the page.
 ///
 /// With code splitting (the default for `"esm"`), every `asset.js` in the
 /// site with identical options (all fields but `path`) is bundled together,
@@ -255,7 +283,12 @@ impl JsAsset {
         let Some(asset) = introspect_asset(engine, spec, elem.span(), vec![OutputReq::Read]) else {
             return Ok(decode_empty(encoding));
         };
-        if let Some(chunk) = asset.built.companions.iter().find(|c| c.chunk) {
+        if let Some(chunk) = asset
+            .built
+            .companions
+            .iter()
+            .find(|c| c.kind == CompanionKind::Chunk)
+        {
             return Err(HintedString::new(eco_format!(
                 "this script imports a chunk (`{}`), so it can't be inlined",
                 chunk.path.rsplit('/').next().unwrap_or(&chunk.path)
@@ -594,7 +627,7 @@ pub(crate) fn build_group(
                 .name("twyla-rolldown-build".into())
                 .spawn_scoped(scope, || {
                     runtime().block_on(bundle(
-                        root,
+                        ctx,
                         &paths,
                         options,
                         transform,
@@ -638,7 +671,7 @@ fn entry_built(output: &GroupOutput, entry_file: &str, entry: &Path) -> Built {
         .and_then(|s| s.to_str())
         .map(str::to_owned);
     let entry_bytes = &output.files[entry_file].bytes;
-    let companions = output
+    let mut companions: Vec<Companion> = output
         .reachable(entry_file)
         .into_iter()
         .map(|name| {
@@ -647,10 +680,38 @@ fn entry_built(output: &GroupOutput, entry_file: &str, entry: &Path) -> Built {
                 path: format!("assets/{name}"),
                 sha256: sha256(&file.bytes),
                 emit: Emit::Bytes(file.bytes.clone()),
-                chunk: matches!(file.kind, FileKind::Chunk { .. }),
+                kind: match file.kind {
+                    FileKind::Chunk { .. } => CompanionKind::Chunk,
+                    FileKind::SourceMap => CompanionKind::SourceMap,
+                },
             }
         })
         .collect();
+    // The `?url` files of every module in the entry's chunk or a chunk it
+    // reaches (statically or dynamically).
+    let chunks = std::iter::once(entry_file.to_string()).chain(output.walk(entry_file, true));
+    for chunk in chunks {
+        let Some(OutputFile {
+            kind: FileKind::Chunk { urls, .. },
+            ..
+        }) = output.files.get(&chunk)
+        else {
+            continue;
+        };
+        for url in urls {
+            if companions.iter().any(|c| c.path == url.output_path) {
+                continue;
+            }
+            companions.push(Companion {
+                path: url.output_path.clone(),
+                // Like `asset.file`: a copy of the source, fingerprinted by
+                // the hash streamed when the module was loaded.
+                emit: Emit::Copy(url.source.clone()),
+                sha256: url.sha256,
+                kind: CompanionKind::File,
+            });
+        }
+    }
     let preload = output
         .static_imports(entry_file)
         .into_iter()
@@ -700,8 +761,21 @@ enum FileKind {
         dynamic_imports: Vec<String>,
         /// Its sourcemap's file name, when sourcemaps are on.
         map: Option<String>,
+        /// The `?url` files its modules reference, in module order.
+        urls: Vec<UrlFile>,
     },
     SourceMap,
+}
+
+/// A file imported with `?url`: emitted as a companion of every entry that
+/// reaches the chunk containing the importing module.
+#[derive(Clone, Debug)]
+struct UrlFile {
+    /// Its output path, exactly as `asset.file` would name it.
+    output_path: String,
+    /// The file, as the build resolved (and read) it.
+    source: PathBuf,
+    sha256: [u8; 32],
 }
 
 impl GroupOutput {
@@ -789,7 +863,7 @@ fn new_resolver(
 
 /// One rolldown build of `entries`, with the tsconfig-derived `transform`.
 async fn bundle(
-    root: &Path,
+    ctx: &TwylaContext,
     entries: &[PathBuf],
     options: &JsOptions,
     transform: BundlerTransformOptions,
@@ -797,6 +871,7 @@ async fn bundle(
     resolver: Arc<rolldown_resolver::Resolver<SandboxFs>>,
     warnings: &mut Vec<String>,
 ) -> Result<GroupOutput, Vec<String>> {
+    let root = &ctx.root;
     let render = |diag: &BuildDiagnostic| render_diagnostic(root, diag);
     let platform = rolldown::Platform::from(options.platform);
     let input = entries
@@ -867,6 +942,7 @@ async fn bundle(
     };
 
     let refused = Arc::new(Mutex::new(Vec::new()));
+    let urls = Arc::new(Mutex::new(BTreeMap::new()));
     let plugin = TwylaPlugin {
         modules: options
             .modules
@@ -874,7 +950,20 @@ async fn bundle(
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         refused: Arc::clone(&refused),
+        ctx: ctx.clone(),
+        fs: fs.clone(),
+        urls: Arc::clone(&urls),
+        resolver: Arc::clone(&resolver),
     };
+    // `BundleFactory::new` also builds a resolver and a filesystem of its
+    // own, on the OS. `create_bundle_with_fs` keeps them out of the module
+    // loader, but plugin contexts still hold that resolver: `ctx.resolve`
+    // and `ctx.try_get_package_json_or_create` would reach the disk outside
+    // the sandbox. twyla's plugin never calls them (queried imports go
+    // through `resolver` directly), and of rolldown's inner plugins only
+    // `CopyModulePlugin` does, and it's inert without `moduleTypes`.
+    // `AssetModulePlugin` reads with `tokio::fs`, but only modules typed
+    // `asset`, which twyla's `load` refuses first (it runs `Post`).
     let mut factory = BundleFactory::new(BundleFactoryOptions {
         bundler_options,
         plugins: vec![Plugin::new_shared(plugin)],
@@ -932,6 +1021,12 @@ async fn bundle(
                             imports: known(&chunk.imports),
                             dynamic_imports: known(&chunk.dynamic_imports),
                             map: chunk.sourcemap_filename.clone(),
+                            // By the exact module id the plugin loaded it as.
+                            urls: chunk
+                                .module_ids
+                                .iter()
+                                .filter_map(|id| urls.lock().unwrap().get(id.as_str()).cloned())
+                                .collect(),
                         },
                     },
                 );
@@ -1077,7 +1172,7 @@ impl Drop for Absorb<'_> {
 ///
 /// pnpm-style `node_modules` (symlinks into a store outside the project)
 /// are refused by the symlink check; npm/yarn/bun's flat layout works.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct SandboxFs {
     root: PathBuf,
     rec: Arc<DepRecorder>,
@@ -1259,6 +1354,164 @@ struct TwylaPlugin {
     /// Why each refused module was refused. rolldown's diagnostic for a
     /// plugin error drops the error's message, so the build reports these.
     refused: Arc<Mutex<Vec<String>>>,
+    /// For `?url` imports' output paths and URLs.
+    ctx: TwylaContext,
+    /// For `?raw`/`?url`/`?inline` imports' reads, which the plugin does
+    /// itself (confined and recorded like every other read).
+    fs: SandboxFs,
+    /// Every `?url` import loaded, by its module id.
+    urls: Arc<Mutex<BTreeMap<String, UrlFile>>>,
+    /// The bundle's resolver (over `fs`), for queried imports.
+    resolver: Arc<rolldown_resolver::Resolver<SandboxFs>>,
+}
+
+/// An import query: `import x from "./file?raw"`. One explicit match on the
+/// name, here and in [`TwylaPlugin::load_query`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Query {
+    /// The file's contents, as a string.
+    Raw,
+    /// The file's twyla URL; the file is emitted as with `asset.file`.
+    Url,
+    /// The file as a `data:` URL.
+    Inline,
+}
+
+impl Query {
+    fn parse(query: &str) -> Result<Self, String> {
+        match query {
+            "raw" => Ok(Self::Raw),
+            "url" => Ok(Self::Url),
+            "inline" => Ok(Self::Inline),
+            other => Err(format!(
+                "unsupported import query `?{other}`: asset.js supports exactly one of `?raw`, \
+                 `?url` and `?inline`"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Url => "url",
+            Self::Inline => "inline",
+        }
+    }
+}
+
+/// The module id of a queried import: `\0` (rollup's "not a plain file"),
+/// then the query, then the resolved path (relative to the root). Distinct from the plain import of
+/// the same file (no prefix) and from other queries of it; equal for every
+/// specifier that resolves to the same file with the same query.
+const QUERY_ID_PREFIX: &str = "\0twyla-query:";
+
+/// A specifier's path and import query, if it has one. Specifiers that
+/// start with a URL scheme (`https:`, `data:`, `node:`) are left alone; a
+/// `:` later on is just part of a file name.
+fn split_query(specifier: &str) -> Option<(&str, &str)> {
+    let scheme = specifier.split_once(':').is_some_and(|(scheme, _)| {
+        let mut chars = scheme.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    if scheme {
+        return None;
+    }
+    specifier.split_once('?')
+}
+
+impl TwylaPlugin {
+    /// The path a relative `specifier` names (`./logo.png` next to the
+    /// importer), when it's the file the resolver resolved, through a
+    /// symlink. `None` for anything else (a package, an alias, a probed
+    /// extension, a `browser` field remap).
+    fn lexical_target(
+        &self,
+        importer: Option<&str>,
+        specifier: &str,
+        resolved: &Path,
+    ) -> Option<PathBuf> {
+        if !(specifier.starts_with("./") || specifier.starts_with("../")) {
+            return None;
+        }
+        let importer = Path::new(importer?);
+        if !importer.is_absolute() {
+            return None;
+        }
+        let lexical = self.fs.admit(&importer.parent()?.join(specifier)).ok()?;
+        if lexical == resolved {
+            return None;
+        }
+        // Both admitted, so both inside the root.
+        let same = std::fs::canonicalize(&lexical).ok()? == std::fs::canonicalize(resolved).ok()?;
+        same.then_some(lexical)
+    }
+
+    /// Refuse an import: rolldown's diagnostic drops the reason, so it's
+    /// recorded for the build to report.
+    fn refuse(&self, message: String) -> anyhow::Error {
+        self.refused.lock().unwrap().push(message.clone());
+        anyhow::anyhow!(message)
+    }
+
+    /// The JS module a queried import loads as.
+    fn load_query(&self, id: &str, query: Query, path: &Path) -> Result<String, String> {
+        let shown = path
+            .strip_prefix(&self.ctx.root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let read = || {
+            OxcFileSystem::read(&self.fs, path)
+                .map_err(|err| format!("can't read `{shown}?{}`: {err}", query.name()))
+        };
+        let value = match query {
+            Query::Raw => String::from_utf8(read()?).map_err(|_| {
+                format!("`{shown}?raw` isn't valid UTF-8; import it with `?url` or `?inline`")
+            })?,
+            Query::Inline => {
+                // Written straight into the module: a mime type and base64
+                // need no escaping in a JS string.
+                use base64::Engine as _;
+                let bytes = read()?;
+                let mime = crate::serve::mime_for(path).replace(' ', "");
+                let mut code = String::with_capacity(bytes.len() / 3 * 4 + mime.len() + 64);
+                code.push_str("export default \"data:");
+                code.push_str(&mime);
+                code.push_str(";base64,");
+                base64::engine::general_purpose::STANDARD.encode_string(&bytes, &mut code);
+                code.push_str("\";\n");
+                return Ok(code);
+            }
+            Query::Url => {
+                // Streamed, never held in memory, like `asset.file`.
+                let admitted = self
+                    .fs
+                    .admit(path)
+                    .map_err(|err| format!("can't read `{shown}?url`: {err}"))?;
+                let hash = self
+                    .fs
+                    .rec
+                    .open(&admitted)
+                    .and_then(|file| file.finish())
+                    .map_err(|err| format!("can't read `{shown}?url`: {err}"))?;
+                let built = super::file::copied(admitted.clone(), hash);
+                let output_path = self.ctx.default_asset_output(&built);
+                let url = self.ctx.asset_url(&output_path);
+                self.urls.lock().unwrap().insert(
+                    id.to_string(),
+                    UrlFile {
+                        output_path,
+                        source: admitted,
+                        sha256: hash,
+                    },
+                );
+                url
+            }
+        };
+        let json = serde_json::to_string(&value).expect("a string serializes");
+        Ok(format!("export default {json};\n"))
+    }
 }
 
 /// Extensions a real module may have.
@@ -1280,17 +1533,85 @@ impl Plugin for TwylaPlugin {
         _ctx: &PluginContext,
         args: &HookResolveIdArgs<'_>,
     ) -> HookResolveIdReturn {
-        Ok(self
-            .modules
-            .contains_key(args.specifier)
-            .then(|| HookResolveIdOutput {
+        if self.modules.contains_key(args.specifier) {
+            return Ok(Some(HookResolveIdOutput {
                 // The `\0` prefix is the rollup convention for "not a file".
                 id: format!("\0{}", args.specifier).into(),
                 ..Default::default()
-            }))
+            }));
+        }
+        let Some((bare, query)) = split_query(args.specifier) else {
+            return Ok(None);
+        };
+        // A leading `#` is a package import (`#internal/x.txt`); anywhere
+        // else it'd be a fragment, which a queried import has no use for (and
+        // which the resolver would split off the path behind our back).
+        if bare.chars().skip(1).any(|c| c == '#') || query.contains('#') {
+            return Err(self.refuse(format!(
+                "can't import `{}`: an import with a query can't have a `#` fragment",
+                args.specifier
+            )));
+        }
+        let query = Query::parse(query)
+            .map_err(|err| self.refuse(format!("can't import `{}`: {err}", args.specifier)))?;
+        // The path without its query, resolved like any import: by the
+        // bundle's own resolver, through the sandbox (with tsconfig `paths`,
+        // package `exports`, …), and recorded. Not with `ctx.resolve`: that
+        // goes through the resolver rolldown's `BundleFactory` built on the
+        // OS filesystem, outside the sandbox.
+        let resolved = self
+            .resolver
+            .resolve(args.importer.map(Path::new), bare, args.kind, false)
+            .map_err(|err| self.refuse(format!("can't resolve `{}`: {err}", args.specifier)))?;
+        let path = Path::new(resolved.path.as_str());
+        if !path.is_absolute() {
+            return Err(self.refuse(format!(
+                "can't import `{}`: `?{}` needs a file in the project",
+                args.specifier,
+                query.name()
+            )));
+        }
+        // Confined like every other access (the load reads through the
+        // sandbox too); refused here so the error names the import.
+        let Ok(admitted) = self.fs.admit(path) else {
+            return Err(self.refuse(format!(
+                "can't resolve `{}`: it's outside the twyla project root",
+                args.specifier
+            )));
+        };
+        // The resolver follows symlinks to the real file. A relative import
+        // of a link names the file by the link instead, as `asset.file`
+        // does: the same file, under the name the code (and the page) uses.
+        let named = self
+            .lexical_target(args.importer, bare, &admitted)
+            .unwrap_or(admitted);
+        // Root-relative in the id: rolldown prints `\0` ids verbatim (module
+        // comments, sourcemap sources), and the output mustn't depend on
+        // where the project is.
+        let relative = named
+            .strip_prefix(&self.ctx.root)
+            .expect("admitted paths are inside the root")
+            .to_string_lossy();
+        Ok(Some(HookResolveIdOutput {
+            id: format!("{QUERY_ID_PREFIX}{}:{relative}", query.name()).into(),
+            ..Default::default()
+        }))
     }
 
     async fn load(&self, _ctx: SharedLoadPluginContext, args: &HookLoadArgs<'_>) -> HookLoadReturn {
+        if let Some(rest) = args.id.strip_prefix(QUERY_ID_PREFIX)
+            && let Some((name, path)) = rest.split_once(':')
+        {
+            let query = Query::parse(name).map_err(|err| self.refuse(err))?;
+            let code = self
+                .load_query(args.id, query, &self.ctx.root.join(path))
+                .map_err(|err| self.refuse(err))?;
+            return Ok(Some(HookLoadOutput {
+                code: ArcStr::from(code),
+                module_type: Some(ModuleType::Js),
+                ..Default::default()
+            }));
+        }
         if let Some(specifier) = args.id.strip_prefix('\0') {
             return Ok(self.modules.get(specifier).map(|json| HookLoadOutput {
                 code: ArcStr::from(json.as_str()),
@@ -1314,10 +1635,10 @@ impl Plugin for TwylaPlugin {
         if as_asset || !MODULE_EXTENSIONS.contains(&ext) {
             let message = format!(
                 "can't import `{file}`: asset.js only bundles JavaScript, TypeScript, JSON and \
-                 text modules (load stylesheets and images with the other `asset` types)"
+                 text modules; import it with `?raw` (its contents as a string), `?url` (its \
+                 URL; the file is emitted) or `?inline` (a `data:` URL)"
             );
-            self.refused.lock().unwrap().push(message.clone());
-            anyhow::bail!(message);
+            return Err(self.refuse(message));
         }
         Ok(None)
     }

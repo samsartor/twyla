@@ -25,7 +25,7 @@ use typst_library::model::{DocumentElem, DocumentInfo, Numbering};
 use typst_library::routines::{Arenas, RealizationKind};
 use typst_utils::Protected;
 
-use crate::asset::{AssetReqIntrospect, ResolvedAsset, hash_spec};
+use crate::asset::{AssetReqIntrospect, Companion, ResolvedAsset, hash_spec};
 use crate::document::{
     DOCUMENTS_LIST_KEY, DocumentAtIntrospect, DocumentOutput, DocumentsArrayIntrospect,
     ResolvedDocument, ResolvedDocumentIntrospect, TwylaDocument, derive_output,
@@ -44,6 +44,9 @@ pub struct CompiledBundle {
     pub bundle: Bundle,
     pub pages: Vec<ResolvedDocument>,
     pub assets: Vec<(String, Arc<ResolvedAsset>)>,
+    /// Companions to emit on their own: see
+    /// [`Resolver::read_only_file_companions`].
+    pub companions: Vec<Companion>,
 }
 
 /// Compile `pages` into a [`Bundle`] *and* harvest each page's twyla
@@ -131,10 +134,12 @@ fn compile_bundle_impl(
     let mut pages: Vec<ResolvedDocument> = files;
     pages.extend(resolver.documents().cloned());
     let assets: Vec<(String, Arc<ResolvedAsset>)> = resolver.emittable_assets().collect();
+    let companions = resolver.read_only_file_companions();
     Ok(CompiledBundle {
         bundle,
         pages,
         assets,
+        companions,
     })
 }
 

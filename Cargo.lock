@@ -5447,6 +5447,7 @@ dependencies = [
  "ansi-to-html",
  "anyhow",
  "arcstr",
+ "base64 0.22.1",
  "clap",
  "comemo",
  "ecow",

@@ -868,19 +868,37 @@ fn serve_static(ctx: &TwylaContext, request_path: &str) -> Response {
     Response::text(404, "not found")
 }
 
-fn mime_for(p: &Path) -> &'static str {
-    match p.extension().and_then(|e| e.to_str()).unwrap_or("") {
+/// The `Content-Type` for a file, by extension: what `serve` sends, and
+/// the mime type of `asset.js` `?inline` data URLs.
+pub(crate) fn mime_for(p: &Path) -> &'static str {
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "application/javascript; charset=utf-8",
-        "json" => "application/json; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
         "xml" => "application/xml; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        "md" => "text/markdown; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
         "svg" => "image/svg+xml",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
+        "avif" => "image/avif",
         "gif" => "image/gif",
+        "bmp" => "image/bmp",
         "ico" => "image/x-icon",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "wasm" => "application/wasm",
         "pdf" => "application/pdf",
         "woff" => "font/woff",
         "woff2" => "font/woff2",

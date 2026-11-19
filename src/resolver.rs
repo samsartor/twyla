@@ -41,8 +41,8 @@ use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult};
 
 use crate::asset::{
-    AssetReq, AssetSpec, Built, OutputReq, Resolution, ResolvedAsset, file, image, js, raw, sass,
-    svg, typst_doc,
+    AssetReq, AssetSpec, Built, Companion, CompanionKind, OutputReq, Resolution, ResolvedAsset,
+    file, image, js, raw, sass, svg, typst_doc,
 };
 use crate::document::ResolvedDocument;
 use crate::ledger::{self, Dep, DepRecorder, Revalidation};
@@ -255,6 +255,30 @@ impl Resolver {
             }
             paths.into_iter().map(|path| (path, Arc::clone(asset)))
         })
+    }
+
+    /// The [`File`](CompanionKind::File) companions of the assets only ever
+    /// `.read()` (which [`emittable_assets`](Self::emittable_assets) omits):
+    /// an inlined `asset.js` entry still references its `?url` files by
+    /// their absolute URLs, so they're emitted on their own.
+    pub fn read_only_file_companions(&self) -> Vec<Companion> {
+        let mut out = Vec::new();
+        for asset in self.assets.iter() {
+            let read_only = !asset.resolutions.is_empty()
+                && asset
+                    .resolutions
+                    .iter()
+                    .all(|r| matches!(r.policy, OutputReq::Read));
+            if !read_only {
+                continue;
+            }
+            for companion in &asset.built.companions {
+                if companion.kind == CompanionKind::File {
+                    out.push(companion.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Every collected document, in deterministic (`output`-keyed) order (for

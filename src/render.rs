@@ -505,6 +505,7 @@ impl RenderWorld {
             bundle,
             pages,
             assets,
+            companions,
         } = output.map_err(|errors| compile_err(&diag_world, &errors))?;
 
         let mut all = IdHashMap::new();
@@ -544,6 +545,17 @@ impl RenderWorld {
                     },
                 )?;
             }
+        }
+
+        for companion in companions {
+            insert_built(
+                &mut all,
+                Output::Companion {
+                    path: companion.path,
+                    emit: companion.emit,
+                    sha256: companion.sha256,
+                },
+            )?;
         }
 
         for out in scan
