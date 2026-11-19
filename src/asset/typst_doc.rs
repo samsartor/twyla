@@ -303,13 +303,14 @@ pub(crate) fn build(
     warnings.extend(sub_warnings);
     let bytes = result?;
 
-    if format == Format::Html
-        && bytes
-            .windows(super::ASSET_PENDING.len())
-            .any(|window| window == super::ASSET_PENDING.as_bytes())
+    // A pending placeholder must never ship: the subcompile can't resolve
+    // it, so it's an error (in any text format it could appear in).
+    if bytes
+        .windows(super::ASSET_PENDING.len())
+        .any(|window| window == super::ASSET_PENDING.as_bytes())
     {
-        warnings.push(
-            SourceDiagnostic::warning(
+        return Err(eco_vec![
+            SourceDiagnostic::error(
                 span,
                 "a Twyla asset inside this `asset.typst` document could not be resolved",
             )
@@ -318,8 +319,8 @@ pub(crate) fn build(
                  carry Twyla calls into the subcompile, but nested asset requests are not part \
                  of the surrounding site's discovery loop",
             )
-            .with_hint("use an inline `document(..)` when the generated HTML needs Twyla assets"),
-        );
+            .with_hint("use an inline `document(..)` when the generated HTML needs Twyla assets")
+        ]);
     }
 
     let bytes = Bytes::new(bytes);

@@ -1,12 +1,13 @@
 //! `asset.js` end to end: fixtures written by hand into a temp dir (no npm,
 //! no network — packages are fake `node_modules/<pkg>/package.json`s).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::project::TwylaContext;
 use crate::render::{Output, Outputs, RenderWorld};
-use crate::resolver::Resolver;
+use crate::resolver::{Resolver, ResolverStats};
 use crate::session::DevSession;
 
 /// A project at `<tmp>/site` (so `<tmp>` is a writable "outside"), with
@@ -281,16 +282,16 @@ fn dynamic_imports_become_companion_chunks_and_static_ones_preload() {
     }
 }
 
-/// Two entries in separate builds that load the same module dynamically
-/// both carry the same chunk (same name, same bytes): it's emitted once,
-/// not a conflict.
+/// Two entries in separate builds (different `define`s, so different
+/// groups) that load the same module dynamically both carry the same chunk
+/// (same name, same bytes): it's emitted once, not a conflict.
 #[test]
 fn identical_chunks_from_two_entries_dedupe() {
     let (ctx, _dir) = project(&[
         (
             "content/main.typ",
-            "#context [#asset.js(\"/a.js\", minify: false).url() \
-             #asset.js(\"/b.js\", minify: false).url()]",
+            "#context [#asset.js(\"/a.js\", minify: false, define: (X: 1)).url() \
+             #asset.js(\"/b.js\", minify: false, define: (X: 2)).url()]",
         ),
         ("a.js", "export const go = () => import('./lazy.js');\n"),
         ("b.js", "export const run = () => import('./lazy.js');\n"),
@@ -976,4 +977,545 @@ fn fixing_an_escaping_symlink_revalidates() {
     std::fs::remove_file(&link).unwrap();
     std::os::unix::fs::symlink(ctx.root.join("a.js"), &link).unwrap();
     assert!(rebuild_entry(&mut session).unwrap().contains("INSIDE"));
+}
+
+// -- groups: one rolldown build per compile -----------------------------------
+
+const A_JS: &str = "import { shared } from './shared.js';\nconsole.log('A', shared);\n";
+const B_JS: &str = "import { shared } from './shared.js';\nconsole.log('B', shared);\n";
+const SHARED_JS: &str = "export const shared = 'SHARED_V1';\n";
+
+/// Two pages, each with an `asset.js` entry; both entries import
+/// `shared.js`. `a_page`/`b_page` are the pages' sources.
+fn group_project(a_page: &str, b_page: &str) -> (TwylaContext, tempfile::TempDir) {
+    project(&[
+        ("content/a.typ", a_page),
+        ("content/b.typ", b_page),
+        ("a.js", A_JS),
+        ("b.js", B_JS),
+        ("shared.js", SHARED_JS),
+    ])
+}
+
+fn a_page() -> String {
+    page("asset.js(\"/a.js\", minify: false)")
+}
+
+fn b_page() -> String {
+    page("asset.js(\"/b.js\", minify: false)")
+}
+
+/// A cold build, with the resolver's counters.
+fn compile_stats(ctx: &TwylaContext) -> (Result<Outputs, String>, ResolverStats) {
+    let world = RenderWorld::new(ctx).unwrap();
+    let mut resolver = Resolver::new(ctx);
+    let result = world
+        .compile_bundle(&mut resolver)
+        .map_err(|e| e.to_string());
+    (result, resolver.stats)
+}
+
+/// The page whose output path starts with `prefix` (`a` for `content/a.typ`).
+fn doc_html(outputs: &Outputs, prefix: &str) -> String {
+    let docs: Vec<_> = outputs
+        .docs()
+        .filter(|d| d.output_path.starts_with(prefix))
+        .collect();
+    assert_eq!(docs.len(), 1, "one page at {prefix}*");
+    docs[0].html.clone()
+}
+
+/// The whole output directory, as written by `twyla build`: relative path →
+/// bytes.
+fn tree(outputs: &Outputs) -> BTreeMap<String, Vec<u8>> {
+    fn walk(dir: &Path, base: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else {
+                let rel = path.strip_prefix(base).unwrap().display().to_string();
+                out.insert(rel, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    outputs.emit_to_fs(dir.path()).unwrap();
+    let mut out = BTreeMap::new();
+    walk(dir.path(), dir.path(), &mut out);
+    out
+}
+
+/// `tree`'s file names, for assertion messages.
+fn names(tree: &BTreeMap<String, Vec<u8>>) -> Vec<&String> {
+    tree.keys().collect()
+}
+
+#[test]
+fn entries_on_two_pages_share_one_build() {
+    let (ctx, _dir) = group_project(&a_page(), &b_page());
+    let (outputs, stats) = compile_stats(&ctx);
+    let outputs = outputs.unwrap();
+    assert_eq!(stats.rolldown_builds, 1, "one rolldown build: {stats:?}");
+    assert_eq!(stats.builds, 1);
+
+    let all = keys(&outputs);
+    assert_eq!(all.len(), 3, "a + b + one shared chunk, got {all:?}");
+    let shared = key(&outputs, "assets/shared-");
+    let a = text(&outputs, &key(&outputs, "assets/a-"));
+    let b = text(&outputs, &key(&outputs, "assets/b-"));
+    assert!(!a.contains("SHARED_V1") && !b.contains("SHARED_V1"));
+    assert!(text(&outputs, &shared).contains("SHARED_V1"));
+    for (prefix, page) in [("a", "assets/a-"), ("b", "assets/b-")] {
+        let html = doc_html(&outputs, prefix);
+        assert!(html.contains(&format!("PRE /{shared}")), "{html}");
+        assert!(html.contains(&format!("URL /{page}")), "{html}");
+    }
+}
+
+/// A page whose `b.js` entry is only requested once `a.js`'s URL is known
+/// (a later fixed-point iteration): it still joins `a.js`'s group.
+const LATE_PAGE: &str = "#let a = asset.js(\"/a.js\", minify: false)\n\
+     #context [#for u in a.preload() [PRE #u\\ ] URL #a.url()]\n\
+     #context if a.url().ends-with(\".js\") [\n\
+       #let b = asset.js(\"/b.js\", minify: false)\n\
+       #for u in b.preload() [PRE #u\\ ] LATE #b.url()\n\
+     ]\n";
+
+#[test]
+fn an_entry_discovered_late_joins_the_group() {
+    let (ctx, _dir) = group_project(LATE_PAGE, "no scripts here");
+    let (outputs, stats) = compile_stats(&ctx);
+    let outputs = outputs.unwrap();
+    // `{a}`, then `{a, b}` once `b` turns up.
+    assert_eq!(stats.rolldown_builds, 2, "{stats:?}");
+
+    let all = keys(&outputs);
+    assert_eq!(all.len(), 3, "a + b + one shared chunk, got {all:?}");
+    let shared = key(&outputs, "assets/shared-");
+    let html = doc_html(&outputs, "a");
+    assert_eq!(
+        html.matches(&format!("PRE /{shared}")).count(),
+        2,
+        "both entries preload the shared chunk:\n{html}"
+    );
+    assert!(html.contains("LATE /assets/b-"), "{html}");
+
+    // The same bundles as when both are found at once.
+    let (eager, _dir) = group_project(&a_page(), &b_page());
+    let assets = |t: BTreeMap<String, Vec<u8>>| -> BTreeMap<String, Vec<u8>> {
+        t.into_iter()
+            .filter(|(k, _)| k.starts_with("assets/"))
+            .collect()
+    };
+    let late = assets(tree(&outputs));
+    let eager = assets(tree(&compile(&eager).unwrap()));
+    assert_eq!(late, eager, "{:?} vs {:?}", names(&late), names(&eager));
+}
+
+/// Declaring the entries in the other order (the pages swapped, so the
+/// first-discovered entry differs) changes nothing in the output but which
+/// page is which.
+#[test]
+fn group_output_does_not_depend_on_discovery_order() {
+    let (one, _d1) = group_project(&a_page(), &b_page());
+    let (two, _d2) = group_project(&b_page(), &a_page());
+    let one = compile(&one).unwrap();
+    let two = compile(&two).unwrap();
+    let page_path = |outputs: &Outputs, prefix: &str| {
+        outputs
+            .docs()
+            .find(|d| d.output_path.starts_with(prefix))
+            .unwrap()
+            .output_path
+            .clone()
+    };
+    let (a_path, b_path) = (page_path(&one, "a"), page_path(&one, "b"));
+    let mut swapped = tree(&two);
+    let a = swapped.remove(&a_path).unwrap();
+    let b = swapped.remove(&b_path).unwrap();
+    swapped.insert(a_path, b);
+    swapped.insert(b_path, a);
+    let one = tree(&one);
+    assert_eq!(one, swapped, "{:?} vs {:?}", names(&one), names(&swapped));
+}
+
+#[test]
+fn serve_rebuilds_a_group_only_when_it_changes() {
+    let (ctx, _dir) = group_project(&a_page(), &b_page());
+    write(&ctx.root, "content/other.typ", "Other page");
+    // Out of the ledger's racy window, so a stamp alone vouches for each
+    // module (a file written moments ago is re-hashed on every check).
+    for f in ["a.js", "b.js", "shared.js"] {
+        std::fs::File::options()
+            .write(true)
+            .open(ctx.root.join(f))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+    }
+    std::thread::sleep(crate::ledger::FINE_RACY_WINDOW + Duration::from_millis(10));
+    let mut session = DevSession::new(&ctx).unwrap();
+    let rebuild = |session: &mut DevSession| session.rebuild().result.unwrap();
+    let cold = |ctx: &TwylaContext| tree(&compile(ctx).unwrap());
+    rebuild(&mut session);
+    assert_eq!(session.resolver.stats.rolldown_builds, 1);
+
+    // An unrelated page: no rolldown build, no module read.
+    let before = session.resolver.stats;
+    edit(&ctx.root, "content/other.typ", "Other page, edited");
+    rebuild(&mut session);
+    assert_eq!(
+        session.resolver.stats.rolldown_builds,
+        before.rolldown_builds
+    );
+    assert_eq!(session.resolver.stats.content_reads, before.content_reads);
+
+    // The shared module: one group rebuild.
+    edit(
+        &ctx.root,
+        "shared.js",
+        "export const shared = 'SHARED_V2';\n",
+    );
+    let outputs = rebuild(&mut session);
+    assert_eq!(
+        session.resolver.stats.rolldown_builds,
+        before.rolldown_builds + 1
+    );
+    assert!(text(&outputs, &key(&outputs, "assets/shared-")).contains("SHARED_V2"));
+    assert_eq!(tree(&outputs), cold(&ctx));
+
+    // `b` drops its entry: the group is rebuilt without it, as a cold
+    // build of the new project would be (no shared chunk for one entry).
+    edit(&ctx.root, "content/b.typ", "no scripts here");
+    let outputs = rebuild(&mut session);
+    let warm = tree(&outputs);
+    assert_eq!(warm, cold(&ctx), "{:?}", names(&warm));
+    assert_eq!(keys(&outputs).len(), 1, "{:?}", keys(&outputs));
+
+    // And back.
+    edit(&ctx.root, "content/b.typ", &b_page());
+    let warm = tree(&rebuild(&mut session));
+    assert_eq!(warm, cold(&ctx), "{:?}", names(&warm));
+    assert_eq!(warm.keys().filter(|k| k.starts_with("assets/")).count(), 3);
+}
+
+/// Different options are different groups; without code splitting
+/// (`split: false`, `iife`) every entry is a group of its own.
+#[test]
+fn groups_follow_options() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            "#context [\n\
+               #asset.js(\"/a.js\", minify: false).url()\n\
+               #asset.js(\"/b.js\", minify: false).url()\n\
+               #asset.js(\"/c.js\", minify: true).url()\n\
+               #asset.js(\"/d.js\", minify: false, split: false).url()\n\
+               #asset.js(\"/e.js\", minify: false, split: false).url()\n\
+               #asset.js(\"/f.js\", minify: false, format: \"iife\").url()\n\
+             ]",
+        ),
+        ("a.js", A_JS),
+        ("b.js", B_JS),
+        ("c.js", A_JS),
+        ("d.js", A_JS),
+        ("e.js", B_JS),
+        ("f.js", B_JS),
+        ("shared.js", SHARED_JS),
+    ]);
+    let (outputs, stats) = compile_stats(&ctx);
+    let outputs = outputs.unwrap();
+    // {a, b}, {c}, {d}, {e}, {f}.
+    assert_eq!(stats.rolldown_builds, 5, "{stats:?}");
+    assert_eq!(stats.builds, 5);
+    // Only {a, b} has a chunk; the groups of one inline `shared.js`.
+    let shared = key(&outputs, "assets/shared-");
+    assert_eq!(keys(&outputs).len(), 7, "{:?}", keys(&outputs));
+    for name in ["c", "d", "e", "f"] {
+        let code = text(&outputs, &key(&outputs, &format!("assets/{name}-")));
+        assert!(code.contains("SHARED_V1"), "{name} doesn't inline shared");
+    }
+    assert!(text(&outputs, &shared).contains("SHARED_V1"));
+}
+
+/// A broken shared module fails the group: each member's error is
+/// reported at its own call site. Fixing it recovers.
+#[test]
+fn a_failed_group_blames_every_member() {
+    let (ctx, _dir) = group_project(&a_page(), &b_page());
+    write(&ctx.root, "shared.js", "export const shared = ;\n");
+    let mut session = DevSession::new(&ctx).unwrap();
+    let Err(err) = session.rebuild().result else {
+        panic!("expected the group to fail");
+    };
+    let err = err.to_string();
+    assert!(err.contains("a.typ") && err.contains("b.typ"), "{err}");
+    assert_eq!(err.matches("asset.js:").count(), 2, "{err}");
+    // Cached: replayed, not rebuilt.
+    let builds = session.resolver.stats.rolldown_builds;
+    assert!(session.rebuild().result.is_err());
+    assert_eq!(session.resolver.stats.rolldown_builds, builds);
+
+    edit(&ctx.root, "shared.js", SHARED_JS);
+    let outputs = session.rebuild().result.unwrap();
+    assert_eq!(keys(&outputs).len(), 3, "{:?}", keys(&outputs));
+}
+
+/// Entries governed by different `tsconfig.json` files are one group, but
+/// can't share a rolldown build (one tsconfig applies to a whole build):
+/// one rolldown build each, each with its own tsconfig.
+#[test]
+fn a_group_splits_its_builds_by_tsconfig() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            "#context [#asset.js(\"/one/main.ts\", minify: false).url() \
+             #asset.js(\"/two/main.ts\", minify: false).url()]",
+        ),
+        (
+            "one/tsconfig.json",
+            r#"{ "compilerOptions": { "paths": { "@v": ["./v-one.ts"] } } }"#,
+        ),
+        ("one/main.ts", "import { v } from '@v';\nconsole.log(v);\n"),
+        ("one/v-one.ts", "export const v = 'FROM_ONE';\n"),
+        (
+            "two/tsconfig.json",
+            r#"{ "compilerOptions": { "paths": { "@v": ["./v-two.ts"] } } }"#,
+        ),
+        ("two/main.ts", "import { v } from '@v';\nconsole.log(v);\n"),
+        ("two/v-two.ts", "export const v = 'FROM_TWO';\n"),
+    ]);
+    let (outputs, stats) = compile_stats(&ctx);
+    let outputs = outputs.unwrap();
+    assert_eq!((stats.builds, stats.rolldown_builds), (1, 2), "{stats:?}");
+    let codes: Vec<String> = keys(&outputs).iter().map(|k| text(&outputs, k)).collect();
+    assert_eq!(codes.len(), 2, "{:?}", keys(&outputs));
+    assert!(codes.iter().any(|c| c.contains("FROM_ONE")));
+    assert!(codes.iter().any(|c| c.contains("FROM_TWO")));
+}
+
+// -- groups follow the live requests ------------------------------------------
+
+/// The emitted `assets/` files of a build: name → bytes.
+fn asset_tree(outputs: &Outputs) -> BTreeMap<String, Vec<u8>> {
+    tree(outputs)
+        .into_iter()
+        .filter(|(k, _)| k.starts_with("assets/"))
+        .collect()
+}
+
+const C_JS: &str = "console.log('C');\n";
+
+/// `c.js` is requested only while `a.js` has no preloads — which holds
+/// exactly while `a` is bundled without `b` (they share `shared.js`). With
+/// `b` found later than `a`, an intermediate pass bundles `a` alone and
+/// requests `c`; once `b` joins, `c` drops out again. The output must be
+/// that of the final live set, `{a, b}`: no `c`, the same bundles as when
+/// `b` is found right away, in any declaration order.
+#[test]
+fn a_member_that_stops_being_requested_leaves_the_group() {
+    const A: &str = "#let a = asset.js(\"/a.js\", minify: false)\n";
+    const C: &str = "#context if a.url().ends-with(\".js\") and a.preload() == () \
+                     [C #asset.js(\"/c.js\", minify: false).url()]\n";
+    const B_NOW: &str = "#context [B #asset.js(\"/b.js\", minify: false).url()]\n";
+    const B_LATER: &str = "#context if a.url().ends-with(\".js\") \
+                           [B #asset.js(\"/b.js\", minify: false).url()]\n";
+    const A_URL: &str = "#context [A #a.url()]\n";
+    let build = |page: String| {
+        let (ctx, _dir) = project(&[
+            ("content/main.typ", &page),
+            ("a.js", A_JS),
+            ("b.js", B_JS),
+            ("c.js", C_JS),
+            ("shared.js", SHARED_JS),
+        ]);
+        let (outputs, stats) = compile_stats(&ctx);
+        let outputs = outputs.unwrap();
+        let html = html(&outputs);
+        assert!(!html.contains("/assets/c-"), "c requested:\n{html}");
+        assert!(!html.contains("__twyla-asset-pending__"), "{html}");
+        (asset_tree(&outputs), stats.rolldown_builds)
+    };
+    let (cold, builds) = build(format!("{A}{A_URL}{B_NOW}{C}"));
+    assert_eq!(cold.len(), 3, "a + b + shared: {:?}", names(&cold));
+    assert_eq!(builds, 1, "c is never requested");
+    for (page, expected_builds) in [
+        // `{a}`, then `{a, b, c}`, then `{a, b}`.
+        (format!("{A}{A_URL}{B_LATER}{C}"), 3),
+        (format!("{A}{C}{B_LATER}{A_URL}"), 3),
+        (format!("{A}{C}{A_URL}{B_NOW}"), 1),
+    ] {
+        let (late, builds) = build(page.clone());
+        assert_eq!(builds, expected_builds, "{page}");
+        assert_eq!(
+            late,
+            cold,
+            "{page}\n{:?} vs {:?}",
+            names(&late),
+            names(&cold)
+        );
+    }
+}
+
+/// An inline document whose body captures `a.url()` and requests `b.js`
+/// (which regroups `a`, changing its URL): the document follows the final
+/// URL instead of conflicting with its own earlier version.
+#[test]
+fn an_inline_document_follows_a_regrouped_url() {
+    let (ctx, _dir) = group_project(
+        "#let a = asset.js(\"/a.js\", minify: false)\n\
+         #context if a.url().ends-with(\".js\") {\n\
+           let u = a.url()\n\
+           document(output: \"widget.html\")[A #u #context asset.js(\"/b.js\", minify: false).url()]\n\
+         }\n",
+        "no scripts here",
+    );
+    let outputs = compile(&ctx).unwrap();
+    let a = key(&outputs, "assets/a-");
+    key(&outputs, "assets/shared-");
+    let widget = doc_html(&outputs, "a/widget");
+    assert!(
+        widget.contains(&format!("A /{a}")),
+        "stale URL ({a}, {:?}):\n{widget}",
+        keys(&outputs)
+    );
+    assert_eq!(outputs.docs().count(), 3, "index, b, widget");
+}
+
+/// The same for any asset: a document capturing a URL that was pending in
+/// an earlier pass.
+#[test]
+fn an_inline_document_capturing_a_pending_url_doesnt_conflict() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            "#context { let u = asset.sass(\"/s.scss\").url(); \
+             document(output: \"w.html\")[URL #u] }",
+        ),
+        ("s.scss", "a { color: red; }"),
+    ]);
+    let outputs = compile(&ctx).unwrap();
+    let w = doc_html(&outputs, "w");
+    assert!(w.contains("URL /assets/s-"), "{w}");
+}
+
+/// A chain that reveals one more entry each pass (each waits for the
+/// previous one's URL) never settles: at the iteration limit that's an
+/// error, not a page shipping a pending URL.
+#[test]
+fn a_group_still_changing_at_the_iteration_limit_is_an_error() {
+    // `if e1 resolved { if e2 resolved { … } }`: each entry is only
+    // requested once the previous one has a URL.
+    let mut body = String::from("[done]");
+    let mut files = vec![("shared.js".to_string(), SHARED_JS.to_string())];
+    for i in (1..=7).rev() {
+        files.push((
+            format!("e{i}.js"),
+            format!("import {{ shared }} from './shared.js';\nconsole.log({i}, shared);\n"),
+        ));
+        body = format!(
+            "if asset.js(\"/e{i}.js\", minify: false).url().ends-with(\".js\") {{ {body} }}"
+        );
+    }
+    files.push((
+        "content/main.typ".to_string(),
+        format!("#context {{ {body} }}"),
+    ));
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let (ctx, _dir) = project(&files);
+    let err = compile_err(&ctx);
+    assert!(err.contains("did not stabilize"), "{err}");
+}
+
+/// An `asset.js` called from inside a package is refused: bundling only
+/// reads the project.
+#[test]
+fn entries_from_packages_are_refused() {
+    let (mut ctx, dir) = project(&[
+        (
+            "content/main.typ",
+            "#import \"@local/p:0.1.0\": app\n\
+             #context [#asset.js(\"/main.js\").url() #app().url()]",
+        ),
+        ("main.js", "console.log('project');\n"),
+        (
+            "../packages/local/p/0.1.0/typst.toml",
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\nentrypoint = \"lib.typ\"\n",
+        ),
+        (
+            "../packages/local/p/0.1.0/lib.typ",
+            "#let app() = asset.js(\"/main.js\")",
+        ),
+        (
+            "../packages/local/p/0.1.0/main.js",
+            "console.log('package');\n",
+        ),
+    ]);
+    ctx.package_dir = Some(dir.path().join("packages"));
+    let err = compile_err(&ctx);
+    assert!(err.contains("not a package file"), "{err}");
+}
+
+/// Failing compiles in a row (here: a broken stylesheet), each with a
+/// different `define`, don't grow the group cache: each attempt keeps only
+/// its own groups and the last successful compile's.
+#[test]
+fn failed_compiles_dont_grow_the_group_cache() {
+    let page = |n: usize| {
+        format!(
+            "#context [#asset.js(\"/a.js\", minify: false, define: (N: {n})).url() \
+             #asset.sass(\"/s.scss\").url()]"
+        )
+    };
+    let (ctx, _dir) = project(&[
+        ("content/main.typ", &page(0)),
+        ("a.js", A_JS),
+        ("shared.js", SHARED_JS),
+        ("s.scss", "a { color: red; }"),
+    ]);
+    let mut session = DevSession::new(&ctx).unwrap();
+    assert!(session.rebuild().result.is_ok());
+    assert_eq!(session.resolver.js_group_count(), 1);
+    edit(&ctx.root, "s.scss", "a { color: ");
+    for n in 1..6 {
+        edit(&ctx.root, "content/main.typ", &page(n));
+        assert!(session.rebuild().result.is_err());
+        assert_eq!(
+            session.resolver.js_group_count(),
+            2,
+            "attempt {n}: its own group and the last good one"
+        );
+    }
+    edit(&ctx.root, "s.scss", "a { color: red; }");
+    assert!(session.rebuild().result.is_ok());
+    assert_eq!(session.resolver.js_group_count(), 1);
+}
+
+/// A failing tsconfig lookup for one entry doesn't keep the others from
+/// being built (and their deps recorded), and every error is reported.
+#[test]
+fn a_tsconfig_error_doesnt_stop_the_other_partitions() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            "#context [#asset.js(\"/one/main.ts\", minify: false).url() \
+             #asset.js(\"/two/main.ts\", minify: false).url()]",
+        ),
+        ("one/tsconfig.json", "{ not json"),
+        ("one/main.ts", "console.log(1);\n"),
+        ("two/tsconfig.json", "{}"),
+        ("two/main.ts", "import { v } from './v';\nconsole.log(v);\n"),
+        ("two/v.ts", "export const v = ;\n"),
+    ]);
+    let (result, stats) = compile_stats(&ctx);
+    let Err(err) = result else {
+        panic!("expected the group to fail");
+    };
+    assert_eq!(stats.rolldown_builds, 1, "two/ still bundled: {stats:?}");
+    assert!(err.contains("tsconfig"), "{err}");
+    assert!(err.contains("v.ts"), "two/'s error missing: {err}");
 }

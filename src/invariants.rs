@@ -123,7 +123,9 @@ fn site_files() -> Files {
         text(
             "#import \"/content/_private.typ\": private-note\n\
              Post #private-note\n\
-             #context link(asset.sass(\"/styles/main.scss\").url())[css]",
+             #context link(asset.sass(\"/styles/main.scss\").url())[css]\n\
+             #context link(asset.js(\"/scripts/post.ts\", sourcemap: true).url())[js]\n\
+             #context link(asset.js(\"/scripts/solo.ts\", split: false).url())[solo]",
         ),
     );
     add("site/content/blog/2024/old.typ", text("Old post"));
@@ -180,6 +182,23 @@ fn site_files() -> Files {
              import { p } from \"pkg\";\n\
              console.log(v, p);\n\
              export const later = () => import(\"./lazy\");\n",
+        ),
+    );
+    // A second entry with the same options, on another page: one group
+    // with `app.ts`, sharing `util/v.ts` as a chunk. And a `split: false`
+    // entry, a group of its own.
+    add(
+        "site/scripts/post.ts",
+        text(
+            "import { v } from \"@util/v\";\n\
+             console.log(\"post\", v);\n",
+        ),
+    );
+    add(
+        "site/scripts/solo.ts",
+        text(
+            "import { v } from \"@util/v\";\n\
+             console.log(\"solo\", v);\n",
         ),
     );
     add(
@@ -301,6 +320,10 @@ fn variants() -> Vec<Variant> {
         v(
             "syntax error in an asset.js module",
             vec![("site/scripts/util/v.ts", Some("export const v = ;"))],
+        ),
+        v(
+            "syntax error in one asset.js entry of a group",
+            vec![("site/scripts/post.ts", Some("console.log(;"))],
         ),
         v(
             "asset.js package export to a missing file",

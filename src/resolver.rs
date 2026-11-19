@@ -19,22 +19,30 @@
 //! discovered (no build), keyed 1:1 by its `output`, and is cheap enough to
 //! re-discover from scratch every compile — so it needs no caching or
 //! revalidation at all. One struct, two maps, shared helpers — not a generic.
+//!
+//! `asset.js` is the one asset type built in *groups*: every `asset.js`
+//! requested in a discovery pass with equal options is bundled together,
+//! so modules they share become shared chunks. The group (its member set,
+//! deps, and outcome) is the cached unit, in `js_groups`; the per-entry
+//! records in `assets`/`failed` are derived from it every pass by
+//! [`prebuild_js_groups`](Resolver::prebuild_js_groups). See there.
 
 // `AssetSpec` keys `failed`; see the note atop `crate::asset`.
 #![allow(clippy::mutable_key_type)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use comemo::Tracked;
-use ecow::{EcoVec, eco_vec};
+use ecow::{EcoVec, eco_format, eco_vec};
 use iddqd::IdHashMap;
 use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult};
 
 use crate::asset::{
-    AssetReq, AssetSpec, OutputReq, Resolution, ResolvedAsset, file, image, js, raw, sass, svg,
-    typst_doc,
+    AssetReq, AssetSpec, Built, OutputReq, Resolution, ResolvedAsset, file, image, js, raw, sass,
+    svg, typst_doc,
 };
 use crate::document::ResolvedDocument;
 use crate::ledger::{self, Dep, DepRecorder, Revalidation};
@@ -59,6 +67,15 @@ pub struct Resolver {
     /// `assets`. Not visible to the introspector: a failed asset aborts the
     /// compile with its error.
     failed: HashMap<AssetSpec, FailedAsset>,
+    /// Every `asset.js` group built, by group and member set (entry ids in
+    /// path order). Persists across compiles like `assets`, revalidated
+    /// against its deps, and pruned after every compile to the member sets
+    /// that compile or the last successful one used
+    /// ([`prune_js_groups`](Self::prune_js_groups)). More than one set per
+    /// group may be cached: a compile can pass through intermediate member
+    /// sets as its fixed-point passes discover (or drop) entries, and the
+    /// next compile goes through them again.
+    js_groups: HashMap<(JsGroupKey, Vec<FileId>), JsGroup>,
     /// Every document discovered so far, keyed by its `output` path.
     documents: IdHashMap<Arc<ResolvedDocument>>,
     /// Warnings of the assets requested since the last drain (e.g. a
@@ -98,13 +115,49 @@ pub struct FailedAsset {
     pub diag_sources: Vec<Source>,
 }
 
+/// Which `asset.js` group a spec belongs to: entries with equal options
+/// share a build, except without code splitting (`split: false`, `iife`),
+/// where each entry is a group of its own (one file per entry).
+///
+/// Entries governed by different `tsconfig.json` files can't share a
+/// rolldown build, but that isn't part of the key: finding an entry's
+/// tsconfig reads the disk, so it happens inside the group's build (whose
+/// deps record it), which runs one rolldown build per tsconfig.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct JsGroupKey {
+    options: js::JsOptions,
+    /// The entry, for a group of one.
+    solo: Option<FileId>,
+}
+
+/// One member of an `asset.js` group in a pass: its path (the build
+/// input), entry, and the span of (the first of) its requests.
+type JsMember = (PathBuf, FileId, Span);
+
+/// A cached `asset.js` group build.
+struct JsGroup {
+    /// Everything the build touched, up to a failure.
+    deps: Vec<Dep>,
+    /// Each member's [`Built`], in member order, or the group's errors.
+    result: Result<Vec<Built>, Vec<String>>,
+    warnings: Vec<String>,
+    /// Whether the compile in progress (or the last one) used it.
+    used: bool,
+    /// Whether the last successful compile used it.
+    kept: bool,
+}
+
 /// How much work the asset pass did over a resolver's lifetime. Lets tests
 /// assert I/O budgets ("editing an unrelated page reads no asset sources")
 /// without a filesystem shim.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ResolverStats {
-    /// Asset builds run (successful or not).
+    /// Asset builds run (successful or not). An `asset.js` group build
+    /// counts as one.
     pub builds: usize,
+    /// rolldown builds run by `asset.js` group builds (normally one per
+    /// group build).
+    pub rolldown_builds: usize,
     /// Files whose contents were read: by builds, and by revalidation
     /// re-hashing a file whose stamp changed.
     pub content_reads: usize,
@@ -118,6 +171,7 @@ impl Resolver {
             ctx: ctx.clone(),
             assets: IdHashMap::new(),
             failed: HashMap::new(),
+            js_groups: HashMap::new(),
             documents: IdHashMap::new(),
             warnings: Vec::new(),
             building: DepRecorder::new(),
@@ -175,6 +229,7 @@ impl Resolver {
             .iter()
             .flat_map(|asset| asset.deps.iter())
             .chain(self.failed.values().flat_map(|failed| failed.deps.iter()))
+            .chain(self.js_groups.values().flat_map(|group| group.deps.iter()))
     }
 
     /// What the asset build in progress has touched so far. Empty unless a
@@ -233,7 +288,200 @@ impl Resolver {
         }
     }
 
+    /// Start a compile's `asset.js` grouping: forget the per-entry records
+    /// derived from the last compile's groups (every pass derives them
+    /// afresh, see [`prebuild_js_groups`](Self::prebuild_js_groups)), and
+    /// mark every cached group unused.
+    pub fn reset_js_groups(&mut self) {
+        self.assets
+            .retain(|asset| !matches!(asset.spec, AssetSpec::Js { .. }));
+        self.failed
+            .retain(|spec, _| !matches!(spec, AssetSpec::Js { .. }));
+        for group in self.js_groups.values_mut() {
+            group.used = false;
+        }
+    }
+
+    /// How many `asset.js` group builds are cached (for tests).
+    #[cfg(test)]
+    pub(crate) fn js_group_count(&self) -> usize {
+        self.js_groups.len()
+    }
+
+    /// Drop every cached `asset.js` group that neither this compile nor the
+    /// last successful one used. Called at the end of every compile,
+    /// `succeeded` or not, so the cache stays bounded however many failed
+    /// attempts serve makes in a row. A failed compile may not have reached
+    /// every group, so it also keeps the last successful compile's (ready
+    /// for when the error is fixed; their deps stay watched).
+    pub fn prune_js_groups(&mut self, succeeded: bool) {
+        for group in self.js_groups.values_mut() {
+            if succeeded {
+                group.kept = group.used;
+            }
+        }
+        self.js_groups.retain(|_, group| group.used || group.kept);
+    }
+
     // -- discovery: build/collect on demand, deduping by key ----------------
+
+    /// Build every `asset.js` group among `reqs`. Called with every request
+    /// of a discovery pass, before any is [resolved](Self::resolve_asset):
+    /// it is what files every `asset.js` spec's record in `assets` (or
+    /// `failed`), which `resolve_asset` only reads.
+    ///
+    /// A group's members are exactly the `asset.js` requests of this pass
+    /// with its key: discovery replays every live request each pass (see
+    /// `discover_requests`), so an entry no longer requested drops out, and
+    /// its record with it. Each group is built for its member set (or taken
+    /// from the cache), sorted by path, so the output depends only on the
+    /// set, never on discovery order. A changed member set changes the
+    /// members' values (shared chunks, hashes), which the fixed-point loop
+    /// iterates on until the sets — and so the values — stop changing.
+    ///
+    /// A failed group fails every member, each blamed at its own request.
+    /// The group's warnings are queued once per pass, at the first member
+    /// (they're about shared modules, not one entry).
+    pub fn prebuild_js_groups<'a>(&mut self, reqs: impl IntoIterator<Item = &'a AssetReq>) {
+        // This pass's members, by group. Keyed by (path, id): the path gives
+        // the build order, and the id keeps distinct entries distinct.
+        type Members = BTreeMap<(PathBuf, u16), (FileId, Span)>;
+        let mut groups: HashMap<JsGroupKey, Members> = HashMap::new();
+        for req in reqs {
+            let AssetSpec::Js { entry, options } = &req.spec else {
+                continue;
+            };
+            let key = JsGroupKey {
+                options: options.clone(),
+                solo: (!options.split).then_some(*entry),
+            };
+            let path = self.ctx.root.join(entry.vpath().get_without_slash());
+            groups
+                .entry(key)
+                .or_default()
+                .entry((path, entry.into_raw().get()))
+                .or_insert((*entry, req.span));
+        }
+
+        // Records of entries no longer requested go.
+        let live: HashSet<AssetSpec> = groups
+            .iter()
+            .flat_map(|(key, members)| {
+                members.values().map(|(entry, _)| AssetSpec::Js {
+                    entry: *entry,
+                    options: key.options.clone(),
+                })
+            })
+            .collect();
+        self.assets.retain(|asset| {
+            !matches!(asset.spec, AssetSpec::Js { .. }) || live.contains(&asset.spec)
+        });
+        self.failed
+            .retain(|spec, _| !matches!(spec, AssetSpec::Js { .. }) || live.contains(spec));
+
+        // In a fixed order, so warnings are queued deterministically.
+        let mut groups: Vec<(JsGroupKey, Vec<JsMember>)> = groups
+            .into_iter()
+            .map(|(key, members)| {
+                let members = members
+                    .into_iter()
+                    .map(|((path, _), (id, span))| (path, id, span))
+                    .collect();
+                (key, members)
+            })
+            .collect();
+        groups.sort_by(|(_, a), (_, b)| {
+            let paths = |m: &Vec<JsMember>| -> Vec<PathBuf> {
+                m.iter().map(|(path, _, _)| path.clone()).collect()
+            };
+            paths(a).cmp(&paths(b))
+        });
+        for (key, members) in groups {
+            self.apply_js_group(key, &members);
+        }
+    }
+
+    /// Build (or find in the cache) `key`'s group for `members`, and
+    /// (re)write every member's record from it.
+    fn apply_js_group(&mut self, key: JsGroupKey, members: &[JsMember]) {
+        let cache_key = (
+            key,
+            members.iter().map(|(_, id, _)| *id).collect::<Vec<_>>(),
+        );
+
+        if !self.js_groups.contains_key(&cache_key) {
+            let paths: Vec<PathBuf> = members.iter().map(|(path, _, _)| path.clone()).collect();
+            let group = js::build_group(&self.ctx, &paths, &cache_key.0.options, &self.building);
+            #[cfg(test)]
+            if std::mem::take(&mut self.inject_build_panic) {
+                panic!("injected asset build panic");
+            }
+            self.stats.builds += 1;
+            self.stats.rolldown_builds += group.rolldown_builds;
+            self.stats.content_reads += self.building.content_reads();
+            let deps = self.building.take();
+            self.js_groups.insert(
+                cache_key.clone(),
+                JsGroup {
+                    deps,
+                    result: group.result,
+                    warnings: group.warnings,
+                    used: false,
+                    kept: false,
+                },
+            );
+        }
+        let group = self.js_groups.get_mut(&cache_key).expect("just built");
+        group.used = true;
+
+        let message = |m: &String| eco_format!("asset.js: {m}");
+        let first_span = members[0].2;
+        self.warnings.extend(
+            group
+                .warnings
+                .iter()
+                .map(|w| SourceDiagnostic::warning(first_span, message(w))),
+        );
+        for (i, (_, entry, span)) in members.iter().enumerate() {
+            let spec = AssetSpec::Js {
+                entry: *entry,
+                options: cache_key.0.options.clone(),
+            };
+            match &group.result {
+                Ok(built) => {
+                    self.failed.remove(&spec);
+                    let mut asset = resolved_asset(&self.ctx, spec, *span, built[i].clone());
+                    if let Some(old) = self.assets.get(&asset.spec) {
+                        if old.built == asset.built {
+                            continue;
+                        }
+                        // Keep the usage this compile's requests recorded
+                        // so far.
+                        asset.outputs = old.outputs.clone();
+                        asset.output_spans = old.output_spans.clone();
+                        asset.resolutions = old.resolutions.clone();
+                    }
+                    self.assets.insert_overwrite(Arc::new(asset));
+                }
+                Err(errors) => {
+                    self.assets.remove(&spec);
+                    let error = |e| SourceDiagnostic::error(*span, message(e));
+                    self.failed.insert(
+                        spec,
+                        FailedAsset {
+                            span: *span,
+                            // The group's, in `js_groups`.
+                            deps: Vec::new(),
+                            // Queued with the group's, above.
+                            warnings: Vec::new(),
+                            errors: errors.iter().map(error).collect(),
+                            diag_sources: Vec::new(),
+                        },
+                    );
+                }
+            }
+        }
+    }
 
     /// Ensure `req`'s spec is built and stored, and record how this request uses
     /// it. The build is a no-op if the spec is already resolved (so repeated
@@ -256,6 +504,14 @@ impl Resolver {
             return Err(failed.errors.iter().map(|e| respan(e, from, to)).collect());
         }
         if !self.assets.contains_key(&req.spec) {
+            // `asset.js` specs are built by `prebuild_js_groups`, never here;
+            // every one of this pass's requests has a record by now.
+            if matches!(req.spec, AssetSpec::Js { .. }) {
+                return Err(eco_vec![SourceDiagnostic::error(
+                    req.span,
+                    "asset.js: internal error: this entry was not built with its group",
+                )]);
+            }
             // The recorder belongs to the resolver, not the build: whatever
             // the build touched before failing (or panicking) is kept.
             let mut warnings = Vec::new();
@@ -476,35 +732,9 @@ impl Resolver {
                 warnings,
                 diag_sources,
             )?,
-            AssetSpec::Js { entry, options } => {
-                js::build(*entry, options, &self.ctx, span, rec, warnings)?
-            }
+            AssetSpec::Js { .. } => unreachable!("built in groups by `prebuild_js_groups`"),
         };
-
-        let output_path = self.ctx.default_asset_output(&built);
-        let url = self.ctx.asset_url(&output_path);
-        let preload = built
-            .preload
-            .iter()
-            .map(|p| self.ctx.asset_url(p))
-            .collect();
-
-        Ok(ResolvedAsset {
-            spec: spec.clone(),
-            span,
-            built,
-            output_path,
-            url,
-            resolutions: Vec::new(),
-            preload,
-            // Filled in by `resolve_asset` from the request(s) that reached it.
-            outputs: Vec::new(),
-            output_spans: Vec::new(),
-            // Filled in by `resolve_asset` from the recorder it owns.
-            deps: Vec::new(),
-            warnings: Vec::new(),
-            diag_sources: Vec::new(),
-        })
+        Ok(resolved_asset(&self.ctx, spec.clone(), span, built))
     }
 
     // -- invalidation -------------------------------------------------------
@@ -518,6 +748,18 @@ impl Resolver {
     /// ([`clear_documents`](Self::clear_documents)).
     pub fn revalidate(&mut self) {
         let mut reads = 0;
+        // An evicted `asset.js` group takes no per-entry records with it:
+        // those are rederived every compile (see `reset_js_groups`).
+        self.js_groups.retain(
+            |_, group| match ledger::revalidate(&group.deps, &mut reads) {
+                Revalidation::Valid => true,
+                Revalidation::Restamped(deps) => {
+                    group.deps = deps;
+                    true
+                }
+                Revalidation::Changed => false,
+            },
+        );
         self.failed.retain(
             |_, failed| match ledger::revalidate(&failed.deps, &mut reads) {
                 Revalidation::Valid => true,
@@ -539,6 +781,30 @@ impl Resolver {
             },
         );
         self.stats.content_reads += reads;
+    }
+}
+
+/// A [`Built`] as a [`ResolvedAsset`]: adds the default output path and URL.
+/// Usage, deps and warnings are left empty for the caller to fill in.
+fn resolved_asset(ctx: &TwylaContext, spec: AssetSpec, span: Span, built: Built) -> ResolvedAsset {
+    let output_path = ctx.default_asset_output(&built);
+    let url = ctx.asset_url(&output_path);
+    let preload = built.preload.iter().map(|p| ctx.asset_url(p)).collect();
+    ResolvedAsset {
+        spec,
+        span,
+        built,
+        output_path,
+        url,
+        resolutions: Vec::new(),
+        preload,
+        // Filled in by `resolve_asset` from the request(s) that reached it.
+        outputs: Vec::new(),
+        output_spans: Vec::new(),
+        // Filled in by the caller from the recorder it owns.
+        deps: Vec::new(),
+        warnings: Vec::new(),
+        diag_sources: Vec::new(),
     }
 }
 

@@ -30,12 +30,12 @@
 //! re-fingerprint them. The hash is rolldown's content hash, so one name
 //! always means the same bytes, and two builds sharing a chunk write it once.
 //!
-//! **Groups.** [`build_group`] bundles N entries that share one
-//! [`JsOptions`] in a single rolldown build: shared modules become shared
-//! chunks. Today each `asset.js` request is built on its own ([`build`], a
-//! group of one); batching every request of a compile with equal options
-//! into one group is a planned follow-up, which is why the build is written
-//! against a list of entries.
+//! **Groups.** Every `asset.js` requested in a compile with equal
+//! [`JsOptions`] is bundled by one [`build_group`] call — one rolldown build
+//! — so modules they share become shared chunks, emitted once. Without code
+//! splitting (`split: false`, `iife`) each entry is a group of its own. The
+//! resolver forms the groups and caches them
+//! ([`Resolver::prebuild_js_groups`](crate::resolver::Resolver::prebuild_js_groups)).
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
@@ -58,13 +58,13 @@ use rolldown_plugin::{
     HookLoadArgs, HookLoadOutput, HookLoadReturn, HookResolveIdArgs, HookResolveIdOutput,
     HookResolveIdReturn, HookUsage, Plugin, PluginContext, SharedLoadPluginContext,
 };
-use typst::diag::{HintedStrResult, HintedString, SourceDiagnostic, SourceResult};
+use typst::diag::{HintedStrResult, HintedString};
 use typst::foundations::{
     Array, Bytes, Cast, Content, Dict, Packed, ShowFn, Smart, Str, StyleChain, Value, cast, elem,
     func, scope,
 };
 use typst::loading::{Encoding, Readable};
-use typst::syntax::{FileId, Span};
+use typst::syntax::VirtualRoot;
 
 use super::{
     AssetInput, AssetSpec, Built, Companion, OutputReq, decode, decode_empty, emit_or_request,
@@ -91,11 +91,17 @@ use crate::render::Emit;
 /// JavaScript, TypeScript, JSON and text modules can be imported — not CSS
 /// or images (use the other `asset` types for those).
 ///
-/// With code splitting (the default for `"esm"`), modules loaded with
-/// dynamic `import()` — and modules shared between them and the entry —
-/// become separate chunk files next to the entry, which are emitted along
-/// with it. Use #link("#asset-js-preload")[`.preload()`] to list the chunks the entry
-/// needs right away:
+/// With code splitting (the default for `"esm"`), every `asset.js` in the
+/// site with identical options (all fields but `path`) is bundled together,
+/// in one build, whichever pages they're on: a module two entries import
+/// becomes one shared chunk, emitted once, so a browser that loaded it for
+/// one page has it cached for the next. (The exception: entries governed
+/// by different `tsconfig.json` files are bundled separately, since one
+/// tsconfig applies to a whole bundle, and share no chunks.) Modules loaded
+/// with dynamic `import()` become chunks too. The chunks are separate files
+/// next to the entry, emitted along with it. Use
+/// #link("#asset-js-preload")[`.preload()`] to list the chunks the entry
+/// needs right away (which includes any it shares with other entries):
 ///
 /// ```typ
 /// #let app = asset.js(
@@ -111,7 +117,9 @@ use crate::render::Emit;
 ///
 /// `.read()` inlines the entry's code (for an inline `<script>`) only when it
 /// has no chunks: an inline script can't resolve their relative URLs. Use
-/// `split: false` to bundle everything into one file first.
+/// `split: false` to bundle everything into one file first (an entry with
+/// code splitting can gain shared chunks when another page adds an entry
+/// that imports the same modules).
 ///
 /// Unlike the other asset types, `asset.js` has no `output` field: rolldown
 /// names the entry and its chunks (`main-<hash>.js`) and the entry imports
@@ -156,10 +164,12 @@ pub struct JsAsset {
     #[default(Format::Esm)]
     pub format: Format,
 
-    /// Code splitting. When on, every dynamic `import()` becomes its own
-    /// chunk file (plus chunks for modules shared between them), emitted
-    /// with the entry. When off, everything — dynamic imports included — is
-    /// inlined into the one entry file. `{auto}` means on for `"esm"` and off
+    /// Code splitting. When on, the entry is bundled together with every
+    /// other `asset.js` with the same options, and every dynamic `import()`
+    /// and every module shared between entries or chunks becomes its own
+    /// chunk file, emitted with the entry. When off, the entry is bundled on
+    /// its own, and everything — dynamic imports included — is inlined into
+    /// the one entry file. `{auto}` means on for `"esm"` and off
     /// for `"iife"`; `split: true` with `format: "iife"` is an error.
     pub split: Smart<bool>,
 
@@ -383,7 +393,20 @@ cast! {
 /// fields.
 fn spec(elem: &Packed<JsAsset>, styles: StyleChain) -> HintedStrResult<AssetSpec> {
     let entry = match &elem.path {
-        AssetInput::Path(path) => resolve_path(path, elem.span())?,
+        AssetInput::Path(path) => {
+            let entry = resolve_path(path, elem.span())?;
+            // Bundling reads only the project (see `SandboxFs`), and the
+            // resolver groups entries by their project path.
+            if !matches!(entry.root(), VirtualRoot::Project) {
+                return Err(HintedString::new(
+                    "asset.js can only bundle a project file, not a package file".into(),
+                )
+                .with_hint(
+                    "call asset.js with a path from the project, not from inside a package",
+                ));
+            }
+            entry
+        }
         AssetInput::Bytes(_) => {
             return Err(HintedString::new("asset.js needs a file path, not bytes".into())
                 .with_hint("imports resolve relative to the entry's location, so it must be a project file"));
@@ -476,33 +499,144 @@ fn json(value: &Value) -> HintedStrResult<EcoString> {
 // Building
 // ---------------------------------------------------------------------------
 
-/// Build one `asset.js` spec: a [group](build_group) of one. The entry's
-/// code is the asset; its chunks and sourcemaps are
-/// [companions](Built::companions); the chunks it statically imports are
-/// [`Built::preload`].
-pub(crate) fn build(
-    entry: FileId,
-    options: &JsOptions,
-    ctx: &TwylaContext,
-    span: Span,
-    rec: &DepRecorder,
-    warnings: &mut Vec<SourceDiagnostic>,
-) -> SourceResult<Built> {
-    let path = ctx.root.join(entry.vpath().get_without_slash());
-    let stem = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned);
-    let group = build_group(&ctx.root, std::slice::from_ref(&path), options, rec);
-    let error = |message: String| SourceDiagnostic::error(span, eco_format!("asset.js: {message}"));
-    warnings.extend(
-        group
-            .warnings
-            .iter()
-            .map(|w| SourceDiagnostic::warning(span, eco_format!("asset.js: {w}"))),
-    );
-    let output = group
-        .result
-        .map_err(|errors| errors.into_iter().map(error).collect::<ecow::EcoVec<_>>())?;
+/// Every `asset.js` entry of one group, built together: each entry's
+/// [`Built`] (in input order), or the errors that failed the whole group.
+/// Warnings are kept on failure too.
+pub(crate) struct GroupBuilt {
+    pub result: Result<Vec<Built>, Vec<String>>,
+    /// Rendered rolldown warnings (`file:line` and a code frame).
+    pub warnings: Vec<String>,
+    /// rolldown builds run: one per `tsconfig.json` governing the entries
+    /// (normally one).
+    pub rolldown_builds: usize,
+}
 
-    let entry_file = &output.entries[0];
+/// Build a group of `asset.js` entries (absolute paths inside `ctx.root`)
+/// that share one set of `options`: one rolldown build, so modules they
+/// share become shared chunks. Every file access is recorded in `rec`,
+/// including when the build fails (or panics).
+///
+/// TypeScript/JSX transform options come from the `tsconfig.json`
+/// governing each entry, found through the sandbox and merged here
+/// (rolldown's own per-file discovery would read it with an unsandboxed
+/// resolver). One tsconfig applies to every module in a rolldown build, so
+/// entries governed by different tsconfig files are split into one rolldown
+/// build per tsconfig: the one exception to "one build per option set", and
+/// modules aren't shared between those builds. The group fails if any of
+/// them does, but every one is attempted, so every entry's deps are
+/// recorded and every error is reported.
+///
+/// Each entry's code is its asset; the chunks and sourcemaps it reaches are
+/// its [companions](Built::companions); the chunks it statically imports
+/// are its [`Built::preload`].
+pub(crate) fn build_group(
+    ctx: &TwylaContext,
+    entries: &[PathBuf],
+    options: &JsOptions,
+    rec: &DepRecorder,
+) -> GroupBuilt {
+    let root = &ctx.root;
+    // rolldown's filesystem must be `Clone + 'static`, so it records into a
+    // recorder of its own, folded into `rec` when this guard drops: on every
+    // return path, and on unwind if rolldown panics.
+    let local = Arc::new(DepRecorder::new());
+    let _absorb = Absorb {
+        into: rec,
+        from: Arc::clone(&local),
+    };
+    let fs = SandboxFs::new(root.to_path_buf(), local);
+    let resolver = new_resolver(root, options, fs.clone());
+    let mut warnings = Vec::new();
+    let mut rolldown_builds = 0;
+    let render = |diag: &BuildDiagnostic| render_diagnostic(root, diag);
+
+    // Partition the entries by governing tsconfig, in entry order. A
+    // lookup error doesn't stop the others: every error is reported, and
+    // every partition that can be built is (so its deps are recorded).
+    let mut errors = Vec::new();
+    let mut partitions: Vec<(Option<Arc<oxc_resolver::TsConfig>>, Vec<usize>)> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let found = match resolver.clone_default_resolver().find_tsconfig(entry) {
+            Ok(found) => found,
+            Err(err) => {
+                errors.push(format!("failed to load tsconfig: {err}"));
+                continue;
+            }
+        };
+        let same = |(t, _): &&mut (Option<Arc<oxc_resolver::TsConfig>>, Vec<usize>)| {
+            t.as_ref().map(|t| &t.path) == found.as_ref().map(|f| &f.path)
+        };
+        match partitions.iter_mut().find(same) {
+            Some((_, members)) => members.push(i),
+            None => partitions.push((found, vec![i])),
+        }
+    }
+
+    let mut built: Vec<Option<Built>> = vec![None; entries.len()];
+    for (tsconfig, members) in partitions {
+        let mut transform = BundlerTransformOptions {
+            target: options.target.as_ref().map(|t| Either::Left(t.to_string())),
+            ..Default::default()
+        };
+        if let Some(found) = &tsconfig {
+            let (merged, merge_warnings) = merge_tsconfig(transform, found, true);
+            transform = merged;
+            warnings.extend(merge_warnings.iter().map(render));
+        }
+        let paths: Vec<PathBuf> = members.iter().map(|&i| entries[i].clone()).collect();
+        rolldown_builds += 1;
+        // Always driven from a thread of our own: `block_on` panics on a
+        // thread that's already inside a tokio runtime, which the compile's
+        // caller may be (an async handler, `#[tokio::test]`). Scoped, so the
+        // build can borrow; a rolldown panic resurfaces here, on join.
+        let output = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("twyla-rolldown-build".into())
+                .spawn_scoped(scope, || {
+                    runtime().block_on(bundle(
+                        root,
+                        &paths,
+                        options,
+                        transform,
+                        fs.clone(),
+                        Arc::clone(&resolver),
+                        &mut warnings,
+                    ))
+                })
+                .expect("failed to spawn the rolldown build thread")
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        match output {
+            Ok(output) => {
+                for (k, &i) in members.iter().enumerate() {
+                    built[i] = Some(entry_built(&output, &output.entries[k], &entries[i]));
+                }
+            }
+            Err(errs) => errors.extend(errs),
+        }
+    }
+    let result = if errors.is_empty() {
+        Ok(built
+            .into_iter()
+            .map(|b| b.expect("every entry built"))
+            .collect())
+    } else {
+        Err(errors)
+    };
+    GroupBuilt {
+        result,
+        warnings,
+        rolldown_builds,
+    }
+}
+
+/// One entry's [`Built`], out of the build that produced its `entry_file`.
+fn entry_built(output: &GroupOutput, entry_file: &str, entry: &Path) -> Built {
+    let stem = entry
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned);
     let entry_bytes = &output.files[entry_file].bytes;
     let companions = output
         .reachable(entry_file)
@@ -522,8 +656,7 @@ pub(crate) fn build(
         .into_iter()
         .map(|name| format!("assets/{name}"))
         .collect();
-
-    Ok(Built {
+    Built {
         sha256: sha256(entry_bytes),
         emit: Emit::Bytes(entry_bytes.clone()),
         ext: Some("js".to_string()),
@@ -533,30 +666,32 @@ pub(crate) fn build(
         output_path: Some(format!("assets/{entry_file}")),
         companions,
         preload,
-    })
+    }
 }
 
-/// The result of one rolldown build. Warnings are kept on failure too.
-pub(crate) struct GroupBuild {
-    pub result: Result<GroupOutput, Vec<String>>,
-    /// Rendered rolldown warnings (`file:line` and a code frame).
-    pub warnings: Vec<String>,
+/// A rolldown diagnostic as text: `file:line` (relative to `root`) and a
+/// code frame.
+fn render_diagnostic(root: &Path, diag: &BuildDiagnostic) -> String {
+    diag.to_diagnostic_with(&DiagnosticOptions {
+        cwd: root.to_path_buf(),
+    })
+    .convert_to_string(false)
 }
 
 /// Every file one rolldown build produced, by rolldown's file name (flat:
 /// `main-Ab12Cd34.js`, `main-Ab12Cd34.js.map`).
-pub(crate) struct GroupOutput {
+struct GroupOutput {
     /// The entry chunk of each input entry, in input order.
-    pub entries: Vec<String>,
-    pub files: BTreeMap<String, OutputFile>,
+    entries: Vec<String>,
+    files: BTreeMap<String, OutputFile>,
 }
 
-pub(crate) struct OutputFile {
-    pub bytes: Bytes,
-    pub kind: FileKind,
+struct OutputFile {
+    bytes: Bytes,
+    kind: FileKind,
 }
 
-pub(crate) enum FileKind {
+enum FileKind {
     Chunk {
         /// Chunks this one imports statically, by file name (externals
         /// excluded).
@@ -628,62 +763,12 @@ impl GroupOutput {
     }
 }
 
-/// Bundle `entries` (absolute paths inside `root`) with one shared set of
-/// `options`, in one rolldown build. Every file access is recorded in `rec`,
-/// including when the build fails (or panics).
-///
-/// TypeScript/JSX transform options come from the `tsconfig.json` governing
-/// the entries, found through the sandbox and merged here (rolldown's own
-/// per-file discovery would read it with an unsandboxed resolver). One
-/// tsconfig applies to every module in the build, so entries governed by
-/// different tsconfig files can't share a build.
-pub(crate) fn build_group(
+/// The module resolver for a group's builds, reading through `fs`.
+fn new_resolver(
     root: &Path,
-    entries: &[PathBuf],
-    options: &JsOptions,
-    rec: &DepRecorder,
-) -> GroupBuild {
-    // rolldown's filesystem must be `Clone + 'static`, so it records into a
-    // recorder of its own, folded into `rec` when this guard drops: on every
-    // return path, and on unwind if rolldown panics.
-    let local = Arc::new(DepRecorder::new());
-    let _absorb = Absorb {
-        into: rec,
-        from: Arc::clone(&local),
-    };
-    let fs = SandboxFs::new(root.to_path_buf(), local);
-    let mut warnings = Vec::new();
-    // Always driven from a thread of our own: `block_on` panics on a thread
-    // that's already inside a tokio runtime, which the compile's caller may
-    // be (an async handler, `#[tokio::test]`). Scoped, so the build can
-    // borrow; a rolldown panic resurfaces here, on join.
-    let result = std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name("twyla-rolldown-build".into())
-            .spawn_scoped(scope, || {
-                runtime().block_on(bundle(root, entries, options, fs, &mut warnings))
-            })
-            .expect("failed to spawn the rolldown build thread")
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    });
-    GroupBuild { result, warnings }
-}
-
-async fn bundle(
-    root: &Path,
-    entries: &[PathBuf],
     options: &JsOptions,
     fs: SandboxFs,
-    warnings: &mut Vec<String>,
-) -> Result<GroupOutput, Vec<String>> {
-    let render = |diag: &BuildDiagnostic| {
-        diag.to_diagnostic_with(&DiagnosticOptions {
-            cwd: root.to_path_buf(),
-        })
-        .convert_to_string(false)
-    };
-    let platform = rolldown::Platform::from(options.platform);
+) -> Arc<rolldown_resolver::Resolver<SandboxFs>> {
     // The resolver's options must agree with the bundler's: rolldown
     // normalizes these for the resolver it builds itself (adding `module` to
     // the conditions for browser/node), but we build ours.
@@ -693,44 +778,27 @@ async fn bundle(
         ..Default::default()
     };
     let tsconfig = TsConfig::Auto(true).with_base(root);
-    let resolver = Arc::new(rolldown_resolver::Resolver::new(
-        fs.clone(),
+    Arc::new(rolldown_resolver::Resolver::new(
+        fs,
         root.to_path_buf(),
-        platform,
+        rolldown::Platform::from(options.platform),
         &tsconfig,
         resolve_options,
-    ));
+    ))
+}
 
-    // The transform's tsconfig, through the sandbox (see the fn docs).
-    let mut transform = BundlerTransformOptions {
-        target: options.target.as_ref().map(|t| Either::Left(t.to_string())),
-        ..Default::default()
-    };
-    let mut governing: Option<PathBuf> = None;
-    for entry in entries {
-        let found = resolver
-            .clone_default_resolver()
-            .find_tsconfig(entry)
-            .map_err(|err| vec![format!("failed to load tsconfig: {err}")])?;
-        let Some(found) = found else { continue };
-        match &governing {
-            Some(path) if *path != found.path => {
-                return Err(vec![format!(
-                    "entries governed by different tsconfig files ({} and {}) can't share a build",
-                    path.display(),
-                    found.path.display()
-                )]);
-            }
-            Some(_) => {}
-            None => {
-                governing = Some(found.path.clone());
-                let (merged, merge_warnings) = merge_tsconfig(transform, &found, true);
-                transform = merged;
-                warnings.extend(merge_warnings.iter().map(render));
-            }
-        }
-    }
-
+/// One rolldown build of `entries`, with the tsconfig-derived `transform`.
+async fn bundle(
+    root: &Path,
+    entries: &[PathBuf],
+    options: &JsOptions,
+    transform: BundlerTransformOptions,
+    fs: SandboxFs,
+    resolver: Arc<rolldown_resolver::Resolver<SandboxFs>>,
+    warnings: &mut Vec<String>,
+) -> Result<GroupOutput, Vec<String>> {
+    let render = |diag: &BuildDiagnostic| render_diagnostic(root, diag);
+    let platform = rolldown::Platform::from(options.platform);
     let input = entries
         .iter()
         .map(|entry| InputItem {
