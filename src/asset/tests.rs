@@ -8,6 +8,7 @@ use super::*;
 use crate::project::TwylaContext;
 use crate::render::{Output, RenderWorld};
 use crate::resolver::Resolver;
+use crate::session::DevSession;
 use typst::syntax::{RootedPath, VirtualPath, VirtualRoot};
 
 fn site(files: &[(&str, &str)]) -> (TwylaContext, tempfile::TempDir) {
@@ -317,7 +318,7 @@ fn image_accepts_inline_bytes() {
     let decoded = ::image::load_from_memory(&asset.built.emit.read().unwrap()).unwrap();
     assert_eq!((decoded.width(), decoded.height()), (20, 10));
     assert!(
-        asset.built.upstream.is_empty(),
+        asset.deps.is_empty(),
         "inline image bytes should not be watched as an asset file"
     );
 }
@@ -388,7 +389,7 @@ fn raw_emits_inline_text_with_an_extension() {
     let asset = &assets[0];
     assert!(asset.output_path.ends_with(".css"));
     assert_eq!(asset.built.emit.read().unwrap().as_slice(), b"a{color:red}");
-    assert!(asset.built.upstream.is_empty());
+    assert!(asset.deps.is_empty());
     assert!(html.contains(&asset.url));
 }
 
@@ -882,7 +883,7 @@ fn separate_compiles_each_resolve() {
 }
 
 /// Editing a sass source and recompiling the *same* (persistent) world must
-/// re-resolve to a new fingerprint — proving mtime revalidation evicts the
+/// re-resolve to a new fingerprint — proving ledger revalidation evicts the
 /// stale entry and the epoch bump lets re-discovery through even when the map
 /// returns to a previously-cached (empty) state.
 #[test]
@@ -894,21 +895,18 @@ fn editing_source_revalidates_to_new_fingerprint() {
         ),
         ("content/main.scss", ".a { color: red; }"),
     ]);
-    let mut world = RenderWorld::new(&ctx).unwrap();
-    // One resolver reused across both compiles — the persistent-store path.
-    let mut resolver = Resolver::new(&ctx);
+    // One session (world + resolver) across both compiles — serve's
+    // persistent-store path.
+    let mut session = DevSession::new(&ctx).unwrap();
 
-    let outputs1 = world.compile_bundle(&mut resolver).unwrap();
+    let outputs1 = session.rebuild().result.unwrap();
     let url1 = outputs1.assets().next().unwrap().output_path.clone();
 
-    // Edit the source (distinct mtime), then recompile the same world the way
-    // `serve` does: reset the FileStore + age comemo.
+    // Edit the source (distinct mtime), then rebuild exactly as `serve` does.
     std::thread::sleep(Duration::from_millis(10));
     std::fs::write(dir.path().join("content/main.scss"), ".a { color: blue; }").unwrap();
-    comemo::evict(0);
-    world.files.reset();
 
-    let outputs2 = world.compile_bundle(&mut resolver).unwrap();
+    let outputs2 = session.rebuild().result.unwrap();
     let html2 = outputs2.docs().next().unwrap().html.clone();
     let url2 = outputs2.assets().next().unwrap().output_path.clone();
 
@@ -923,8 +921,8 @@ fn editing_source_revalidates_to_new_fingerprint() {
 }
 
 /// The document half of the warm path: editing the source of an inline
-/// `#document(..)` and recompiling the *same* resolver (FileStore reset + comemo
-/// aged, exactly as `serve` does) re-discovers it with a *fresh body*. Documents
+/// `#document(..)` and rebuilding the *same* [`DevSession`] (exactly as `serve`
+/// does) re-discovers it with a *fresh body*. Documents
 /// are cleared and rediscovered each compile, so the stale v1 body neither
 /// lingers nor trips the duplicate-output conflict check against v2.
 #[test]
@@ -933,11 +931,10 @@ fn editing_source_revalidates_inline_document() {
         "content/main.typ",
         "before #document(output: \"child/index.html\")[v1-body] after",
     )]);
-    let mut world = RenderWorld::new(&ctx).unwrap();
-    // One resolver across both compiles — the persistent document-store path.
-    let mut resolver = Resolver::new(&ctx);
+    // One session across both compiles — the persistent document-store path.
+    let mut session = DevSession::new(&ctx).unwrap();
 
-    let outputs1 = world.compile_bundle(&mut resolver).unwrap();
+    let outputs1 = session.rebuild().result.unwrap();
     let child1 = outputs1
         .docs()
         .find(|d| d.output_path == "child/index.html")
@@ -949,17 +946,15 @@ fn editing_source_revalidates_inline_document() {
         "first child body missing:\n{child1}"
     );
 
-    // Edit the source (distinct mtime), then recompile the same world like serve.
+    // Edit the source (distinct mtime), then rebuild the same session like serve.
     std::thread::sleep(Duration::from_millis(10));
     std::fs::write(
         dir.path().join("content/main.typ"),
         "before #document(output: \"child/index.html\")[v2-body] after",
     )
     .unwrap();
-    comemo::evict(0);
-    world.files.reset();
 
-    let outputs2 = world.compile_bundle(&mut resolver).unwrap();
+    let outputs2 = session.rebuild().result.unwrap();
     let child2 = outputs2
         .docs()
         .find(|d| d.output_path == "child/index.html")
@@ -1125,7 +1120,7 @@ fn bare_typst_asset_emits_and_vanishes() {
 
 /// Editing a typst asset's source file (or an import) revalidates it to a new
 /// fingerprint on a warm rebuild — proving the sub-compile's file reads are
-/// harvested into `upstream` and drive invalidation, like sass partials.
+/// recorded as ledger deps and drive invalidation, like sass partials.
 #[test]
 fn editing_typst_source_revalidates_to_new_fingerprint() {
     let (ctx, dir) = site(&[
@@ -1135,11 +1130,11 @@ fn editing_typst_source_revalidates_to_new_fingerprint() {
         ),
         ("doc.typ", "= First Version"),
     ]);
-    let mut world = RenderWorld::new(&ctx).unwrap();
-    let mut resolver = Resolver::new(&ctx);
+    let mut session = DevSession::new(&ctx).unwrap();
 
-    let url1 = world
-        .compile_bundle(&mut resolver)
+    let url1 = session
+        .rebuild()
+        .result
         .unwrap()
         .assets()
         .next()
@@ -1149,10 +1144,8 @@ fn editing_typst_source_revalidates_to_new_fingerprint() {
 
     std::thread::sleep(Duration::from_millis(10));
     std::fs::write(dir.path().join("doc.typ"), "= A Different Version").unwrap();
-    comemo::evict(0);
-    world.files.reset();
 
-    let outputs2 = world.compile_bundle(&mut resolver).unwrap();
+    let outputs2 = session.rebuild().result.unwrap();
     let url2 = outputs2.assets().next().unwrap().output_path.clone();
     let html2 = outputs2.docs().next().unwrap().html.clone();
 

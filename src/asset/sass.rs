@@ -1,25 +1,25 @@
 //! `asset.sass` — compile a Sass/SCSS file to fingerprinted CSS via grass.
 //!
-//! grass reads `@use`/`@import` partials through a custom [`RecordingFs`], so
-//! every file the stylesheet pulls in becomes part of the asset's `upstream`
-//! set — that's what makes a partial edit invalidate the compiled CSS (and get
-//! watched). The entry file is read through the tracked World (so it's also a
-//! typst dependency) and added to the set explicitly.
+//! grass does *all* its file I/O — the entry file, every `@use`/`@import`
+//! partial, and every existence probe its import resolution makes — through
+//! [`RecordingFs`], which forwards to the resolver's
+//! [`DepRecorder`](crate::ledger::DepRecorder). So the asset's ledger deps
+//! hold every file the stylesheet pulled in *and* every candidate path it
+//! tried (`_partial.scss`, `partial.sass`, `partial/_index.scss`, …): editing a
+//! partial invalidates the CSS, and creating a file that an import would now
+//! resolve to — or that a broken `@use` was looking for — does too. Recorded
+//! whether or not the compile succeeds.
 
-use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 
 use super::{
-    AssetInput, AssetSource, AssetSpec, Built, OutputReq, Upstream, emit_or_request, resolve_input,
-    sha256,
+    AssetInput, AssetSource, AssetSpec, Built, OutputReq, emit_or_request, resolve_input, sha256,
 };
+use crate::ledger::DepRecorder;
 use crate::project::TwylaContext;
 use crate::render::Emit;
-use comemo::Tracked;
-use ecow::{EcoString, eco_format, eco_vec};
-use typst::World;
+use ecow::{eco_format, eco_vec};
 use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
 use typst::foundations::{
     AutoValue, Bytes, Cast, Packed, ShowFn, StyleChain, cast, elem, func, scope,
@@ -90,34 +90,39 @@ pub const SHOW_RULE: ShowFn<SassAsset> = |elem, engine, styles| {
 };
 
 pub(crate) fn build(
-    _world: Tracked<dyn World + '_>,
     source: &AssetSource,
     format: Format,
     minify: bool,
     ctx: &TwylaContext,
     span: Span,
+    rec: &DepRecorder,
 ) -> SourceResult<Built> {
-    let (entry, stem, syntax, src, load_path) = match source {
+    let style = if minify {
+        grass::OutputStyle::Compressed
+    } else {
+        grass::OutputStyle::Expanded
+    };
+    let fs = RecordingFs { rec };
+    let options = grass::Options::default().style(style).fs(&fs);
+    let sass_err =
+        |e: Box<grass::Error>| eco_vec![SourceDiagnostic::error(span, eco_format!("sass: {e}"))];
+
+    let (stem, css) = match source {
+        // The entry is read by grass itself (`from_path`), through the
+        // recording fs like every import. Relative imports resolve against
+        // the entry's directory; it's also the load path.
         AssetSource::File(file) => {
-            let on_disk = ctx.root.join(file.vpath().get_without_slash());
-            let (on_disk, src) = Upstream::new_read_string(on_disk).map_err(|err| {
-                eco_vec![SourceDiagnostic::error(
-                    span,
-                    EcoString::from(err.to_string())
-                )]
-            })?;
-            let stem = on_disk
-                .path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(str::to_owned);
-            let detected = match on_disk.path.extension().and_then(|e| e.to_str()) {
+            let path = ctx.root.join(file.vpath().get_without_slash());
+            let stem = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned);
+            let detected = match path.extension().and_then(|e| e.to_str()) {
                 Some("sass") => Syntax::Sass,
                 _ => Syntax::Scss,
             };
-            let syntax = format.explicit().unwrap_or(detected).into();
-            let load_path = on_disk.path.parent().map(Path::to_path_buf);
-            (Some(on_disk), stem, syntax, src.to_string(), load_path)
+            let mut options = options.input_syntax(format.explicit().unwrap_or(detected).into());
+            if let Some(parent) = path.parent() {
+                options = options.load_path(parent);
+            }
+            (stem, grass::from_path(&path, &options).map_err(sass_err)?)
         }
         // With no filename there is no extension from which to infer syntax.
         // Imports are rooted at the project root, a stable and unsurprising
@@ -143,39 +148,15 @@ pub(crate) fn build(
                     )]
                 })?
                 .to_owned();
-            (None, None, syntax, src, Some(ctx.root.clone()))
+            let options = options.input_syntax(syntax).load_path(&ctx.root);
+            (None, grass::from_string(src, &options).map_err(sass_err)?)
         }
     };
-
-    let style = if minify {
-        grass::OutputStyle::Compressed
-    } else {
-        grass::OutputStyle::Expanded
-    };
-
-    let fs = RecordingFs::default();
-    let mut options = grass::Options::default()
-        .input_syntax(syntax)
-        .style(style)
-        .fs(&fs);
-    if let Some(parent) = load_path.as_deref() {
-        options = options.load_path(parent);
-    }
-    let css = grass::from_string(src.to_string(), &options)
-        .map_err(|e| eco_vec![SourceDiagnostic::error(span, eco_format!("sass: {e}"))])?;
-
-    // Upstream = the imports grass read + a file-backed entry (not seen by the
-    // recording fs). Inline bytes are content-addressed by the spec.
-    let mut upstream = fs.reads();
-    if let Some(entry) = entry {
-        upstream.push(entry);
-    }
 
     let css = Bytes::new(css.into_bytes());
     Ok(Built {
         sha256: sha256(&css),
         emit: Emit::Bytes(css),
-        upstream,
         ext: Some("css".to_string()),
         stem,
         dimensions: None,
@@ -230,34 +211,26 @@ impl From<Syntax> for grass::InputSyntax {
     }
 }
 
-/// A grass [`Fs`](grass::Fs) that delegates to disk and records every file it
-/// successfully *reads* (not merely probes), capturing the transitive
-/// `@use`/`@import` set. Single-threaded (grass compiles synchronously), so a
-/// `RefCell` is fine.
-#[derive(Debug, Default)]
-struct RecordingFs {
-    reads: RefCell<BTreeSet<Upstream>>,
+/// A grass [`Fs`](grass::Fs) that does every access through a
+/// [`DepRecorder`]: reads (including failed ones, and the entry file) and the
+/// `is_file`/`is_dir` probes of import resolution. `canonicalize` keeps
+/// grass's default (the path as-is), so deps are recorded under the paths
+/// grass actually touched.
+#[derive(Debug)]
+struct RecordingFs<'a> {
+    rec: &'a DepRecorder,
 }
 
-impl RecordingFs {
-    /// The files read so far, as a fresh `Vec`.
-    fn reads(&self) -> Vec<Upstream> {
-        self.reads.borrow().iter().cloned().collect()
-    }
-}
-
-impl grass::Fs for RecordingFs {
+impl grass::Fs for RecordingFs<'_> {
     fn is_dir(&self, path: &Path) -> bool {
-        path.is_dir()
+        self.rec.is_dir(path)
     }
 
     fn is_file(&self, path: &Path) -> bool {
-        path.is_file()
+        self.rec.is_file(path)
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        let (upstream, data) = Upstream::new_read_bytes(path.to_path_buf())?;
-        self.reads.borrow_mut().insert(upstream);
-        Ok(data)
+        self.rec.read(path)
     }
 }

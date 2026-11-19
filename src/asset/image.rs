@@ -21,9 +21,9 @@
 use std::io::Cursor;
 
 use super::{
-    AssetInput, AssetSource, AssetSpec, Built, OutputReq, Upstream, emit_or_request, resolve_input,
-    sha256,
+    AssetInput, AssetSource, AssetSpec, Built, OutputReq, emit_or_request, resolve_input, sha256,
 };
+use crate::ledger::DepRecorder;
 use crate::project::TwylaContext;
 use crate::render::Emit;
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
@@ -290,11 +290,11 @@ impl OutputFormat {
 /// Decode the source image, resize it per `fit`/`filter` (if any dimension is
 /// given), and re-encode it to `format` (or the source format) at `quality`.
 ///
-/// A file-backed source is read from disk (so it joins the asset's `upstream`
-/// set for invalidation/watching) — like [`file::build`](super::file::build),
+/// A file-backed source is read through the recorder (so it joins the asset's
+/// ledger deps for invalidation/watching) — like [`file::build`](super::file::build),
 /// the bytes are an asset input, not a typst dependency of the page. A
-/// bytes-backed source is an inline image typst already loaded (no `upstream`;
-/// the spec is keyed by content). Reports the output's pixel `dimensions` so the
+/// bytes-backed source is an inline image typst already loaded (no deps; the
+/// spec is keyed by content). Reports the output's pixel `dimensions` so the
 /// native rule can emit `<img width height>`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build(
@@ -307,21 +307,21 @@ pub(crate) fn build(
     quality: u8,
     ctx: &TwylaContext,
     span: Span,
+    rec: &DepRecorder,
 ) -> SourceResult<Built> {
     // Read the source bytes from disk (tracking the file) or take the inline
     // bytes directly.
-    let (upstream, stem, bytes) = match source {
+    let (stem, bytes) = match source {
         AssetSource::File(file) => {
             let on_disk = ctx.root.join(file.vpath().get_without_slash());
-            let (up, bytes) = Upstream::new_read_bytes(on_disk).map_err(|err| err_at(span, err))?;
-            let stem = up
-                .path
+            let bytes = rec.read(&on_disk).map_err(|err| err_at(span, err))?;
+            let stem = on_disk
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .map(str::to_owned);
-            (vec![up], stem, bytes)
+            (stem, bytes)
         }
-        AssetSource::Bytes(bytes) => (Vec::new(), None, bytes.to_vec()),
+        AssetSource::Bytes(bytes) => (None, bytes.to_vec()),
     };
 
     // Detect the source format up front: it drives both decoding and the
@@ -348,7 +348,6 @@ pub(crate) fn build(
     Ok(Built {
         sha256: sha256(&bytes),
         emit: Emit::Bytes(bytes),
-        upstream,
         ext: Some(out_format.ext().to_owned()),
         stem,
         dimensions,

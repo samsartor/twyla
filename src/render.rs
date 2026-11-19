@@ -8,15 +8,16 @@
 //! compile once, and drop it.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{fmt, fs, io};
 
 use iddqd::{IdHashItem, IdHashMap, id_upcast};
 
-use typst::diag::{FileError, FileResult, SourceDiagnostic, Warned};
+use typst::diag::{FileError, FileResult, PackageError, PackageResult, SourceDiagnostic, Warned};
 use typst::foundations::{
     Binding, Bytes, Datetime, Dict, Duration, IntoValue, Module, Scope, Value, Version,
 };
+use typst::syntax::package::PackageSpec;
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
@@ -25,16 +26,19 @@ use typst_bundle::{BundleDocument, BundleFile};
 use typst_kit::diagnostics::termcolor::{Buffer, ColorChoice, StandardStream};
 use typst_kit::diagnostics::{self, DiagnosticFormat, DiagnosticWorld};
 use typst_kit::downloader::SystemDownloader;
+use typst_kit::files::FsRoot;
 use typst_kit::files::{FileLoader, FileStore};
 use typst_kit::fonts::FontStore;
-use typst_kit::packages::SystemPackages;
+use typst_kit::packages::{FsPackages, SystemPackages, UniversePackages};
 use typst_library::Feature;
 
 use crate::asset::ResolvedAsset;
 use crate::compile::CompiledBundle;
 use crate::document::ResolvedDocument;
-use crate::project::TwylaContext;
+use crate::ledger::{self, Dep};
+use crate::project::{ContentScan, TwylaContext};
 use crate::resolver::Resolver;
+use crate::watch::Stamp;
 
 /// The `type` attribute marking a raw-HTML carrier `<script>`. The builtin
 /// [`crate::content::raw_html`] produces an element with this type; the
@@ -71,6 +75,10 @@ pub enum RenderErrorKind {
     Compile,
     /// The bundle didn't contain the expected HTML documents.
     Bundle,
+    /// The compile panicked. Caught by the dev server's
+    /// [`DevSession`](crate::session::DevSession) so a twyla bug shows up in
+    /// the browser instead of killing hot reload.
+    Panic,
 }
 
 impl RenderError {
@@ -99,6 +107,15 @@ pub struct OutputDoc {
 }
 
 /// Some data which can be emitted to the output directory.
+///
+/// TODO(on-disk cache): `Copy` re-opens the live source path for `.read()`,
+/// output writing and HTTP serving, but the asset's fingerprint was hashed
+/// from an earlier read. A source replaced in between publishes new bytes
+/// under the old fingerprint (serve can hit this even after a successful
+/// build, while the next rebuild is pending). The planned content-addressed
+/// cache fixes it: builds stream into an immutable snapshot while hashing,
+/// and every consumer reads the snapshot. (`Bytes` residency in the warm
+/// resolver goes away with it too.)
 #[derive(Clone, Debug, PartialEq)]
 pub enum Emit {
     Bytes(Bytes),
@@ -342,8 +359,9 @@ fn emit_warnings(world: &dyn DiagnosticWorld, warnings: &[SourceDiagnostic]) {
 ///
 /// Wraps a [`FileStore`] (which handles source/byte caching, dependency
 /// tracking via slot-access flags, and in-place stale-source reuse on
-/// reset). For `twyla serve`, one instance lives behind a mutex across
-/// requests so the comemo cache survives between compiles. For one-shot
+/// reset). For `twyla serve`, one instance lives in a
+/// [`DevSession`](crate::session::DevSession) so the comemo cache survives
+/// between compiles. For one-shot
 /// CLI commands, we just build one, compile, drop.
 pub struct RenderWorld {
     pub ctx: TwylaContext,
@@ -364,9 +382,7 @@ impl RenderWorld {
     pub fn new(ctx: &TwylaContext) -> Result<Self, RenderError> {
         let ctx = ctx.clone();
 
-        let mut fonts = FontStore::new();
-        fonts.extend(typst_kit::fonts::embedded());
-        fonts.extend(typst_kit::fonts::system());
+        let fonts = load_fonts();
 
         // Static `FileId` allocated to act as the site "main".
         let main_id = FileId::unique(RootedPath::new(
@@ -376,10 +392,8 @@ impl RenderWorld {
 
         let loader = TwylaLoader {
             root: ctx.root.clone(),
-            packages: SystemPackages::new(SystemDownloader::new(concat!(
-                "twyla/",
-                env!("CARGO_PKG_VERSION"),
-            ))),
+            observed: Mutex::new(Vec::new()),
+            packages: system_packages(&ctx),
         };
 
         let mut inputs = Dict::new();
@@ -408,12 +422,14 @@ impl RenderWorld {
         })
     }
 
-    /// Paths that the last compile read from disk. Suitable for
-    /// `typst_kit::watcher::Watcher::update`. Drops the virtual main
-    /// (not a real path).
-    pub fn dependencies(&mut self) -> impl Iterator<Item = PathBuf> + '_ {
-        let (loader, ids) = self.files.dependencies();
-        ids.filter_map(|id| loader.resolve(id).ok())
+    /// Every file load (project or package, successful or not) since the
+    /// last call, as ledger [`Dep`]s stamped at load time. After
+    /// `files.reset()`, every file the next compile depends on — including
+    /// ones comemo answers from cache, which it re-validates by asking for
+    /// the file again — is loaded once more, so calling this after a compile
+    /// yields exactly that compile's typst dependencies.
+    pub fn take_loads(&self) -> Vec<Dep> {
+        std::mem::take(&mut *self.files.loader().observed.lock().unwrap())
     }
 
     /// Compile every routed page in the bundle.
@@ -424,31 +440,52 @@ impl RenderWorld {
     /// would force interior mutability, since `self` is also handed to typst as
     /// `&dyn World` for the duration of the compile.
     pub fn compile_bundle(&self, resolver: &mut Resolver) -> Result<Outputs, RenderError> {
-        // Reads through `FileStore`, so repeated calls hit the comemo
-        // cache. Between compiles, call [`reset`](Self::reset) and
-        // `comemo::evict(..)` to invalidate; for content/ shape changes,
-        // also call [`refresh_main`](Self::refresh_main).
+        self.compile_bundle_with(&self.ctx.scan_content(), resolver)
+    }
 
-        let sources = self.ctx.scan_pages().map_err(setup_err)?;
-        let fileids: Vec<_> = sources
-            .into_iter()
+    /// [`compile_bundle`](Self::compile_bundle) against a [`ContentScan`] the
+    /// caller already took. The dev server scans once and uses the same scan
+    /// for this compile and for its watch set, so a page created mid-compile
+    /// can't be missing from the bundle yet present in what's watched (or vice
+    /// versa).
+    pub fn compile_bundle_with(
+        &self,
+        scan: &ContentScan,
+        resolver: &mut Resolver,
+    ) -> Result<Outputs, RenderError> {
+        // Reads through `FileStore`, so repeated calls hit the comemo
+        // cache. Between compiles, call `files.reset()` and
+        // `comemo::evict(..)` to invalidate.
+
+        if let Some(err) = &scan.error {
+            return Err(setup_err(err.clone()));
+        }
+        let fileids: Vec<_> = scan
+            .pages
+            .iter()
             .map(|path| {
                 FileId::new(RootedPath::new(
                     VirtualRoot::Project,
-                    VirtualPath::virtualize(&self.ctx.root, &path)
+                    VirtualPath::virtualize(&self.ctx.root, path)
                         .expect("all paths should be within the root"),
                 ))
             })
             .collect();
         let Warned { output, warnings } =
             crate::compile::compile_bundle(&self.ctx, self, &fileids, resolver);
-        emit_warnings(self, &warnings);
+        // Diagnostics can point into files only an asset build loaded (an
+        // `asset.typst` sub-document): render those from the build's sources.
+        let diag_world = DiagWorld {
+            world: self,
+            sources: resolver.diag_sources(),
+        };
+        emit_warnings(&diag_world, &warnings);
 
         let CompiledBundle {
             bundle,
             pages,
             assets,
-        } = output.map_err(|errors| compile_err(self, &errors))?;
+        } = output.map_err(|errors| compile_err(&diag_world, &errors))?;
 
         let mut all = IdHashMap::new();
         for (path, file) in bundle.files.iter() {
@@ -456,7 +493,7 @@ impl RenderWorld {
                 BundleFile::Document(BundleDocument::Html(doc)) => doc,
                 _ => continue,
             };
-            let raw = typst_html::html(doc).map_err(|errors| compile_err(self, &errors))?;
+            let raw = typst_html::html(doc).map_err(|errors| compile_err(&diag_world, &errors))?;
             if let Err(err) = all.insert_unique(Output::Doc(OutputDoc {
                 html: resolve_raw_html_placeholders(&raw),
                 output_path: path.get_without_slash().to_owned(),
@@ -480,11 +517,11 @@ impl RenderWorld {
             }
         }
 
-        let static_outputs = match self.ctx.static_outputs() {
-            Ok(s) => s,
-            Err(err) => return Err(plain_err(err, RenderErrorKind::Bundle)),
-        };
-        for out in static_outputs {
+        for out in scan
+            .static_files
+            .iter()
+            .filter_map(|path| self.ctx.static_output(path))
+        {
             if let Err(err) = all.insert_unique(out) {
                 return Err(duplication_error(err).0);
             }
@@ -560,45 +597,202 @@ fn install_sys(global: &mut Scope) {
     global.bind("sys".into(), Binding::detached(sys));
 }
 
-/// FileLoader for [`FileStore`]. Serves the (empty) virtual main from
-/// memory and every other id from the on-disk project root.
-pub struct TwylaLoader {
-    root: PathBuf,
-    /// Serves packages from the  standard data/cache dirs, downloading from
-    /// Typst Universe on a cache miss.
-    packages: SystemPackages,
+/// The embedded fonts, then the system's.
+#[cfg(not(test))]
+fn load_fonts() -> FontStore {
+    let mut fonts = FontStore::new();
+    fonts.extend(typst_kit::fonts::embedded());
+    fonts.extend(typst_kit::fonts::system());
+    fonts
 }
 
-impl TwylaLoader {
-    /// Resolve a file id to its on-disk path. Returns
-    /// [`FileError::NotFound`] for the virtual main (no real path) so
-    /// callers iterating dependencies can `filter_map` it away.
-    /// Package ids resolve through [`SystemPackages`] (data/cache dirs,
-    /// then download from Universe), mirroring the typst CLI.
-    fn resolve(&self, id: FileId) -> FileResult<PathBuf> {
-        let vpath = id.vpath();
-        match id.root() {
-            VirtualRoot::Project => Ok(self.root.join(vpath.get_without_slash())),
-            VirtualRoot::Package(spec) => Ok(self.packages.obtain(spec)?.resolve(vpath)),
+/// Test builds: the same fonts in the same order, but the system scan (and
+/// parsing the embedded fonts) happens once per test process instead of once
+/// per world — it takes seconds in a debug build, and the end-to-end tests
+/// (`crate::invariants`) build hundreds of cold worlds.
+#[cfg(test)]
+fn load_fonts() -> FontStore {
+    use std::sync::OnceLock;
+    use typst::text::FontInfo;
+    use typst_kit::fonts::FontPath;
+    type Cached = (Vec<(Font, FontInfo)>, Vec<(PathBuf, u32, FontInfo)>);
+    static CACHE: OnceLock<Cached> = OnceLock::new();
+    let (embedded, system) = CACHE.get_or_init(|| {
+        let embedded = typst_kit::fonts::embedded().collect();
+        let system = typst_kit::fonts::system()
+            .map(|(font, info)| (font.path, font.index, info))
+            .collect();
+        (embedded, system)
+    });
+    let mut fonts = FontStore::new();
+    fonts.extend(embedded.iter().cloned());
+    fonts.extend(system.iter().map(|(path, index, info)| {
+        let font = FontPath {
+            path: path.clone(),
+            index: *index,
+        };
+        (font, info.clone())
+    }));
+    fonts
+}
+
+/// The package sources every compile of `ctx` uses — the outer world's
+/// loader and each `asset.typst` sub-world alike: local packages from
+/// [`TwylaContext::package_dir`] (or the system data dir), downloads cached in
+/// the system cache dir, fetched from Typst Universe on a miss.
+pub(crate) fn system_packages(ctx: &TwylaContext) -> SystemPackages {
+    let data = match &ctx.package_dir {
+        Some(dir) => Some(FsPackages::new(dir)),
+        None => FsPackages::system_data(),
+    };
+    SystemPackages::from_parts(
+        data,
+        FsPackages::system_cache(),
+        UniversePackages::new(SystemDownloader::new(concat!(
+            "twyla/",
+            env!("CARGO_PKG_VERSION"),
+        ))),
+    )
+}
+
+/// Find `spec`'s root directory, recording the lookup as a ledger probe
+/// through `record`: the local candidate `<data>/<ns>/<name>/<version>`,
+/// whose existence decides the lookup — a missing `@local` package fails
+/// until it's installed there, and a local copy overrides a cached download.
+/// The answer is derived from that same probe, so it can't disagree with the
+/// record. (Downloads land in the cache dir, which only the compile itself
+/// writes, so it isn't recorded.)
+pub(crate) fn locate_package(
+    packages: &SystemPackages,
+    spec: &PackageSpec,
+    record: &mut dyn FnMut(Dep),
+) -> PackageResult<FsRoot> {
+    if let Some(data) = packages.data() {
+        let dir = data
+            .path()
+            .join(format!("{}/{}/{}", spec.namespace, spec.name, spec.version));
+        let (dep, meta) = ledger::observe_probe(&dir);
+        record(dep);
+        if meta.is_some() {
+            return Ok(FsRoot::new(dir));
         }
     }
+    // Not installed locally (as recorded). Go straight to the download cache
+    // and Universe — the same steps as `SystemPackages::obtain` after its own
+    // local lookup, which isn't repeated: a package installed between the
+    // recorded miss and a second lookup would load while the ledger says
+    // `Missing`, and the first watch update would rebuild for nothing.
+    let Some(cache) = packages.cache() else {
+        return Err(PackageError::NotFound(spec.clone()));
+    };
+    if let Some(root) = cache.obtain(spec) {
+        return Ok(root);
+    }
+    if spec.namespace == UniversePackages::NAMESPACE {
+        let mut archive = packages.universe().package(spec)?;
+        cache.store(spec, |tempdir| {
+            archive
+                .unpack(tempdir)
+                .map_err(|err| PackageError::MalformedArchive(Some(ecow::eco_format!("{err}"))))
+        })?;
+        if let Some(root) = cache.obtain(spec) {
+            return Ok(root);
+        }
+    }
+    Err(PackageError::NotFound(spec.clone()))
+}
+
+/// FileLoader for [`FileStore`]: serves project files from the on-disk
+/// project root and package files from the package dirs, recording every
+/// load into the ledger as it happens.
+pub struct TwylaLoader {
+    root: PathBuf,
+    /// Every load since the last [`RenderWorld::take_loads`], stamped (and
+    /// hashed — the file is in memory anyway) at load time, including failed
+    /// ones (so a missing import is polled until it appears). The dev server
+    /// builds the typst part of its watch set from these, instead of
+    /// stat'ing dependencies after the compile (which can't see a file that
+    /// changed in between).
+    observed: Mutex<Vec<Dep>>,
+    /// See [`system_packages`].
+    packages: SystemPackages,
 }
 
 impl FileLoader for TwylaLoader {
     fn load(&self, id: FileId) -> FileResult<Bytes> {
-        // Packages resolve to a (possibly just-downloaded) cache dir and
-        // load through `FsRoot` so the path-escape guard applies; project
-        // files read directly from the resolved on-disk path.
-        if let VirtualRoot::Package(spec) = id.root() {
-            return self.packages.obtain(spec)?.load(id.vpath());
+        let path = match id.root() {
+            VirtualRoot::Project => self.root.join(id.vpath().get_without_slash()),
+            VirtualRoot::Package(spec) => {
+                locate_package(&self.packages, spec, &mut |dep| self.record(dep))?
+                    .resolve(id.vpath())
+            }
+        };
+        let (dep, result) = ledger::observe_read(&path);
+        // `read` on a directory: typst's own loader reports this specially
+        // (`FsRoot::load`); match it. Decided from the recorded observation,
+        // not a second lookup.
+        let is_dir = matches!(dep.stamp, Stamp::Dir { .. } | Stamp::Unreadable);
+        self.record(dep);
+        result.map(Bytes::new).map_err(|err| {
+            if is_dir {
+                FileError::IsDirectory
+            } else {
+                FileError::from_io(err, &path)
+            }
+        })
+    }
+}
+
+impl TwylaLoader {
+    fn record(&self, dep: Dep) {
+        self.observed.lock().unwrap().push(dep);
+    }
+}
+
+/// The world diagnostics are rendered against: the live [`RenderWorld`],
+/// except for the files asset builds loaded themselves
+/// ([`Resolver::diag_sources`]), which are served from the sources captured
+/// by the build. Asking the live world for those would load them into its
+/// persistent `FileStore` just to draw a snippet — and could show different
+/// bytes than the build saw.
+struct DiagWorld<'a> {
+    world: &'a RenderWorld,
+    sources: std::collections::HashMap<FileId, Source>,
+}
+
+impl DiagnosticWorld for DiagWorld<'_> {
+    fn name(&self, id: FileId) -> String {
+        self.world.name(id)
+    }
+}
+
+impl World for DiagWorld<'_> {
+    fn library(&self) -> &LazyHash<Library> {
+        self.world.library()
+    }
+    fn book(&self) -> &LazyHash<FontBook> {
+        self.world.book()
+    }
+    fn main(&self) -> FileId {
+        self.world.main()
+    }
+    fn source(&self, id: FileId) -> FileResult<Source> {
+        match self.sources.get(&id) {
+            Some(source) => Ok(source.clone()),
+            None => self.world.source(id),
         }
-        let path = self.resolve(id)?;
-        std::fs::read(&path)
-            .map(Bytes::new)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => FileError::NotFound(path),
-                _ => FileError::Other(Some(e.to_string().into())),
-            })
+    }
+    fn file(&self, id: FileId) -> FileResult<Bytes> {
+        match self.sources.get(&id) {
+            Some(source) => Ok(Bytes::from_string(source.text().to_owned())),
+            None => self.world.file(id),
+        }
+    }
+    fn font(&self, index: usize) -> Option<Font> {
+        self.world.font(index)
+    }
+    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
+        self.world.today(offset)
     }
 }
 
