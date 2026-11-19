@@ -25,10 +25,28 @@
 //! - **Identity invalidation.** Any create/remove/rename event drops the
 //!   bookkeeping for that path *and everything under it*, so the next
 //!   `update` re-subscribes (and re-checks) whatever now lives there.
-//! - **No spinning, no panics escaping.** A disconnected channel or a backend
-//!   error is returned as `Err`; the caller recreates the watcher. notify's
-//!   inotify backend `unwrap`s its event-loop channel in `watch`, `unwatch`
-//!   and `Drop`, so all three are run under `catch_unwind`.
+//! - **Per-path failures stay per-path.** A path the backend refuses to
+//!   watch (permission denied, vanished mid-call, inotify's watch limit) is
+//!   polled instead, by a [`Probe`] of its existence, permissions and
+//!   identity, and reported once as a warning. Healthy subscriptions are
+//!   kept, so one unreadable directory can't suspend reload for the site.
+//! - **No spinning, no panics escaping.** A disconnected channel, an error
+//!   event, or a backend panic is returned as `Err`; the caller recreates the
+//!   watcher. notify's inotify backend `unwrap`s its event-loop channel in
+//!   `watch`, `unwatch` and `Drop`, so all three are run under
+//!   `catch_unwind`, and after one panic the backend is never called again.
+//!
+//! Known limitations (not handled; see the rev-1b review):
+//! - On Linux, two watched paths that resolve to the same directory (e.g.
+//!   `content/real` and a symlink `content/alias` to it) share one inotify
+//!   watch descriptor in notify 8.2. Unwatching one (say the alias is
+//!   removed) drops the watch for both, while the other stays marked watched
+//!   here, so changes inside it can go unnoticed until something else
+//!   invalidates it.
+//! - On macOS, notify's FSEvents backend stops and restarts its whole stream
+//!   on every `watch`/`unwatch` call, starting "since now". An edit to an
+//!   already-subscribed path landing in that gap is lost: `update` only
+//!   re-checks paths it newly subscribes.
 //!
 //! [`Stamp`] and [`WatchSet`] are plain data keyed by absolute paths (no typst
 //! `FileId`s) so the planned dependency ledger can reuse or extend them.
@@ -60,6 +78,11 @@ pub enum Stamp {
     /// watched for pages/files appearing or disappearing; edits to the files
     /// inside are observed through their own stamps or events.
     Dir { listing: u64 },
+    /// A directory that exists but can't be listed (e.g. permission
+    /// denied). A stable observation, unlike [`Stamp::Unknown`]: an
+    /// unreadable directory that stays unreadable has not changed, and
+    /// treating it as changed would rebuild forever.
+    Unreadable,
     /// The observation can't be trusted (the file may have changed while the
     /// compile was reading it, or a directory listing was cut short). Never
     /// matches, so re-checking it always reports a change.
@@ -82,7 +105,7 @@ impl Stamp {
             return match read_dir_names(path) {
                 Ok(names) => Stamp::dir_listing(names),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Stamp::Missing,
-                Err(_) => Stamp::Unknown,
+                Err(_) => Stamp::Unreadable,
             };
         }
         match meta.modified() {
@@ -101,6 +124,12 @@ impl Stamp {
     /// an edit necessarily has an mtime at or after `started`, so any file
     /// modified since the compile began is recorded as [`Stamp::Unknown`]
     /// (forcing one re-check rebuild) instead.
+    ///
+    /// TODO(revision 2, dependency ledger): this is still sampled *after* the
+    /// compile, so a file deleted (or restored with an old mtime) between the
+    /// read and this call is stamped as the compile never saw it. The ledger
+    /// will record the stamp and a content hash in the loader, at read time,
+    /// and this function goes away.
     pub fn after_read(path: &Path, started: SystemTime) -> Stamp {
         match Stamp::now(path) {
             Stamp::File { mtime, .. } if mtime + MTIME_SLACK >= started => Stamp::Unknown,
@@ -157,14 +186,24 @@ impl WatchSet {
         self.paths.insert(path, stamp);
     }
 
-    /// Add every path of `older` that this set doesn't have, keeping its old
-    /// stamp. Used after a failed rebuild so the watch set never shrinks
+    /// Add every path of `older` that this set doesn't have, stamped as it
+    /// is *now*. Used after a failed rebuild so the watch set never shrinks
     /// because a compile stopped early.
+    ///
+    /// Retained paths get a fresh baseline rather than their old stamp: this
+    /// attempt didn't observe them, so the old stamp says nothing about what
+    /// it saw. Keeping it would also loop forever — e.g. an import deleted
+    /// while `main.typ` is broken before reaching it: the old `File` stamp
+    /// never matches the now-missing path, so the watcher's post-subscribe
+    /// re-check queues a rebuild, which fails the same way and retains the
+    /// same stamp, with no filesystem event involved. Baselined at the
+    /// current state, a retained path only triggers on its next transition.
+    /// Paths this attempt did observe keep their compile observations.
     pub fn keep_from(&mut self, older: &WatchSet) {
-        for (path, stamp) in &older.paths {
-            self.paths
-                .entry(path.clone())
-                .or_insert_with(|| stamp.clone());
+        for path in older.paths.keys() {
+            if !self.paths.contains_key(path) {
+                self.paths.insert(path.clone(), Stamp::now(path));
+            }
         }
     }
 }
@@ -204,16 +243,56 @@ impl Backend for RecommendedWatcher {
     }
 }
 
+/// How a polled path looked: its [`Stamp`] plus, for paths the backend
+/// refused to watch, what can make it watchable again without changing the
+/// stamp — permissions (a `chmod` touches neither mtime nor listing) and
+/// identity (the inode, on unix). Taken when the path starts being polled and
+/// compared on every poll; any difference is reported as a change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    pub stamp: Stamp,
+    pub permissions: Option<fs::Permissions>,
+    pub inode: Option<(u64, u64)>,
+}
+
+impl Probe {
+    pub fn now(path: &Path) -> Probe {
+        let meta = fs::metadata(path).ok();
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            meta.as_ref().map(|m| (m.dev(), m.ino()))
+        };
+        #[cfg(not(unix))]
+        let inode = None;
+        Probe {
+            stamp: Stamp::now(path),
+            permissions: meta.map(|m| m.permissions()),
+            inode,
+        }
+    }
+}
+
 /// Watches a [`WatchSet`]. See the module docs.
 pub struct Watcher<B: Backend = RecommendedWatcher> {
     /// `Option` only so `Drop` can move it into a `catch_unwind`.
     backend: Option<B>,
+    /// Set when a backend call panicked: the backend's internals are in an
+    /// unknown state, so it's never called again (except to drop it, which
+    /// is itself panic-guarded) and every later call fails with this message.
+    dead: Option<String>,
     rx: Receiver<notify::Result<Event>>,
     /// Paths subscribed through `backend`. The bool is the mark for
     /// `update`'s mark-and-sweep.
     watched: HashMap<PathBuf, bool>,
-    /// Paths in the watch set that don't exist, polled by `wait`.
-    missing: BTreeSet<PathBuf>,
+    /// Paths in the watch set without a subscription — missing ones, and ones
+    /// the backend refused — polled by `wait` against how they looked when
+    /// `update` gave up on subscribing them.
+    polled: BTreeMap<PathBuf, Probe>,
+    /// Paths already warned about as unwatchable, so a path that stays
+    /// unwatchable is reported once, not on every `update`. A path leaves
+    /// this set when it's subscribed or leaves the watch set.
+    warned: BTreeSet<PathBuf>,
     /// Changes found by `update`'s re-check; the next `wait` returns them
     /// without blocking.
     pending: ChangedPaths,
@@ -224,8 +303,17 @@ pub struct Watcher<B: Backend = RecommendedWatcher> {
 const BATCH_TIMEOUT: Duration = Duration::from_millis(100);
 /// The longest a batch may run, so a barrage of events can't starve rebuilds.
 const STARVE_TIMEOUT: Duration = Duration::from_millis(500);
-/// How often missing paths are polled (and the poll backend's interval).
+/// How often polled paths are checked (and the poll backend's interval).
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Why a [`Backend`] call failed.
+enum CallError {
+    /// The backend refused this one path (permission denied, not found, out
+    /// of inotify watches, …). The backend itself is fine.
+    Refused(notify::Error),
+    /// The backend panicked, now or earlier: the watcher is unusable.
+    Dead(String),
+}
 
 impl Watcher {
     /// A watcher on the platform's recommended notify backend, watching
@@ -245,22 +333,31 @@ impl<B: Backend> Watcher<B> {
     pub fn with_backend(backend: B, rx: Receiver<notify::Result<Event>>) -> Self {
         Watcher {
             backend: Some(backend),
+            dead: None,
             rx,
             watched: HashMap::new(),
-            missing: BTreeSet::new(),
+            polled: BTreeMap::new(),
+            warned: BTreeSet::new(),
             pending: ChangedPaths::default(),
         }
     }
 
     /// Watch exactly the paths of `set`: subscribe new ones, unsubscribe ones
-    /// no longer listed, poll missing ones. Every path not already subscribed
-    /// is re-checked against its observed [`Stamp`] *after* subscribing, so a
-    /// change in between is reported by the next [`wait`](Self::wait).
-    pub fn update(&mut self, set: &WatchSet) -> Result<(), String> {
+    /// no longer listed, poll missing ones and ones the backend refuses. Every
+    /// path not already subscribed is re-checked against its observed
+    /// [`Stamp`] *after* subscribing, so a change in between is reported by
+    /// the next [`wait`](Self::wait).
+    ///
+    /// Returns one warning per path that newly became unwatchable (it's
+    /// polled instead). `Err` only when the backend itself is unusable (it
+    /// panicked); the watcher should then be replaced.
+    pub fn update(&mut self, set: &WatchSet) -> Result<Vec<String>, String> {
+        let mut warnings = Vec::new();
         for seen in self.watched.values_mut() {
             *seen = false;
         }
-        self.missing.clear();
+        self.polled.clear();
+        self.warned.retain(|p| set.paths.contains_key(p));
 
         for (path, observed) in &set.paths {
             if let Some(seen) = self.watched.get_mut(path) {
@@ -273,15 +370,25 @@ impl<B: Backend> Watcher<B> {
                 match self.backend_call(|b| b.watch(path)) {
                     Ok(()) => {
                         self.watched.insert(path.clone(), true);
+                        self.warned.remove(path);
                     }
-                    // Vanished between `exists` and `watch`: poll it instead.
-                    Err(_) if !path.exists() => {
-                        self.missing.insert(path.clone());
+                    Err(CallError::Dead(e)) => return Err(e),
+                    // Refused (or vanished between `exists` and `watch`):
+                    // poll it from its current state. Healthy subscriptions
+                    // are unaffected.
+                    Err(CallError::Refused(e)) => {
+                        let probe = Probe::now(path);
+                        if probe.stamp != Stamp::Missing && self.warned.insert(path.clone()) {
+                            warnings.push(format!(
+                                "cannot watch {} ({e}); polling it instead",
+                                path.display()
+                            ));
+                        }
+                        self.polled.insert(path.clone(), probe);
                     }
-                    Err(e) => return Err(format!("failed to watch {} ({e})", path.display())),
                 }
             } else {
-                self.missing.insert(path.clone());
+                self.polled.insert(path.clone(), Probe::now(path));
             }
             if !observed.matches_now(path) {
                 self.pending.paths.insert(path.clone());
@@ -296,23 +403,24 @@ impl<B: Backend> Watcher<B> {
             .collect();
         for path in stale {
             self.watched.remove(&path);
-            // Best effort: the backend may already have dropped it.
-            let _ = self.backend_call(|b| b.unwatch(&path));
+            self.unwatch(&path)?;
         }
-        Ok(())
+        Ok(warnings)
     }
 
     /// Block until a watched path changes; return what changed. Returns `Err`
-    /// if the backend reports an error or its channel disconnects — the
-    /// watcher is then unusable and should be replaced.
+    /// if the backend reports an error, panics, or its channel disconnects —
+    /// the watcher is then unusable and should be replaced.
     pub fn wait(&mut self) -> Result<ChangedPaths, String> {
+        if let Some(e) = &self.dead {
+            return Err(e.clone());
+        }
         if !self.pending.is_empty() {
             return Ok(std::mem::take(&mut self.pending));
         }
         loop {
-            // With missing paths to poll, wake up periodically even without
-            // events.
-            let first = if self.missing.is_empty() {
+            // With paths to poll, wake up periodically even without events.
+            let first = if self.polled.is_empty() {
                 Some(self.rx.recv().map_err(|_| disconnected())?)
             } else {
                 match self.rx.recv_timeout(POLL_INTERVAL) {
@@ -334,13 +442,19 @@ impl<B: Backend> Watcher<B> {
                     }
                 }
             }
-            for path in &self.missing {
-                if path.exists() {
-                    changed.paths.insert(path.clone());
-                }
-            }
+            self.poll(&mut changed);
             if !changed.is_empty() {
                 return Ok(changed);
+            }
+        }
+    }
+
+    /// Add every polled path that no longer looks the way it did when
+    /// `update` started polling it.
+    fn poll(&self, changed: &mut ChangedPaths) {
+        for (path, probe) in &self.polled {
+            if Probe::now(path) != *probe {
+                changed.paths.insert(path.clone());
             }
         }
     }
@@ -357,7 +471,7 @@ impl<B: Backend> Watcher<B> {
         // re-checks all of them) and report "everything changed".
         if event.need_rescan() {
             for path in std::mem::take(&mut self.watched).into_keys() {
-                let _ = self.backend_call(|b| b.unwatch(&path));
+                self.unwatch(&path)?;
             }
             changed.unknown = true;
             return Ok(());
@@ -367,7 +481,7 @@ impl<B: Backend> Watcher<B> {
         }
         if changes_identity(&event.kind) {
             for path in &event.paths {
-                self.invalidate(path);
+                self.invalidate(path)?;
             }
         }
         changed.paths.extend(event.paths);
@@ -379,7 +493,7 @@ impl<B: Backend> Watcher<B> {
     /// different inode than the one subscribed (inotify watches inodes, and
     /// drops the watch when its inode is deleted), so the next `update` must
     /// subscribe afresh.
-    fn invalidate(&mut self, path: &Path) {
+    fn invalidate(&mut self, path: &Path) -> Result<(), String> {
         let gone: Vec<PathBuf> = self
             .watched
             .keys()
@@ -388,18 +502,40 @@ impl<B: Backend> Watcher<B> {
             .collect();
         for p in gone {
             self.watched.remove(&p);
-            let _ = self.backend_call(|b| b.unwatch(&p));
+            self.unwatch(&p)?;
+        }
+        Ok(())
+    }
+
+    /// Unsubscribe `path`, best effort: the backend may already have dropped
+    /// the watch (its inode was deleted), so a refusal is ignored. A panic is
+    /// not: the backend is dead and the watcher must be replaced.
+    fn unwatch(&mut self, path: &Path) -> Result<(), String> {
+        match self.backend_call(|b| b.unwatch(path)) {
+            Ok(()) | Err(CallError::Refused(_)) => Ok(()),
+            Err(CallError::Dead(e)) => Err(e),
         }
     }
 
-    /// Run a backend call, turning a panic into an error (see module docs).
-    fn backend_call(&mut self, f: impl FnOnce(&mut B) -> notify::Result<()>) -> Result<(), String> {
+    /// Run a backend call, turning a panic into [`CallError::Dead`] (see
+    /// module docs). After the first panic the backend is never called again.
+    fn backend_call(
+        &mut self,
+        f: impl FnOnce(&mut B) -> notify::Result<()>,
+    ) -> Result<(), CallError> {
+        if let Some(e) = &self.dead {
+            return Err(CallError::Dead(e.clone()));
+        }
         let Some(backend) = self.backend.as_mut() else {
-            return Err("file watcher backend is gone".into());
+            return Err(CallError::Dead("file watcher backend is gone".into()));
         };
         match catch_unwind(AssertUnwindSafe(|| f(backend))) {
-            Ok(result) => result.map_err(|e| e.to_string()),
-            Err(_) => Err("file watcher backend panicked".into()),
+            Ok(result) => result.map_err(CallError::Refused),
+            Err(_) => {
+                let e = "file watcher backend panicked".to_string();
+                self.dead = Some(e.clone());
+                Err(CallError::Dead(e))
+            }
         }
     }
 }

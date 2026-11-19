@@ -47,7 +47,9 @@ pub struct Rebuild {
     /// - files twyla's asset pass read (each resolved asset's upstream paths);
     /// - after a *failed* rebuild, everything the previous rebuild watched, so
     ///   a compile that stopped early (scan error, typst error, panic) never
-    ///   shrinks the watch set.
+    ///   shrinks the watch set. Those retained paths are stamped as they are
+    ///   now, not as the earlier compile saw them (see [`WatchSet::keep_from`]
+    ///   for the rebuild loop that would cause).
     pub watch: WatchSet,
 }
 

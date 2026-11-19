@@ -23,23 +23,28 @@
 //! - `static/` is part of the same loop: its directories are in the watch set
 //!   (each non-recursively, like `content/`'s), and a static change rebuilds
 //!   too, because static files take part in the bundle's output-conflict
-//!   check. When the only changes are edits to existing static files, the
-//!   browser gets an in-place `asset:` swap instead of a full reload.
+//!   check. When the only changes are edits to existing static files *and*
+//!   no page's HTML changed, the browser gets an in-place `asset:` swap
+//!   instead of a full reload (see [`static_swaps`]).
 //! - Failures never end hot reload: a watcher error drops the watcher and
 //!   recreates it with backoff, then forces one rebuild to cover whatever
 //!   changed while it was down; a compile panic becomes an error page.
-//! - Reload events are written to the browsers' SSE sockets outside any lock
-//!   and with a write timeout, so a stalled browser tab can't block the
-//!   watcher thread; it's dropped instead.
+//! - Reload events go through a third thread, the broadcaster: the watcher
+//!   thread only records the latest event in a coalescing slot
+//!   ([`Broadcaster`]) and never touches a socket. The broadcaster writes to
+//!   all SSE sockets at once, nonblocking, under one deadline, and drops any
+//!   that stalled — so neither a rebuild nor a healthy tab waits on a stalled
+//!   one.
 //!
 //! Fonts are enumerated once, when the session starts. Installing, removing,
 //! or editing a font needs a `twyla serve` restart.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -87,8 +92,8 @@ pub struct Serve {
 type LastOutput = Mutex<Result<Outputs, RenderError>>;
 
 /// Live Server-Sent-Events connections subscribed to `/__twyla/reload`.
-/// Request handlers push new ones; the watcher thread writes reload
-/// events (see [`broadcast`]) and prunes any whose socket failed.
+/// Request handlers push new ones; the broadcaster thread writes reload
+/// events (see [`broadcast`]) and prunes any whose socket failed or stalled.
 type ReloadClients = Mutex<Vec<TcpStream>>;
 
 struct ServeState {
@@ -180,16 +185,27 @@ pub fn run(serve: Serve) -> io::Result<()> {
 
     let last_output: Arc<LastOutput> = Arc::new(Mutex::new(initial));
     let reload_clients: Arc<ReloadClients> = Arc::new(Mutex::new(Vec::new()));
+    let broadcaster = Arc::new(Broadcaster::default());
+
+    // Spawn the broadcaster thread: the only place that writes to SSE
+    // sockets, so a stalled browser tab never delays a rebuild.
+    {
+        let broadcaster = Arc::clone(&broadcaster);
+        let reload_clients = Arc::clone(&reload_clients);
+        thread::Builder::new()
+            .name("twyla-broadcaster".to_string())
+            .spawn(move || run_broadcaster(&broadcaster, &reload_clients))
+            .map_err(io::Error::other)?;
+    }
 
     // Spawn the watcher thread. The session moves into it — it's the only
     // place that compiles; request handlers only read `last_output`. After
     // each recompile it tells the browsers to reload (or swap a static file).
     {
         let last_output = Arc::clone(&last_output);
-        let reload_clients = Arc::clone(&reload_clients);
         thread::Builder::new()
             .name("twyla-watcher".to_string())
-            .spawn(move || run_watcher(session, watch, last_output, reload_clients))
+            .spawn(move || run_watcher(session, watch, last_output, broadcaster))
             .map_err(io::Error::other)?;
     }
 
@@ -234,7 +250,7 @@ fn run_watcher(
     mut session: DevSession,
     mut watch: WatchSet,
     last_output: Arc<LastOutput>,
-    reload_clients: Arc<ReloadClients>,
+    broadcaster: Arc<Broadcaster>,
 ) {
     let static_dir = session.world.ctx.static_dir();
     let mut watcher: Option<Watcher> = None;
@@ -258,13 +274,21 @@ fn run_watcher(
             },
         };
         // Either call failing means the backend is unusable (dead event
-        // loop, disconnected channel, a path it refuses to watch): drop this
-        // watcher (dropping is panic-safe) and retry with a new one.
-        if let Err(e) = w.update(&watch) {
-            watcher_failed(&format!("watcher update failed: {e}"), &mut backoff);
-            watcher = None;
-            force_rebuild = true;
-            continue;
+        // loop, disconnected channel, a panic): drop this watcher (dropping
+        // is panic-safe) and retry with a new one. A path the backend merely
+        // refuses is polled instead, with a one-time warning.
+        match w.update(&watch) {
+            Ok(warnings) => {
+                for warning in warnings {
+                    eprintln!("  {}", warning.if_supports_color(OUT, |s| s.yellow()));
+                }
+            }
+            Err(e) => {
+                watcher_failed(&format!("watcher update failed: {e}"), &mut backoff);
+                watcher = None;
+                force_rebuild = true;
+                continue;
+            }
         }
         let changed = if std::mem::take(&mut force_rebuild) {
             ChangedPaths {
@@ -284,9 +308,9 @@ fn run_watcher(
         };
         backoff = WATCHER_BACKOFF_MIN;
 
-        // Some watched path changed: rebuild and publish. The static keys of
-        // the outgoing result decide below whether this was an in-place edit.
-        let static_before = static_keys(&last_output.lock().unwrap());
+        // Some watched path changed: rebuild and publish. What the outgoing
+        // result published decides below whether this was an in-place edit.
+        let before = Published::of(&last_output.lock().unwrap());
         let start = Instant::now();
         let rebuild = session.rebuild();
         let elapsed = start.elapsed();
@@ -303,24 +327,25 @@ fn run_watcher(
             ),
         }
         watch = rebuild.watch;
-        let swaps = static_swaps(&changed, &static_dir, &static_before, &rebuild.result);
+        let swaps = static_swaps(&changed, &static_dir, &before, &rebuild.result);
         *last_output.lock().unwrap() = rebuild.result;
 
         // Tell every connected browser. We signal on *every* publish,
         // including compile errors, so that fixing broken typst reloads the
-        // error page back to a working one.
+        // error page back to a working one. Never blocks: delivery happens on
+        // the broadcaster thread.
         match swaps {
             Some(urls) => {
-                for url in urls {
+                for url in &urls {
                     eprintln!(
                         "  {}  {url}  {}",
                         "↻".if_supports_color(OUT, |s| s.cyan()),
                         "(static reload)".if_supports_color(OUT, |s| s.dimmed()),
                     );
-                    broadcast(&reload_clients, &format!("asset:{url}"));
                 }
+                broadcaster.swap(urls);
             }
-            None => broadcast(&reload_clients, "reload"),
+            None => broadcaster.reload(),
         }
     }
 }
@@ -340,97 +365,216 @@ fn watcher_failed(msg: &str, backoff: &mut Duration) {
     *backoff = (*backoff * 2).min(WATCHER_BACKOFF_MAX);
 }
 
-/// The output keys of every `static/` file in a compile result (empty for an
-/// error).
-fn static_keys(result: &Result<Outputs, RenderError>) -> BTreeSet<String> {
-    let Ok(site) = result else {
-        return BTreeSet::new();
-    };
-    site.iter()
-        .filter_map(|out| match out {
-            Output::Static(key, _) => Some(key.clone()),
-            _ => None,
-        })
-        .collect()
+/// What a compile result put in front of the browser, as far as deciding
+/// between an in-place swap and a full reload goes: the set of static files,
+/// and a hash of every page's HTML by output path. Empty for an error.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Published {
+    static_keys: BTreeSet<String>,
+    doc_html: BTreeMap<String, u64>,
+}
+
+impl Published {
+    fn of(result: &Result<Outputs, RenderError>) -> Published {
+        let mut published = Published::default();
+        let Ok(site) = result else {
+            return published;
+        };
+        for out in site.iter() {
+            match out {
+                Output::Static(key, _) => {
+                    published.static_keys.insert(key.clone());
+                }
+                Output::Doc(doc) => {
+                    let mut hasher = DefaultHasher::new();
+                    doc.html.hash(&mut hasher);
+                    published
+                        .doc_html
+                        .insert(doc.output_path.clone(), hasher.finish());
+                }
+                Output::Asset { .. } => {}
+            }
+        }
+        published
+    }
 }
 
 /// If this rebuild was caused only by edits to existing static files, the
 /// URLs to swap in place (`static/site.css` → `/site.css`); otherwise `None`,
 /// meaning a full reload.
 ///
-/// "Only edits" is decided from the outputs, not from event kinds (which vary
-/// by backend and editor): every changed path is under `static/`, the compile
-/// succeeded, and the set of static files is the same before and after. A
-/// changed path that's a static file in neither result is ignored (an
-/// editor's temp file, created and renamed away within the batch).
+/// "Only edits" is decided from the outputs and the disk, not from event
+/// kinds (which vary by backend and editor). All of:
+/// - the compile succeeded, and nothing is `unknown`;
+/// - the set of static files is the same before and after;
+/// - every page's HTML is unchanged — a page can `read()` a static file
+///   (say, to inline it), and swapping the `<link>` would leave that copy
+///   stale;
+/// - every changed path is under `static/` and is either a known static file
+///   (swapped) or no longer exists and never was one (an editor's temp file,
+///   created and renamed away within the batch; ignored). Anything else — a
+///   directory, whose event says nothing about which files under it changed,
+///   or a file that exists but isn't in the outputs — means a full reload.
 fn static_swaps(
     changed: &ChangedPaths,
     static_dir: &Path,
-    before: &BTreeSet<String>,
+    before: &Published,
     after: &Result<Outputs, RenderError>,
-) -> Option<Vec<String>> {
+) -> Option<BTreeSet<String>> {
     if changed.is_empty() || changed.unknown || after.is_err() {
         return None;
     }
-    if static_keys(after) != *before {
+    if Published::of(after) != *before {
         return None;
     }
-    let mut urls = Vec::new();
+    let mut urls = BTreeSet::new();
     for path in &changed.paths {
         let rel = path.strip_prefix(static_dir).ok()?;
         let key = rel.to_string_lossy().replace('\\', "/");
-        if before.contains(&key) {
+        let known = before.static_keys.contains(&key);
+        match (known, path.is_file()) {
             // The URL the dev server serves this file at. The client matches
             // it suffix-wise against `<link>`/`<img>` URLs, so a
             // `base_url`/version prefix on the page is tolerated.
-            urls.push(format!("/{key}"));
+            (true, true) => {
+                urls.insert(format!("/{key}"));
+            }
+            (false, false) if !path.exists() => {}
+            _ => return None,
         }
     }
     (!urls.is_empty()).then_some(urls)
 }
 
-/// How long writing one SSE message may take before the client is
-/// considered stalled and dropped (see [`write_sse`]).
-const SSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+/// The reload event the broadcaster thread still has to deliver. Only the
+/// latest state matters, so events coalesce: swaps accumulate (every swapped
+/// file still needs swapping), and a reload supersedes any pending swaps (the
+/// page will refetch everything anyway).
+#[derive(Debug, Default, PartialEq, Eq)]
+enum Pending {
+    #[default]
+    Nothing,
+    Swaps(BTreeSet<String>),
+    Reload,
+}
 
-/// Push one Server-Sent-Events message to every connected reload client,
-/// dropping any whose write fails or times out.
+/// The single-slot, coalescing hand-off from the watcher thread to the
+/// broadcaster thread. Posting only takes a short-lived lock on the slot,
+/// never one held during socket writes, so the watcher thread can't block on
+/// delivery.
+#[derive(Default)]
+struct Broadcaster {
+    pending: Mutex<Pending>,
+    wake: Condvar,
+}
+
+impl Broadcaster {
+    /// Tell every browser to reload.
+    fn reload(&self) {
+        *self.pending.lock().unwrap() = Pending::Reload;
+        self.wake.notify_one();
+    }
+
+    /// Tell every browser to swap these static files in place.
+    fn swap(&self, urls: BTreeSet<String>) {
+        let mut pending = self.pending.lock().unwrap();
+        match &mut *pending {
+            Pending::Reload => {}
+            Pending::Swaps(queued) => queued.extend(urls),
+            Pending::Nothing => *pending = Pending::Swaps(urls),
+        }
+        drop(pending);
+        self.wake.notify_one();
+    }
+
+    /// Block until there's something to deliver, and take it.
+    fn next(&self) -> Pending {
+        let mut pending = self.pending.lock().unwrap();
+        while *pending == Pending::Nothing {
+            pending = self.wake.wait(pending).unwrap();
+        }
+        std::mem::take(&mut *pending)
+    }
+}
+
+/// The broadcaster thread: deliver each coalesced event to every client.
+fn run_broadcaster(broadcaster: &Broadcaster, clients: &ReloadClients) {
+    loop {
+        let msg = match broadcaster.next() {
+            Pending::Nothing => continue,
+            Pending::Reload => "data: reload\n\n".to_string(),
+            Pending::Swaps(urls) => urls
+                .iter()
+                .map(|url| format!("data: asset:{url}\n\n"))
+                .collect(),
+        };
+        broadcast(clients, msg.as_bytes());
+    }
+}
+
+/// How long one broadcast may take in total before every client that hasn't
+/// received the whole message is considered stalled and dropped.
+const SSE_DEADLINE: Duration = Duration::from_secs(1);
+/// How long to sleep between write passes over clients whose socket buffer
+/// is full.
+const SSE_RETRY: Duration = Duration::from_millis(5);
+
+/// Write `msg` (one or more complete SSE messages) to every connected reload
+/// client, dropping any whose write fails or doesn't finish within
+/// [`SSE_DEADLINE`].
 ///
 /// The client list is taken out of the mutex for the writes and the
 /// survivors put back afterwards, so a slow socket never holds the lock that
-/// request handlers need to register new clients. Each write is bounded by
-/// [`SSE_WRITE_TIMEOUT`], so a tab that stopped reading costs the watcher
-/// thread at most that long, once.
-fn broadcast(clients: &ReloadClients, data: &str) {
+/// request handlers need to register new clients. Writes are nonblocking and
+/// interleaved across clients under one shared deadline: a healthy client
+/// gets the message on the first pass no matter how many stalled ones there
+/// are, and a broadcast costs at most [`SSE_DEADLINE`], not that per client.
+fn broadcast(clients: &ReloadClients, msg: &[u8]) {
     let taken = std::mem::take(&mut *clients.lock().unwrap());
-    let alive: Vec<TcpStream> = taken
+    let deadline = Instant::now() + SSE_DEADLINE;
+    // (socket, bytes of `msg` already written)
+    let mut sending: Vec<(TcpStream, usize)> = taken
         .into_iter()
-        .filter_map(|mut stream| write_sse(&mut stream, data).ok().map(|()| stream))
+        .filter(|stream| stream.set_nonblocking(true).is_ok())
+        .map(|stream| (stream, 0))
         .collect();
+    let mut alive = Vec::new();
+    loop {
+        let mut blocked = Vec::new();
+        for (mut stream, mut written) in sending {
+            match write_nonblocking(&mut stream, &msg[written..]) {
+                Ok(n) if written + n == msg.len() => alive.push(stream),
+                Ok(n) => {
+                    written += n;
+                    blocked.push((stream, written));
+                }
+                Err(_) => {} // dropped
+            }
+        }
+        sending = blocked;
+        if sending.is_empty() || Instant::now() >= deadline {
+            break; // anything still in `sending` stalled: dropped
+        }
+        thread::sleep(SSE_RETRY);
+    }
     // Clients that connected during the writes are already in the list.
     clients.lock().unwrap().extend(alive);
 }
 
-/// Write one SSE message, giving up after [`SSE_WRITE_TIMEOUT`] in total.
-/// The socket timeout alone bounds each `write` call, and a client draining
-/// slowly could keep `write_all` going indefinitely one partial write at a
-/// time, so each call gets only what's left of the deadline.
-fn write_sse(stream: &mut TcpStream, data: &str) -> io::Result<()> {
-    let msg = format!("data: {data}\n\n");
-    let mut buf = msg.as_bytes();
-    let deadline = Instant::now() + SSE_WRITE_TIMEOUT;
-    while !buf.is_empty() {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        stream.set_write_timeout(Some(left))?;
-        match stream.write(buf)? {
-            0 => return Err(io::ErrorKind::WriteZero.into()),
-            n => buf = &buf[n..],
+/// Write as much of `buf` as the socket accepts right now; `Ok(0)` only if
+/// its buffer is full. A closed socket is an error.
+fn write_nonblocking(stream: &mut TcpStream, buf: &[u8]) -> io::Result<usize> {
+    let mut written = 0;
+    while written < buf.len() {
+        match stream.write(&buf[written..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
-    Ok(())
+    Ok(written)
 }
 
 fn handle(state: &ServeState, mut stream: TcpStream) -> io::Result<()> {
@@ -465,7 +609,7 @@ fn handle(state: &ServeState, mut stream: TcpStream) -> io::Result<()> {
 }
 
 /// Upgrade `GET /__twyla/reload` to a Server-Sent-Events stream and park
-/// the socket in the reload registry. The watcher thread writes events
+/// the socket in the reload registry. The broadcaster thread writes events
 /// to it; we never read from it again. The connection stays open because
 /// the registry owns the stream — returning here does not close it.
 fn accept_reload_client(state: &ServeState, mut stream: TcpStream) -> io::Result<()> {
@@ -752,10 +896,13 @@ fn html_escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
     use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::sync::mpsc;
 
     use super::*;
+    use crate::session::DevSession;
 
     /// A connected socket pair; the first is the server side.
     fn socket_pair() -> (TcpStream, TcpStream) {
@@ -765,90 +912,209 @@ mod tests {
         (server, client)
     }
 
-    /// A browser tab that stopped reading fills its socket buffer; after
-    /// that, a broadcast must give up on it within the write timeout and drop
-    /// it, never block indefinitely. A healthy client is kept throughout.
+    /// Several tabs that stopped reading must not delay a healthy one, nor
+    /// the sender: posting an event returns at once, the healthy client gets
+    /// all of it well within one deadline (serial per-client timeouts would
+    /// take one deadline *per stalled client* before reaching it), and the
+    /// stalled ones are dropped.
+    ///
+    /// The event is a large swap set (32 MiB on the wire) rather than a
+    /// 14-byte `reload`: Linux loopback sockets keep absorbing small writes
+    /// well past the first `WouldBlock`, so only a message bigger than any
+    /// socket buffer reliably stalls.
     #[test]
-    fn stalled_sse_client_is_dropped_not_waited_on() {
-        let (stalled, _stalled_peer) = socket_pair();
-        let (healthy, healthy_peer) = socket_pair();
-        // Keep the healthy peer drained.
-        std::thread::spawn(move || {
-            let mut peer = healthy_peer;
-            let _ = io::copy(&mut peer, &mut io::sink());
+    fn stalled_sse_clients_dont_delay_sender_or_healthy_client() {
+        let mut peers = Vec::new();
+        let mut list = Vec::new();
+        for _ in 0..4 {
+            // The peer never reads.
+            let (server, peer) = socket_pair();
+            list.push(server);
+            peers.push(peer);
+        }
+        let (healthy, mut healthy_peer) = socket_pair();
+        list.push(healthy); // last: a serial broadcast would reach it last
+
+        let swap_urls: BTreeSet<String> = (0..32)
+            .map(|i| format!("/{i:02}-{}.css", "x".repeat(1 << 20)))
+            .collect();
+        let expected: usize = swap_urls
+            .iter()
+            .map(|url| format!("data: asset:{url}\n\n").len())
+            .sum();
+
+        let (got_tx, got_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut total = 0;
+            let mut buf = vec![0; 1 << 16];
+            while let Ok(n) = healthy_peer.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if total == expected {
+                    let _ = got_tx.send(());
+                }
+            }
         });
 
-        let clients: ReloadClients = Mutex::new(vec![stalled, healthy]);
-        let big = "x".repeat(1 << 20);
-        for _ in 0..256 {
-            let start = Instant::now();
-            broadcast(&clients, &big);
-            assert!(
-                start.elapsed() < SSE_WRITE_TIMEOUT + Duration::from_millis(500),
-                "broadcast blocked for {:?}",
-                start.elapsed()
-            );
-            if clients.lock().unwrap().len() == 1 {
-                return; // stalled client dropped, healthy one kept
-            }
+        let clients: Arc<ReloadClients> = Arc::new(Mutex::new(list));
+        let broadcaster = Arc::new(Broadcaster::default());
+        {
+            let (b, c) = (Arc::clone(&broadcaster), Arc::clone(&clients));
+            thread::spawn(move || run_broadcaster(&b, &c));
         }
-        panic!("stalled client never dropped");
+
+        let start = Instant::now();
+        broadcaster.swap(swap_urls);
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "posting blocked for {:?}",
+            start.elapsed()
+        );
+        got_rx
+            .recv_timeout(SSE_DEADLINE / 2)
+            .expect("healthy client didn't get the event promptly");
+
+        let deadline = Instant::now() + SSE_DEADLINE * 3;
+        while clients.lock().unwrap().len() != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "stalled clients never dropped ({} left)",
+                clients.lock().unwrap().len()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        drop(peers);
     }
 
-    fn outputs(statics: &[&str]) -> Result<Outputs, RenderError> {
+    #[test]
+    fn pending_events_coalesce() {
+        let b = Broadcaster::default();
+        b.swap(BTreeSet::from(["/a.css".to_string()]));
+        b.swap(BTreeSet::from(["/b.css".to_string()]));
+        assert_eq!(
+            b.next(),
+            Pending::Swaps(BTreeSet::from(["/a.css".into(), "/b.css".into()]))
+        );
+        b.swap(BTreeSet::from(["/a.css".to_string()]));
+        b.reload();
+        b.swap(BTreeSet::from(["/b.css".to_string()]));
+        assert_eq!(b.next(), Pending::Reload, "reload supersedes swaps");
+    }
+
+    fn outputs(static_dir: &Path, statics: &[&str]) -> Result<Outputs, RenderError> {
         let mut all = iddqd::IdHashMap::new();
         for key in statics {
-            let path = PathBuf::from("/site/static").join(key);
-            all.insert_unique(Output::Static(key.to_string(), path))
+            all.insert_unique(Output::Static(key.to_string(), static_dir.join(key)))
                 .unwrap();
         }
         Ok(Outputs { all })
     }
 
-    fn changed(paths: &[&str]) -> ChangedPaths {
+    fn changed(paths: &[PathBuf]) -> ChangedPaths {
         ChangedPaths {
-            paths: paths.iter().map(PathBuf::from).collect(),
+            paths: paths.iter().cloned().collect(),
             unknown: false,
         }
     }
 
+    fn urls(urls: &[&str]) -> Option<BTreeSet<String>> {
+        Some(urls.iter().map(|u| u.to_string()).collect())
+    }
+
     #[test]
     fn static_swaps_only_for_edits_to_existing_static_files() {
-        let dir = Path::new("/site/static");
-        let before = static_keys(&outputs(&["site.css", "img/a.png"]));
-        let same = outputs(&["site.css", "img/a.png"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("static");
+        std::fs::create_dir_all(dir.join("img")).unwrap();
+        std::fs::write(dir.join("site.css"), "").unwrap();
+        std::fs::write(dir.join("img/a.png"), "").unwrap();
+        let before = Published::of(&outputs(&dir, &["site.css", "img/a.png"]));
+        let same = outputs(&dir, &["site.css", "img/a.png"]);
 
         // An edit (plus an editor temp file that came and went): swap.
         assert_eq!(
             static_swaps(
-                &changed(&["/site/static/site.css", "/site/static/.site.css.swp"]),
-                dir,
+                &changed(&[dir.join("site.css"), dir.join(".site.css.swp")]),
+                &dir,
                 &before,
                 &same
             ),
-            Some(vec!["/site.css".to_string()])
+            urls(&["/site.css"])
         );
         // A content change alongside: full reload.
         assert_eq!(
             static_swaps(
-                &changed(&["/site/static/site.css", "/site/content/main.typ"]),
-                dir,
+                &changed(&[dir.join("site.css"), tmp.path().join("content/main.typ")]),
+                &dir,
                 &before,
                 &same
             ),
             None
         );
         // A static file added or removed: full reload.
-        let added = outputs(&["site.css", "img/a.png", "new.css"]);
+        std::fs::write(dir.join("new.css"), "").unwrap();
+        let added = outputs(&dir, &["site.css", "img/a.png", "new.css"]);
         assert_eq!(
-            static_swaps(&changed(&["/site/static/new.css"]), dir, &before, &added),
+            static_swaps(&changed(&[dir.join("new.css")]), &dir, &before, &added),
             None
         );
         // Unknown changes (forced rebuild / overflow): full reload.
         let unknown = ChangedPaths {
             unknown: true,
-            ..changed(&["/site/static/site.css"])
+            ..changed(&[dir.join("site.css")])
         };
-        assert_eq!(static_swaps(&unknown, dir, &before, &same), None);
+        assert_eq!(static_swaps(&unknown, &dir, &before, &same), None);
+        // A directory in the batch: which files under it changed is unknown,
+        // so full reload even alongside a swappable edit.
+        assert_eq!(
+            static_swaps(
+                &changed(&[dir.join("site.css"), dir.join("img")]),
+                &dir,
+                &before,
+                &same
+            ),
+            None
+        );
+        // An existing file that isn't a known static output: full reload.
+        assert_eq!(
+            static_swaps(&changed(&[dir.join("new.css")]), &dir, &before, &same),
+            None
+        );
+    }
+
+    /// A page that `read()`s a static stylesheet (to inline it) changes when
+    /// the stylesheet does; swapping the `<link>` alone would leave the
+    /// inlined copy stale, so it's a full reload. The same edit with a page
+    /// that only links the file is swapped.
+    #[test]
+    fn static_swaps_reload_when_page_html_changes() {
+        for (page, expect_swap) in [("#read(\"/static/site.css\")", false), ("plain page", true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            std::fs::create_dir_all(root.join("content")).unwrap();
+            std::fs::create_dir_all(root.join("static")).unwrap();
+            std::fs::write(root.join("content/main.typ"), page).unwrap();
+            let css = root.join("static/site.css");
+            std::fs::write(&css, "body { color: red }").unwrap();
+            let ctx = TwylaContext::new(root, None).unwrap();
+            let mut session = DevSession::new(&ctx).unwrap();
+            let before = Published::of(&session.rebuild().result);
+
+            std::fs::write(&css, "body { color: blue }").unwrap();
+            let after = session.rebuild().result;
+            let swaps = static_swaps(
+                &changed(std::slice::from_ref(&css)),
+                &ctx.static_dir(),
+                &before,
+                &after,
+            );
+            if expect_swap {
+                assert_eq!(swaps, urls(&["/site.css"]), "{page}");
+            } else {
+                assert_eq!(swaps, None, "{page}");
+            }
+        }
     }
 }

@@ -7,29 +7,45 @@ use super::*;
 
 // ---- fake backend: deterministic bookkeeping tests --------------------------
 
-/// Records every call; `fail_watch` makes `watch` panic like notify's inotify
-/// backend does when its event loop is dead.
+/// Records every successful call, and counts every call at all.
 #[derive(Default)]
 struct Log {
     watched: Vec<PathBuf>,
     unwatched: Vec<PathBuf>,
+    calls: usize,
 }
 
+/// The `panic_on_*` flags make calls panic like notify's inotify backend does
+/// when its event loop is dead; `refuse` makes `watch` fail for those paths
+/// like it does for, e.g., a directory without read permission.
+#[derive(Default)]
 struct Fake {
     log: Arc<Mutex<Log>>,
+    refuse: Vec<PathBuf>,
     panic_on_watch: bool,
+    panic_on_unwatch: bool,
     panic_on_drop: bool,
 }
 
 impl Backend for Fake {
     fn watch(&mut self, path: &Path) -> notify::Result<()> {
+        self.log.lock().unwrap().calls += 1;
         if self.panic_on_watch {
             panic!("fake backend: event loop is dead");
+        }
+        if self.refuse.iter().any(|p| p == path) {
+            return Err(notify::Error::io(io::Error::from(
+                io::ErrorKind::PermissionDenied,
+            )));
         }
         self.log.lock().unwrap().watched.push(path.to_path_buf());
         Ok(())
     }
     fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        self.log.lock().unwrap().calls += 1;
+        if self.panic_on_unwatch {
+            panic!("fake backend: event loop is dead");
+        }
         self.log.lock().unwrap().unwatched.push(path.to_path_buf());
         Ok(())
     }
@@ -46,13 +62,14 @@ impl Drop for Fake {
 type Tx = Sender<notify::Result<Event>>;
 
 fn fake() -> (Watcher<Fake>, Tx, Arc<Mutex<Log>>) {
+    fake_with(Fake::default())
+}
+
+/// A watcher on `backend` (whose log is replaced by the returned one).
+fn fake_with(mut backend: Fake) -> (Watcher<Fake>, Tx, Arc<Mutex<Log>>) {
     let (tx, rx) = mpsc::channel();
     let log = Arc::new(Mutex::new(Log::default()));
-    let backend = Fake {
-        log: Arc::clone(&log),
-        panic_on_watch: false,
-        panic_on_drop: false,
-    };
+    backend.log = Arc::clone(&log);
     (Watcher::with_backend(backend, rx), tx, log)
 }
 
@@ -102,7 +119,7 @@ fn missing_paths_are_polled_not_watched() {
 
     w.update(&set).unwrap();
     assert!(log.lock().unwrap().watched.is_empty());
-    assert!(w.missing.contains(&gone));
+    assert!(w.polled.contains_key(&gone));
     assert!(w.pending.is_empty(), "still missing, as observed");
 
     // Appearing is reported by the poll in `wait`, without any event.
@@ -243,10 +260,11 @@ fn overflow_forgets_everything_and_reports_unknown() {
 fn backend_panics_become_errors() {
     let dir = tempfile::tempdir().unwrap();
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-    let backend = Fake {
-        log: Default::default(),
-        panic_on_watch: true,
-        panic_on_drop: true,
+    let backend = {
+        let mut f = Fake::default();
+        f.panic_on_watch = true;
+        f.panic_on_drop = true;
+        f
     };
     let mut w = Watcher::with_backend(backend, rx);
     assert!(w.update(&observed(&[dir.path()])).is_err());
@@ -296,18 +314,190 @@ fn stamps() {
 
 #[test]
 fn watch_set_keep_from_never_shrinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
     let mut old = WatchSet::default();
-    old.insert("/a".into(), Stamp::Missing);
-    old.insert("/b".into(), Stamp::Missing);
+    // `a` was a file when the old set observed it; it's gone now.
+    old.insert(
+        a.clone(),
+        Stamp::File {
+            mtime: SystemTime::UNIX_EPOCH,
+            len: 1,
+        },
+    );
+    old.insert(b.clone(), Stamp::Missing);
     let mut new = WatchSet::default();
-    new.insert("/b".into(), Stamp::Unknown);
+    new.insert(b.clone(), Stamp::Unknown);
     new.keep_from(&old);
     assert_eq!(new.paths.len(), 2);
+    assert_eq!(new.paths[&b], Stamp::Unknown, "this attempt's stamp wins");
     assert_eq!(
-        new.paths[Path::new("/b")],
-        Stamp::Unknown,
-        "newer stamp wins"
+        new.paths[&a],
+        Stamp::Missing,
+        "retained-only paths are re-baselined at their current state"
     );
+}
+
+/// An unreadable directory is a stable observation (re-checking it while
+/// it stays unreadable must not report a change), unlike `Unknown`.
+#[cfg(unix)]
+#[test]
+fn unreadable_dir_stamp_is_stable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("locked");
+    fs::create_dir(&sub).unwrap();
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&sub).is_ok() {
+        return; // running as root: permissions aren't enforced
+    }
+    let stamp = Stamp::now(&sub);
+    assert_eq!(stamp, Stamp::Unreadable);
+    assert!(stamp.matches_now(&sub));
+    fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!stamp.matches_now(&sub));
+}
+
+/// Regression (rev 1b): a failed rebuild retained an import's old `File`
+/// stamp after the import was deleted, so every `update` re-check saw a
+/// change, queued a rebuild, which failed the same way — forever, with no
+/// filesystem events. The retained path must go idle, then wake when it
+/// reappears.
+#[test]
+fn failed_rebuild_with_deleted_retained_import_goes_idle() {
+    use crate::project::TwylaContext;
+    use crate::session::DevSession;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("content")).unwrap();
+    let main = root.join("content/main.typ");
+    let lib = root.join("content/_lib.typ");
+    fs::write(&main, "#import \"_lib.typ\": x\n#x").unwrap();
+    fs::write(&lib, "#let x = [lib]").unwrap();
+    let ctx = TwylaContext::new(&root, None).unwrap();
+    let mut session = DevSession::new(&ctx).unwrap();
+    let (mut w, tx, _log) = fake();
+
+    let r1 = session.rebuild();
+    assert!(r1.result.is_ok());
+    assert!(matches!(r1.watch.paths.get(&lib), Some(Stamp::File { .. })));
+    w.update(&r1.watch).unwrap();
+
+    // Break main.typ before it reaches the import, and delete the import.
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(&main, "#oops-undefined\n#import \"_lib.typ\": x").unwrap();
+    fs::remove_file(&lib).unwrap();
+    tx.send(event(
+        EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+        &main,
+    ))
+    .unwrap();
+    tx.send(event(EventKind::Remove(RemoveKind::File), &lib))
+        .unwrap();
+    let changed = w.wait().unwrap();
+    assert!(changed.paths.contains(&lib));
+
+    // Two failed rounds: neither may leave anything to rebuild for.
+    for _ in 0..2 {
+        let r = session.rebuild();
+        assert!(r.result.is_err());
+        assert_eq!(r.watch.paths.get(&lib), Some(&Stamp::Missing));
+        w.update(&r.watch).unwrap();
+        assert!(
+            w.pending.is_empty(),
+            "re-check queued a rebuild: {:?}",
+            w.pending
+        );
+        let mut polled = ChangedPaths::default();
+        w.poll(&mut polled);
+        assert!(polled.is_empty(), "poll reported a change: {polled:?}");
+    }
+
+    // The import reappearing wakes the loop.
+    fs::write(&lib, "#let x = [back]").unwrap();
+    let mut polled = ChangedPaths::default();
+    w.poll(&mut polled);
+    assert!(polled.paths.contains(&lib), "{polled:?}");
+}
+
+/// A path the backend refuses doesn't take the watcher down: the other
+/// subscriptions stay, the refused path is polled (and warned about once,
+/// not on every `update`), and a change to it — here a `chmod`, which
+/// leaves its stamp unchanged — is reported.
+#[cfg(unix)]
+#[test]
+fn refused_path_is_polled_and_others_stay_watched() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    fs::write(&a, "x").unwrap();
+    fs::write(&b, "x").unwrap();
+    let (mut w, _tx, log) = fake_with({
+        let mut f = Fake::default();
+        f.refuse = vec![b.clone()];
+        f
+    });
+    let set = observed(&[&a, &b]);
+
+    let warnings = w.update(&set).unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("polling"), "{warnings:?}");
+    assert!(w.watched.contains_key(&a));
+    assert!(!w.watched.contains_key(&b));
+    assert!(w.polled.contains_key(&b));
+    assert!(w.pending.is_empty());
+
+    assert_eq!(w.update(&set).unwrap(), Vec::<String>::new(), "warned once");
+    assert_eq!(log.lock().unwrap().watched, [a]);
+
+    fs::set_permissions(&b, fs::Permissions::from_mode(0o000)).unwrap();
+    let changed = w.wait().unwrap();
+    assert_eq!(changed.paths, BTreeSet::from([b]));
+}
+
+/// A panic from `unwatch` (best-effort elsewhere) kills the watcher: `update`
+/// returns `Err`, and the dead backend is never called again.
+#[test]
+fn unwatch_panic_is_fatal_and_backend_is_not_called_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    fs::write(&a, "x").unwrap();
+    let (mut w, _tx, log) = fake_with({
+        let mut f = Fake::default();
+        f.panic_on_unwatch = true;
+        f
+    });
+    w.update(&observed(&[&a])).unwrap();
+
+    // Dropping `a` from the set unwatches it: panics.
+    assert!(w.update(&WatchSet::default()).is_err());
+    let calls = log.lock().unwrap().calls;
+    assert!(w.update(&observed(&[&a])).is_err());
+    assert!(w.wait().is_err());
+    assert_eq!(
+        log.lock().unwrap().calls,
+        calls,
+        "dead backend called again"
+    );
+}
+
+/// Same via the event path: an identity-changing event unwatches, and a
+/// panic there makes `wait` fail.
+#[test]
+fn unwatch_panic_during_invalidation_fails_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    fs::write(&a, "x").unwrap();
+    let (mut w, tx, _log) = fake_with({
+        let mut f = Fake::default();
+        f.panic_on_unwatch = true;
+        f
+    });
+    w.update(&observed(&[&a])).unwrap();
+    tx.send(event(EventKind::Remove(RemoveKind::File), &a))
+        .unwrap();
+    assert!(w.wait().is_err());
 }
 
 // ---- real notify backend -----------------------------------------------------
