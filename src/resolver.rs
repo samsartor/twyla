@@ -33,7 +33,7 @@ use typst::World;
 use typst::diag::{SourceDiagnostic, SourceResult};
 
 use crate::asset::{
-    AssetReq, AssetSpec, OutputReq, Resolution, ResolvedAsset, file, image, raw, sass, svg,
+    AssetReq, AssetSpec, OutputReq, Resolution, ResolvedAsset, file, image, js, raw, sass, svg,
     typst_doc,
 };
 use crate::document::ResolvedDocument;
@@ -476,10 +476,18 @@ impl Resolver {
                 warnings,
                 diag_sources,
             )?,
+            AssetSpec::Js { entry, options } => {
+                js::build(*entry, options, &self.ctx, span, rec, warnings)?
+            }
         };
 
         let output_path = self.ctx.default_asset_output(&built);
         let url = self.ctx.asset_url(&output_path);
+        let preload = built
+            .preload
+            .iter()
+            .map(|p| self.ctx.asset_url(p))
+            .collect();
 
         Ok(ResolvedAsset {
             spec: spec.clone(),
@@ -488,6 +496,7 @@ impl Resolver {
             output_path,
             url,
             resolutions: Vec::new(),
+            preload,
             // Filled in by `resolve_asset` from the request(s) that reached it.
             outputs: Vec::new(),
             output_spans: Vec::new(),

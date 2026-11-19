@@ -86,6 +86,27 @@ iddqd = "0.4.2"
 # `id` attribute can be injected on the parsed tree before serialization.
 svgm-core = "0.3"
 
+# JS/TS/JSX bundler for `asset.js`. rolldown is consumed as a Rust library, so
+# no JS ever runs: no node, no JS config files, no JS plugins. Twyla supplies
+# the filesystem (src/asset/js.rs's `SandboxFs`), which confines every read to
+# the project root, refuses all writes, and records each access in the dep
+# ledger. The sub-crates are exact-pinned to rolldown's own version: their
+# APIs (the `FileSystem` traits, `Plugin` hooks, `Resolver::new`) are internal
+# to rolldown and shift between releases, and `oxc_resolver` must be the exact
+# version rolldown_fs implements its trait for. Bump them together,
+# deliberately. rolldown is async; tokio drives one build at a time.
+rolldown = "=1.3.2"
+rolldown_plugin = "=1.3.2"
+rolldown_fs = { version = "=1.3.2", features = ["os"] }
+rolldown_resolver = "=1.3.2"
+rolldown_common = "=1.3.2"
+oxc_resolver = "=11.24.3"
+arcstr = "1"
+rolldown_error = "=1.3.2"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+serde_json = "1"
+
 # The musl release is a fully static binary (runs on any x86_64 Linux,
 # regardless of glibc version), so there's no system OpenSSL to link against:
 # build typst-kit's package downloader against a vendored copy. Cargo unifies

@@ -105,6 +105,7 @@ fn site_files() -> Files {
              #context raw-html(str(asset.raw(read(\"/data/raw.css\"), extension: \"css\").read(encoding: none)))\n\
              #context link(asset.raw(\"b{}\", extension: \"css\").url())[inline-raw]\n\
              #context link(asset.typst(\"/assets/fig.typ\", format: \"svg\").url())[fig]\n\
+             #context link(asset.js(\"/scripts/app.ts\", sourcemap: true).url())[js]\n\
              #context link(document(output: auto)[Inline child #shout[x]].url())[child]\n\
              #document(output: \"extra.html\")[Extra page]\n",
         ),
@@ -166,6 +167,39 @@ fn site_files() -> Files {
         ),
     );
     add("site/assets/_fig-dep.typ", text("#let caption = [Figure]"));
+    // `asset.js`: a tsconfig `paths` alias, a package resolved through its
+    // `package.json` `exports`, and a dynamic-import chunk.
+    add(
+        "site/tsconfig.json",
+        text(r#"{ "compilerOptions": { "paths": { "@util/*": ["./scripts/util/*"] } } }"#),
+    );
+    add(
+        "site/scripts/app.ts",
+        text(
+            "import { v } from \"@util/v\";\n\
+             import { p } from \"pkg\";\n\
+             console.log(v, p);\n\
+             export const later = () => import(\"./lazy\");\n",
+        ),
+    );
+    add(
+        "site/scripts/util/v.ts",
+        text("export const v: string = \"v\";"),
+    );
+    add(
+        "site/scripts/lazy.ts",
+        text("export const lazy = \"lazy\";"),
+    );
+    add(
+        "site/node_modules/pkg/package.json",
+        text(
+            r#"{ "name": "pkg", "exports": { ".": { "browser": "./browser.js", "default": "./index.js" } } }"#,
+        ),
+    );
+    add(
+        "site/node_modules/pkg/browser.js",
+        text("export const p = \"browser\";"),
+    );
 
     // Static files.
     add("site/static/robots.txt", text("User-agent: *"));
@@ -189,6 +223,11 @@ fn site_files() -> Files {
     add("site/styles/partials/_unused.scss", text("$u: blue;"));
     add("site/templates/unused.typ", text("#let unused = 1"));
     add("site/assets/unused.typ", text("unused"));
+    add("site/scripts/unused.ts", text("export const unused = 1;"));
+    add(
+        "site/node_modules/pkg/index.js",
+        text("export const p = \"node\";"),
+    );
     add("site/drafts", None);
     add("packages/local/greet/0.1.0/README.md", text("greet"));
     add(
@@ -259,6 +298,17 @@ fn variants() -> Vec<Variant> {
             vec![("packages/local/greet/0.1.0/util.typ", Some("#let who = {"))],
         ),
         v("missing native image", vec![("site/images/pic.png", None)]),
+        v(
+            "syntax error in an asset.js module",
+            vec![("site/scripts/util/v.ts", Some("export const v = ;"))],
+        ),
+        v(
+            "asset.js package export to a missing file",
+            vec![(
+                "site/node_modules/pkg/package.json",
+                Some(r#"{ "name": "pkg", "exports": "./missing.js" }"#),
+            )],
+        ),
         v(
             "static file conflicts with a page",
             vec![("site/static/index.html", Some("<p>static</p>"))],
@@ -335,6 +385,7 @@ fn snapshot(result: &Result<Outputs, RenderError>, base: &Path) -> Snapshot {
                             format!("copy {} {}", rel(src), hex::encode(asset.built.sha256))
                         }
                     },
+                    Output::Companion { sha256, .. } => format!("bytes {}", hex::encode(sha256)),
                     Output::Static(_, src) => format!("static {}", rel(src)),
                 };
                 (output.key().to_string(), digest)

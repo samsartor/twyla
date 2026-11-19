@@ -50,7 +50,6 @@ use std::time::{Duration, Instant};
 
 use owo_colors::{AnsiColors, OwoColorize, Stream, Style};
 
-use crate::asset::ResolvedAsset;
 use crate::project::TwylaContext;
 use crate::render::{Emit, Output, Outputs, RenderError};
 use crate::session::{DevSession, Rebuild};
@@ -392,7 +391,7 @@ impl Published {
                         .doc_html
                         .insert(doc.output_path.clone(), hasher.finish());
                 }
-                Output::Asset { .. } => {}
+                Output::Asset { .. } | Output::Companion { .. } => {}
             }
         }
         published
@@ -773,7 +772,10 @@ fn dispatch(state: &ServeState, path: &str) -> Response {
     };
     match site.get(path).or_else(|| site.get(&index_key)) {
         Some(Output::Doc(d)) => return Response::html(200, d.html.clone()),
-        Some(Output::Asset { asset, .. }) => return serve_asset(asset),
+        Some(Output::Asset { asset, .. }) => {
+            return serve_emit(Path::new(&asset.output_path), &asset.built.emit);
+        }
+        Some(Output::Companion { path, emit, .. }) => return serve_emit(Path::new(path), emit),
         // `Output::Static` falls through to the live-disk read below, so a
         // freshly-added file (not yet in the recompiled map) still resolves.
         _ => {}
@@ -788,10 +790,10 @@ fn dispatch(state: &ServeState, path: &str) -> Response {
     serve_static(&state.ctx, path)
 }
 
-/// Serve a processed (`asset.*`) asset's bytes, by its `assets/…` output key.
-fn serve_asset(asset: &ResolvedAsset) -> Response {
-    let dest = Path::new(&asset.output_path);
-    match &asset.built.emit {
+/// Serve a processed (`asset.*`) asset's bytes — or an `asset.js` chunk's —
+/// with the Content-Type of its output path `dest`.
+fn serve_emit(dest: &Path, emit: &Emit) -> Response {
+    match emit {
         Emit::Copy(src) => match std::fs::read(src) {
             Ok(body) => Response::bytes(200, mime_for(dest), body),
             Err(_) => Response::text(404, "asset source unreadable"),

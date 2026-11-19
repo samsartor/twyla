@@ -87,5 +87,8 @@ pub(crate) fn build(
         emit: Emit::Copy(path),
         dimensions: None,
         elem_id: None,
+        output_path: None,
+        companions: Vec::new(),
+        preload: Vec::new(),
     })
 }
