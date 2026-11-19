@@ -151,6 +151,14 @@ pub enum Output {
         path: String,
         asset: Arc<ResolvedAsset>,
     },
+    /// A file emitted alongside an asset ([`Companion`](crate::asset::Companion)):
+    /// an `asset.js` chunk or sourcemap. Several entries can share one (a
+    /// common chunk); it's still one output.
+    Companion {
+        path: String,
+        emit: Emit,
+        sha256: [u8; 32],
+    },
     Static(String, PathBuf),
 }
 
@@ -161,7 +169,18 @@ impl Output {
         match self {
             Output::Doc(d) => d.output_path.as_str(),
             Output::Asset { path, .. } => path,
+            Output::Companion { path, .. } => path,
             Output::Static(f, _) => f,
+        }
+    }
+
+    /// SHA-256 of a built output's bytes (an asset or companion). What
+    /// [`insert_built`] compares to tell a harmless duplicate from a conflict.
+    fn digest(&self) -> Option<[u8; 32]> {
+        match self {
+            Output::Asset { asset, .. } => Some(asset.built.sha256),
+            Output::Companion { sha256, .. } => Some(*sha256),
+            Output::Doc(_) | Output::Static(..) => None,
         }
     }
 
@@ -171,6 +190,7 @@ impl Output {
         match self {
             Output::Doc(d) => fs::write(dest, &d.html),
             Output::Asset { asset, .. } => asset.built.emit.write_to(dest),
+            Output::Companion { emit, .. } => emit.write_to(dest),
             Output::Static(_, src) => fs::copy(src, dest).map(drop),
         }
     }
@@ -485,6 +505,7 @@ impl RenderWorld {
             bundle,
             pages,
             assets,
+            companions,
         } = output.map_err(|errors| compile_err(&diag_world, &errors))?;
 
         let mut all = IdHashMap::new();
@@ -512,9 +533,29 @@ impl RenderWorld {
         }
 
         for (path, asset) in assets {
-            if let Err(err) = all.insert_unique(Output::Asset { path, asset }) {
-                return Err(duplication_error(err).0);
+            let companions = asset.built.companions.clone();
+            insert_built(&mut all, Output::Asset { path, asset })?;
+            for companion in companions {
+                insert_built(
+                    &mut all,
+                    Output::Companion {
+                        path: companion.path,
+                        emit: companion.emit,
+                        sha256: companion.sha256,
+                    },
+                )?;
             }
+        }
+
+        for companion in companions {
+            insert_built(
+                &mut all,
+                Output::Companion {
+                    path: companion.path,
+                    emit: companion.emit,
+                    sha256: companion.sha256,
+                },
+            )?;
         }
 
         for out in scan
@@ -538,17 +579,31 @@ impl RenderWorld {
     }
 }
 
+/// Insert an asset or companion output. The same bytes at the same path is
+/// one output, not a conflict: two `asset.js` entries sharing a chunk, or two
+/// specs that build identical bytes under one name.
+fn insert_built(all: &mut IdHashMap<Output>, out: Output) -> Result<(), RenderError> {
+    let existing = all.get(out.key()).and_then(Output::digest);
+    if existing.is_some() && existing == out.digest() {
+        return Ok(());
+    }
+    all.insert_unique(out)
+        .map_err(|err| duplication_error(err).0)
+}
+
 /// The error shown when two outputs conflict
 fn duplication_error(err: iddqd::errors::DuplicateItem<Output, &Output>) -> (RenderError, Output) {
     let (new, duplicates) = err.into_parts();
     let new_text = match &new {
         Output::Doc(_d) => format_args!("document"), // TODO: source location?
         Output::Asset { asset, .. } => format_args!("asset {:?}", asset.spec),
+        Output::Companion { path, .. } => format_args!("asset.js chunk \"{}\"", *path),
         Output::Static(_, p) => format_args!("static file \"{}\"", p.display()),
     };
     let dup_text = match &duplicates[0] {
         Output::Doc(_d) => format_args!("a document"), // TODO: source location?
         Output::Asset { asset, .. } => format_args!("an asset {:?}", asset.spec),
+        Output::Companion { path, .. } => format_args!("an asset.js chunk \"{}\"", *path),
         Output::Static(_, p) => format_args!("static file \"{}\"", p.display()),
     };
     (

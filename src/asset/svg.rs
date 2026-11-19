@@ -207,6 +207,9 @@ pub(crate) fn build(
         stem,
         dimensions: None,
         elem_id,
+        output_path: None,
+        companions: Vec::new(),
+        preload: Vec::new(),
     })
 }
 

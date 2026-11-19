@@ -72,6 +72,7 @@ macro_rules! asset_methods {
 
 pub(crate) mod file;
 pub(crate) mod image;
+pub(crate) mod js;
 pub(crate) mod raw;
 pub(crate) mod sass;
 pub(crate) mod svg;
@@ -142,6 +143,13 @@ pub enum AssetSpec {
         ppi: i64,
         /// Minify `svg` output. Normalized to `false` for the other formats.
         minify: bool,
+    },
+    Js {
+        /// The entry module, a project file.
+        entry: FileId,
+        /// Every other `asset.js` field. Two entries with equal options can
+        /// share one rolldown build (see [`js::build_group`]).
+        options: js::JsOptions,
     },
 }
 
@@ -381,7 +389,7 @@ fn read_or_request(
 
 /// Apply `read`'s `encoding` to resolved bytes: `none` → raw bytes, UTF-8 →
 /// decode to a string (erroring on invalid UTF-8, like the native `read`).
-fn decode(bytes: Bytes, encoding: Option<Encoding>) -> HintedStrResult<Readable> {
+pub(crate) fn decode(bytes: Bytes, encoding: Option<Encoding>) -> HintedStrResult<Readable> {
     match encoding {
         None => Ok(Readable::Bytes(bytes)),
         Some(Encoding::Utf8) => {
@@ -393,7 +401,7 @@ fn decode(bytes: Bytes, encoding: Option<Encoding>) -> HintedStrResult<Readable>
 }
 
 /// The empty placeholder returned on a miss, of the type `encoding` selects.
-fn decode_empty(encoding: Option<Encoding>) -> Readable {
+pub(crate) fn decode_empty(encoding: Option<Encoding>) -> Readable {
     match encoding {
         None => Readable::Bytes(Bytes::new(Vec::<u8>::new())),
         Some(Encoding::Utf8) => Readable::Str(Str::from("")),
@@ -424,6 +432,7 @@ pub fn module() -> Module {
     scope.define_elem::<image::ImageAsset>();
     scope.define_elem::<raw::RawAsset>();
     scope.define_elem::<typst_doc::TypstAsset>();
+    scope.define_elem::<js::JsAsset>();
     Module::new("asset", scope)
 }
 
@@ -463,6 +472,60 @@ pub struct Built {
     /// `asset.svg(..).elem-id()` resolves to. `None` for every other asset
     /// type (and for `id: none` svgs).
     pub elem_id: Option<String>,
+    /// Where this asset must be emitted, overriding twyla's fingerprinted
+    /// naming ([`TwylaContext::default_asset_output`](crate::project::TwylaContext::default_asset_output)).
+    /// Set by [`js::build`]: rolldown names the entry and its chunks itself and
+    /// embeds those names in the code (`import "./chunk-x.js"`), so the
+    /// entry has to land exactly where rolldown put it. `None` for every
+    /// other asset type.
+    pub output_path: Option<String>,
+    /// Further files emitted next to this asset whenever it is emitted (a
+    /// `.url()` or bare usage, not `.read()` alone): an `asset.js` entry's
+    /// chunks and sourcemaps. Empty for every other asset type.
+    pub companions: Vec<Companion>,
+    /// Bundle-relative paths of the [`companions`](Self::companions) this
+    /// asset statically imports, transitively: what `asset.js(..).preload()`
+    /// lists. Empty for every other asset type.
+    pub preload: Vec<String>,
+}
+
+/// A file emitted alongside an asset (see [`Built::companions`]). Its
+/// `path` is final and chosen by the tool that produced it, so two assets
+/// whose builds share a chunk name the same `path` — with the same bytes,
+/// since rolldown's chunk names are content hashes — and it's written once.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Companion {
+    /// Bundle-relative output path, e.g. `assets/chunk-BmPq2sXz.js`.
+    pub path: String,
+    pub emit: Emit,
+    /// SHA-256 of the emitted bytes.
+    pub sha256: [u8; 32],
+    pub kind: CompanionKind,
+}
+
+/// What a [`Companion`] is, which decides when it must be emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompanionKind {
+    /// A JS chunk the asset imports (statically or dynamically). An entry
+    /// with chunk companions can't be inlined with `.read()`: its relative
+    /// chunk imports wouldn't resolve.
+    Chunk,
+    /// A sourcemap. Not needed by an inlined (`.read()`) entry, whose
+    /// sourcemap directive is stripped.
+    SourceMap,
+    /// A file the code references by its absolute URL (an `asset.js`
+    /// `?url` import). Needed even by an inlined entry, so it's emitted
+    /// whenever its asset is used at all.
+    File,
+    /// A file of a worker an `asset.js` entry starts (its entry chunk, its
+    /// chunks, their sourcemaps). The worker is fetched by its absolute URL
+    /// (`?worker`) and its own files relative to it, so, like a `File`, it's
+    /// needed even by an inlined entry.
+    Worker,
+    /// The entry chunk of a worker the code starts by a URL relative to the
+    /// script (`new Worker(new URL("./w.ts", import.meta.url))`). Like a
+    /// `Chunk`, it keeps the entry from being inlined.
+    RelativeWorker,
 }
 
 impl Built {
@@ -479,6 +542,12 @@ impl Hash for Built {
         if let Emit::Copy(path) = &self.emit {
             path.hash(state);
         }
+        self.output_path.hash(state);
+        for companion in &self.companions {
+            companion.path.hash(state);
+            companion.sha256.hash(state);
+        }
+        self.preload.hash(state);
     }
 }
 
@@ -518,6 +587,10 @@ pub struct ResolvedAsset {
     pub url: String,
     /// Per-output-policy resolved paths/URLs for `.url()` usages.
     pub resolutions: Vec<Resolution>,
+    /// Public URLs of [`Built::preload`] (each resolved through
+    /// [`TwylaContext::asset_url`](crate::project::TwylaContext::asset_url),
+    /// like `url`): what `asset.js(..).preload()` returns.
+    pub preload: Vec<String>,
     /// How this asset is used *this compile* — the union of [`OutputReq`]s over
     /// its call sites, accumulated as requests are discovered. Drives emission
     /// ([`Resolver::emittable_assets`](crate::resolver::Resolver::emittable_assets)):
@@ -558,6 +631,7 @@ impl PartialEq for ResolvedAsset {
             && self.output_path == other.output_path
             && self.url == other.url
             && self.resolutions == other.resolutions
+            && self.preload == other.preload
             && self.outputs == other.outputs
     }
 }
@@ -569,6 +643,7 @@ impl Hash for ResolvedAsset {
         self.output_path.hash(state);
         self.url.hash(state);
         self.resolutions.hash(state);
+        self.preload.hash(state);
         self.outputs.hash(state);
     }
 }

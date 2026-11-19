@@ -6,6 +6,8 @@
 //! drive it through the asset system. Showing a bare `FileAsset` emits the asset
 //! and renders nothing.
 
+use std::path::PathBuf;
+
 use super::{AssetSpec, Built, OutputReq, emit_or_request, resolve_path};
 use crate::ledger::{DepRecorder, annotate};
 use crate::project::TwylaContext;
@@ -73,8 +75,14 @@ pub(crate) fn build(
         )]
     };
     let hash = rec.open(&path).map_err(err)?.finish().map_err(err)?;
+    Ok(copied(path, hash))
+}
 
-    Ok(Built {
+/// The [`Built`] of a verbatim copy of `path`, whose contents hash to
+/// `hash`. Shared with `asset.js`'s `?url` imports, so a file imported that
+/// way gets exactly the output path (and URL) `asset.file` gives it.
+pub(crate) fn copied(path: PathBuf, hash: [u8; 32]) -> Built {
+    Built {
         sha256: hash,
         stem: path
             .file_stem()
@@ -87,5 +95,8 @@ pub(crate) fn build(
         emit: Emit::Copy(path),
         dimensions: None,
         elem_id: None,
-    })
+        output_path: None,
+        companions: Vec::new(),
+        preload: Vec::new(),
+    }
 }

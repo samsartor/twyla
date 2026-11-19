@@ -9,7 +9,7 @@ use comemo::{Track, Tracked, TrackedMut};
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
 use iddqd::IdHashMap;
 use typst::World;
-use typst::diag::{HintedString, SourceDiagnostic, SourceResult, StrResult, Warned};
+use typst::diag::{HintedString, Severity, SourceDiagnostic, SourceResult, StrResult, Warned};
 use typst::foundations::{
     BundlePath, Content, Context, Dynamic, IntoValue, Label, NativeElement, Output, Selector,
     Smart, Str, StyleChain, Styles, Target, TargetElem, Value,
@@ -25,10 +25,10 @@ use typst_library::model::{DocumentElem, DocumentInfo, Numbering};
 use typst_library::routines::{Arenas, RealizationKind};
 use typst_utils::Protected;
 
-use crate::asset::{AssetReqIntrospect, ResolvedAsset, hash_spec};
+use crate::asset::{AssetReqIntrospect, Companion, ResolvedAsset, hash_spec};
 use crate::document::{
-    DOCUMENTS_LIST_KEY, DocumentOutput, ResolvedDocument, ResolvedDocumentIntrospect,
-    TwylaDocument, derive_output,
+    DOCUMENTS_LIST_KEY, DocumentAtIntrospect, DocumentOutput, DocumentsArrayIntrospect,
+    ResolvedDocument, ResolvedDocumentIntrospect, TwylaDocument, derive_output,
 };
 use crate::project::{TwylaContext, present_output};
 use crate::resolver::Resolver;
@@ -44,6 +44,9 @@ pub struct CompiledBundle {
     pub bundle: Bundle,
     pub pages: Vec<ResolvedDocument>,
     pub assets: Vec<(String, Arc<ResolvedAsset>)>,
+    /// Companions to emit on their own: see
+    /// [`Resolver::read_only_file_companions`].
+    pub companions: Vec<Companion>,
 }
 
 /// Compile `pages` into a [`Bundle`] *and* harvest each page's twyla
@@ -66,6 +69,8 @@ pub fn compile_bundle(
         resolver,
     )
     .map_err(deduplicate);
+    // Bound the `asset.js` group cache, whether or not the compile succeeded.
+    resolver.prune_js_groups(output.is_ok());
     Warned {
         output,
         warnings: sink.warnings(),
@@ -87,6 +92,8 @@ fn compile_bundle_impl(
     // Asset *usage* (which assets are linked vs only inlined) is recomputed from
     // this compile's requests, so a dropped `.url()` stops emitting the file.
     resolver.clear_asset_usage();
+    // `asset.js` groups are re-formed from this compile's requests.
+    resolver.reset_js_groups();
     // Documents are re-discovered from scratch each compile (cheap; their
     // sources are typst deps), so drop the previous compile's set — otherwise a
     // since-edited inline document would look like a conflicting one.
@@ -127,10 +134,12 @@ fn compile_bundle_impl(
     let mut pages: Vec<ResolvedDocument> = files;
     pages.extend(resolver.documents().cloned());
     let assets: Vec<(String, Arc<ResolvedAsset>)> = resolver.emittable_assets().collect();
+    let companions = resolver.read_only_file_companions();
     Ok(CompiledBundle {
         bundle,
         pages,
         assets,
+        companions,
     })
 }
 
@@ -332,9 +341,14 @@ fn compile_bundle_loop(
     let mut document: Bundle;
 
     loop {
-        // Content = file pages + every document discovered so far, each routed
-        // to its own bundle output; grows as discovery proceeds.
+        // Content = file pages + the inline documents, each routed
+        // to its own bundle output, as of the last discovery pass.
         let content = build_content(files, resolver);
+        // The inline documents that content was built from: if this pass
+        // collects different ones (a body that captured a value that has
+        // since changed), the bundle rendered stale bodies, and must be
+        // rebuilt even if nothing *read* the documents.
+        let documents_in = resolver.documents_snapshot();
 
         let input: &TwylaIntrospector = history.last().unwrap_or(&empty);
         let constraint = comemo::Constraint::new();
@@ -398,7 +412,8 @@ fn compile_bundle_loop(
             ctx: ctx.clone(),
         };
 
-        if constraint.validate(&output as &dyn Introspector) {
+        let documents_settled = same_documents(&documents_in, &output.documents);
+        if documents_settled && constraint.validate(&output as &dyn Introspector) {
             sink.extend_from_sink(subsink);
             break;
         }
@@ -414,11 +429,42 @@ fn compile_bundle_loop(
             }
             introspectors[MAX_ITERS] = &output;
 
-            let warnings = analyze(world, introspectors, subsink.introspections());
+            // Twyla's own introspections (asset URLs, documents) are
+            // analyzed apart from typst's: if one of them is still unstable,
+            // the output would ship a pending placeholder or a URL for a file
+            // that isn't emitted, so it's an error, not a warning.
+            let (twyla, typst): (Vec<Introspection>, Vec<Introspection>) = subsink
+                .introspections()
+                .iter()
+                .cloned()
+                .partition(is_twyla_introspection);
+            let unstable = analyze(world, introspectors, &twyla);
+            let warnings = analyze(world, introspectors, &typst);
 
             sink.extend_from_sink(subsink);
             for warning in warnings {
                 sink.warn(warning);
+            }
+            let mut unstable = unstable;
+            if !documents_settled {
+                unstable.push(
+                    SourceDiagnostic::error(
+                        Span::detached(),
+                        "the inline documents did not stabilize within five attempts",
+                    )
+                    .with_hint(
+                        "a `document(..)` body keeps capturing a value that changes each pass",
+                    ),
+                );
+            }
+            if !unstable.is_empty() {
+                return Err(unstable
+                    .into_iter()
+                    .map(|mut diag| {
+                        diag.severity = Severity::Error;
+                        diag
+                    })
+                    .collect());
             }
             break;
         }
@@ -435,6 +481,31 @@ fn compile_bundle_loop(
     Ok(document)
 }
 
+/// Whether two document sets are equal, body for body.
+fn same_documents(
+    a: &IdHashMap<Arc<ResolvedDocument>>,
+    b: &IdHashMap<Arc<ResolvedDocument>>,
+) -> bool {
+    a.len() == b.len()
+        && a.iter().all(|doc| {
+            b.get(doc.output.as_str())
+                .is_some_and(|other| **other == **doc)
+        })
+}
+
+/// Whether `introspection` is one of twyla's: an asset request, a document,
+/// or a read of the document list or metadata.
+fn is_twyla_introspection(introspection: &Introspection) -> bool {
+    introspection.downcast::<AssetReqIntrospect>().is_some()
+        || introspection
+            .downcast::<ResolvedDocumentIntrospect>()
+            .is_some()
+        || introspection.downcast::<DocumentAtIntrospect>().is_some()
+        || introspection
+            .downcast::<DocumentsArrayIntrospect>()
+            .is_some()
+}
+
 /// Resolve every asset and collect every document a realization requested.
 ///
 /// Each `asset.*().url()`/`.read()` and inline `document(..)` records an
@@ -447,14 +518,40 @@ fn discover_requests(
     world: Tracked<dyn World + '_>,
     introspections: &[Introspection],
 ) -> SourceResult<()> {
+    // Documents are collected afresh each pass: every pass replays every
+    // live request (see above), and a document whose body captured a value
+    // that changed since an earlier pass (a URL that was still pending, or
+    // that a regrouped `asset.js` changed) would otherwise conflict with its
+    // own earlier version, or linger under a stale auto output.
+    resolver.clear_documents();
+    // Every `asset.js` request first: they're built in groups, which must
+    // know all of the pass's members before any is resolved.
+    resolver.prebuild_js_groups(
+        introspections
+            .iter()
+            .filter_map(|i| i.downcast::<AssetReqIntrospect>())
+            .map(|req| &req.0),
+    );
+    // Every failing request is reported, not just the first: a failed
+    // `asset.js` group fails each of its members, at each one's call site.
+    let mut errors = EcoVec::new();
     for introspection in introspections {
-        if let Some(req) = introspection.downcast::<AssetReqIntrospect>() {
-            resolver.resolve_asset(world, &req.0)?;
+        let result = if let Some(req) = introspection.downcast::<AssetReqIntrospect>() {
+            resolver.resolve_asset(world, &req.0)
         } else if let Some(req) = introspection.downcast::<ResolvedDocumentIntrospect>() {
-            resolver.collect_document(&req.0)?;
+            resolver.collect_document(&req.0)
+        } else {
+            Ok(())
+        };
+        if let Err(errs) = result {
+            errors.extend(errs);
         }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 fn resolve_outputs(resolver: &mut Resolver, engine: &mut Engine) -> SourceResult<()> {

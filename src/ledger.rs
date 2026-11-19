@@ -48,6 +48,12 @@ pub enum DepKind {
     Probe,
     /// The build listed a directory. Valid while the entry names are the same.
     Dir,
+    /// The build went *through* the path, without reading or listing it
+    /// itself: a symlink that a resolver followed to its target. Valid while
+    /// [`Stamp::now`] — which follows symlinks: a file's identity (inode,
+    /// times), a directory's listing — is the same, so retargeting the link
+    /// is a change even when nothing at the old target changed.
+    Stat,
 }
 
 /// One recorded access. See the module docs.
@@ -367,6 +373,31 @@ impl DepRecorder {
         meta.is_some_and(|m| m.is_dir())
     }
 
+    /// `path`'s metadata (following symlinks), or `None` if it can't be
+    /// stat'ed, recorded as a probe. For tools whose filesystem interface asks
+    /// for metadata rather than a yes/no (rolldown's resolver).
+    pub fn metadata(&self, path: &Path) -> Option<fs::Metadata> {
+        let (dep, meta) = observe_probe(path);
+        self.push(dep);
+        meta
+    }
+
+    /// Record that the build went through `path` (a followed symlink; see
+    /// [`DepKind::Stat`]). Doesn't read anything.
+    pub fn stat(&self, path: &Path) {
+        let path = absolute(path);
+        let observed_at = SystemTime::now();
+        let stamp = Stamp::now(&path);
+        self.push(Dep {
+            path,
+            kind: DepKind::Stat,
+            stamp,
+            sha256: None,
+            error: None,
+            observed_at,
+        });
+    }
+
     /// The entry names of directory `path`, recorded by listing.
     pub fn list_dir(&self, path: &Path) -> io::Result<Vec<OsString>> {
         let (dep, result) = observe_dir(path);
@@ -379,6 +410,17 @@ impl DepRecorder {
     /// them at access time.
     pub fn ingest(&self, deps: impl IntoIterator<Item = Dep>) {
         self.lock().extend(deps);
+    }
+
+    /// Move everything `other` recorded into this recorder, including its
+    /// [`content_reads`](Self::content_reads) count. For a tool that needs an
+    /// owned (`'static`) recorder of its own during the build (rolldown's
+    /// filesystem must be `Clone + 'static`), folded back into the build's
+    /// recorder afterwards.
+    pub fn absorb(&self, other: &DepRecorder) {
+        self.content_reads
+            .fetch_add(other.content_reads(), Ordering::Relaxed);
+        self.ingest(other.take());
     }
 
     /// How many files' contents were read since the last
@@ -562,7 +604,7 @@ pub fn revalidate(deps: &[Dep], content_reads: &mut usize) -> Revalidation {
                 }
                 None
             }
-            DepKind::Dir => {
+            DepKind::Dir | DepKind::Stat => {
                 if Stamp::now(&dep.path) != dep.stamp {
                     return Revalidation::Changed;
                 }

@@ -88,5 +88,8 @@ pub(crate) fn build(bytes: Bytes, ext: Option<EcoString>) -> Built {
         emit: crate::render::Emit::Bytes(bytes),
         dimensions: None,
         elem_id: None,
+        output_path: None,
+        companions: Vec::new(),
+        preload: Vec::new(),
     }
 }
