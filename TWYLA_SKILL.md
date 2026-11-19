@@ -106,6 +106,7 @@ Twyla registers these on top of stock Typst. This is your whole toolbox.
 #context asset.sass(bytes("$x: red; a { color: $x }"), format: "scss").url()
 #context asset.file("/static/logo.png").url()   // copy a file verbatim
 #context asset.image("/img/hero.jpg", width: 1024, format: "webp").url()  // resize + transcode
+#context asset.image("/img/plot.svg", width: 800, format: "png").url()    // rasterize svg/pdf
 #context asset.svg(bytes("<svg>...</svg>")).url()  // bytes are parsed directly
 #context asset.raw("body { color: red }", extension: "css").url()  // emit inline data verbatim
 #context asset.typst("/resume/cv.typ", format: "pdf").url()  // compile a typst doc (svg/png/pdf/html)
@@ -117,7 +118,9 @@ in `#context`). For `asset.sass`, `asset.image`, and `asset.svg`, strings and
 paths name files while `bytes` values are treated as the source data itself.
 Use `asset.file` for a verbatim file and `asset.raw` for verbatim inline text or
 bytes (`extension` defaults to `"bin"`). `asset.image` defaults `format` to
-`auto`, preserving the detected source format.
+`auto`, preserving the detected source format. SVG and PDF sources (a PDF's
+first page) are rasterized by typst at the target size, so they require an
+explicit raster `format` and at least one of `width`/`height`.
 
 **Raw HTML & text:**
 

@@ -14,6 +14,12 @@
 //! fills, rotation, anchors) are intentionally out of scope — those belong in a
 //! Typst drawing API, not the asset pipeline.
 //!
+//! Vector sources (SVG, PDF) are *rasterized* rather than decoded: they need an
+//! explicit raster `format` and at least one of `width`/`height`, and are
+//! rendered by typst's own image renderers (resvg / hayro, via
+//! `typst_render`) directly at the target pixel size — no render-then-resample
+//! step, so `filter` doesn't apply. A PDF renders its first page.
+//!
 //! Encoders: PNG / JPEG / GIF / AVIF go through the `image` crate; lossy WebP
 //! goes through libwebp (the `webp` crate), because `image`'s pure-Rust WebP
 //! encoder is lossless-only and lossless WebP defeats the point for photos.
@@ -22,20 +28,32 @@ use std::io::Cursor;
 
 use super::{
     AssetInput, AssetSource, AssetSpec, Built, OutputReq, emit_or_request, resolve_input, sha256,
+    typst_doc,
 };
 use crate::ledger::DepRecorder;
 use crate::project::TwylaContext;
 use crate::render::Emit;
+use comemo::{Track, Tracked};
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
 use image::codecs::avif::AvifEncoder;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageEncoder, ImageFormat};
-use typst::diag::{HintedStrResult, SourceDiagnostic, SourceResult};
+use typst::World;
+use typst::diag::{HintedStrResult, LoadedWithin, SourceDiagnostic, SourceResult};
 use typst::foundations::{
-    AutoValue, Bytes, Cast, Packed, ShowFn, StyleChain, cast, elem, func, scope,
+    AutoValue, Bytes, Cast, Content, Packed, ShowFn, Smart, StyleChain, cast, elem, func, scope,
 };
-use typst::syntax::Span;
+use typst::layout::{Abs, Frame, FrameItem, Point, Size};
+use typst::loading::{LoadSource, Loaded};
+use typst::syntax::{Span, Spanned};
+use typst::text::families;
+use typst::visualize::{
+    Color, Image, ImageFormat as TypstImageFormat, ImageKind, PdfDocument, PdfImage, SvgImage,
+    VectorFormat,
+};
+use typst_kit::packages::SystemPackages;
+use typst_layout::Page;
 
 /// Pulls in an image file as an asset.
 ///
@@ -48,6 +66,10 @@ use typst::syntax::Span;
 /// By default, the image file is copied verbatim (same as #link("#file")[file]).
 /// If `format` is provided, the image will be transcoded. If `width`/`height` are
 /// provided, the image will be resized.
+///
+/// An SVG or PDF source is rasterized (a PDF's first page), which requires an
+/// explicit `format` and at least one of `width`/`height`:
+/// `asset.image("diagram.svg", width: 800, format: "png")`.
 ///
 /// All parameters are settable, so `#set asset.image(format: "webp")` applies to
 /// any image asset in the scope.
@@ -78,6 +100,7 @@ pub struct ImageAsset {
 
     /// The resampling filter used when scaling. `"lanczos"` (the default) gives
     /// the best downscaling quality; cheaper options trade quality for speed.
+    /// Ignored for SVG/PDF sources, which render directly at the target size.
     #[default(Filter::Lanczos)]
     pub filter: Filter,
 
@@ -289,6 +312,7 @@ impl OutputFormat {
 
 /// Decode the source image, resize it per `fit`/`filter` (if any dimension is
 /// given), and re-encode it to `format` (or the source format) at `quality`.
+/// An SVG/PDF source is instead rasterized at the target size ([`rasterize`]).
 ///
 /// A file-backed source is read through the recorder (so it joins the asset's
 /// ledger deps for invalidation/watching) — like [`file::build`](super::file::build),
@@ -298,6 +322,7 @@ impl OutputFormat {
 /// native rule can emit `<img width height>`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build(
+    world: Tracked<dyn World + '_>,
     source: &AssetSource,
     width: Option<u32>,
     height: Option<u32>,
@@ -306,6 +331,7 @@ pub(crate) fn build(
     format: Format,
     quality: u8,
     ctx: &TwylaContext,
+    packages: &SystemPackages,
     span: Span,
     rec: &DepRecorder,
 ) -> SourceResult<Built> {
@@ -324,23 +350,59 @@ pub(crate) fn build(
         AssetSource::Bytes(bytes) => (None, bytes.to_vec()),
     };
 
-    // Detect the source format up front: it drives both decoding and the
-    // "keep source format" default.
-    let detected = image::guess_format(&bytes)
-        .map_err(|err| err_at(span, format_args!("not a recognized image: {err}")))?;
-    let out_format = match format.explicit() {
-        Some(f) => f,
-        None => OutputFormat::from_detected(detected).ok_or_else(|| {
-            err_at(
-                span,
-                format_args!("cannot re-encode {detected:?} images; set an explicit `format`"),
+    let (img, out_format) = match image::guess_format(&bytes) {
+        // Raster: detect the source format up front — it drives both decoding
+        // and the "keep source format" default.
+        Ok(detected) => {
+            let out_format = match format.explicit() {
+                Some(f) => f,
+                None => OutputFormat::from_detected(detected).ok_or_else(|| {
+                    err_at(
+                        span,
+                        format_args!(
+                            "cannot re-encode {detected:?} images; set an explicit `format`"
+                        ),
+                    )
+                })?,
+            };
+            let img = image::load_from_memory_with_format(&bytes, detected)
+                .map_err(|err| err_at(span, format_args!("failed to decode image: {err}")))?;
+            (
+                resize(img, width, height, fit, filter.into(), span)?,
+                out_format,
             )
-        })?,
+        }
+        Err(err) => match TypstImageFormat::detect(&bytes) {
+            Some(TypstImageFormat::Vector(vector)) => {
+                let name = vector_name(vector);
+                let out_format = format.explicit().ok_or_else(|| {
+                    err_at(
+                        span,
+                        format_args!(
+                            "{name} images must be rasterized; set an explicit raster `format`"
+                        ),
+                    )
+                })?;
+                if width.is_none() && height.is_none() {
+                    return Err(err_at(
+                        span,
+                        format_args!("rasterizing {name} images needs `width` and/or `height`"),
+                    ));
+                }
+                let opaque = out_format == OutputFormat::Jpeg;
+                let vector = Vector {
+                    format: vector,
+                    source,
+                    bytes,
+                };
+                let img = rasterize(
+                    vector, width, height, fit, opaque, world, ctx, packages, span, rec,
+                )?;
+                (img, out_format)
+            }
+            _ => return Err(err_at(span, format_args!("not a recognized image: {err}"))),
+        },
     };
-
-    let img = image::load_from_memory_with_format(&bytes, detected)
-        .map_err(|err| err_at(span, format_args!("failed to decode image: {err}")))?;
-    let img = resize(img, width, height, fit, filter.into(), span)?;
     let dimensions = Some((img.width(), img.height()));
     let encoded = encode(&img, out_format, quality).map_err(|err| err_at(span, err))?;
 
@@ -386,6 +448,134 @@ fn resize(
             }
         },
     }
+}
+
+/// The user-facing name of a vector source format, for diagnostics.
+fn vector_name(format: VectorFormat) -> &'static str {
+    match format {
+        VectorFormat::Svg => "SVG",
+        VectorFormat::Pdf => "PDF",
+    }
+}
+
+/// A vector image source to rasterize: its detected format, where it came from
+/// (for resolving an SVG's relative `href`s and placing load errors), and its
+/// bytes.
+struct Vector<'a> {
+    format: VectorFormat,
+    source: &'a AssetSource,
+    bytes: Vec<u8>,
+}
+
+/// Rasterize an SVG or PDF (first page) with typst's image renderers, directly
+/// at the target pixel size: the image is placed into a frame of the output
+/// size (1pt = 1px) per `fit` and rendered with [`typst_render::render`], which
+/// builds the vector texture at exactly the painted size. The background is
+/// transparent unless `opaque` (JPEG, which has no alpha) asks for white.
+///
+/// An SVG loads its fonts from the live `world` (using the default text font
+/// families as the fallback list) and its linked images through a recording
+/// world ([`typst_doc::file_world`]), so they join the asset's deps.
+#[allow(clippy::too_many_arguments)]
+fn rasterize(
+    vector: Vector,
+    width: Option<u32>,
+    height: Option<u32>,
+    fit: Fit,
+    opaque: bool,
+    world: Tracked<dyn World + '_>,
+    ctx: &TwylaContext,
+    packages: &SystemPackages,
+    span: Span,
+    rec: &DepRecorder,
+) -> SourceResult<DynamicImage> {
+    let data = Bytes::new(vector.bytes);
+    let kind = match vector.format {
+        VectorFormat::Svg => {
+            // Relative hrefs resolve against the SVG file, or (inline bytes)
+            // the calling file — as typst's own `image` does.
+            let (file, load_source) = match vector.source {
+                AssetSource::File(file) => (Some(*file), LoadSource::Path(*file)),
+                AssetSource::Bytes(_) => (span.id(), LoadSource::Bytes),
+            };
+            let loaded = Loaded::new(Spanned::new(load_source, span), data.clone());
+            let library = world.library();
+            let families: Vec<&str> = families(StyleChain::new(&library.styles))
+                .map(|family| family.as_str())
+                .collect();
+            let files = typst_doc::file_world(world, ctx, packages, rec);
+            let files: &dyn World = &files;
+            let svg = SvgImage::with_fonts_images(data, files.track(), &families, file)
+                .within(&loaded)?;
+            ImageKind::Svg(svg)
+        }
+        VectorFormat::Pdf => {
+            let document = PdfDocument::new(data).map_err(|err| {
+                err_at(span, format_args!("the PDF could not be loaded ({err:?})"))
+            })?;
+            let page =
+                PdfImage::new(document, 0).ok_or_else(|| err_at(span, "the PDF has no pages"))?;
+            ImageKind::Pdf(page)
+        }
+    };
+    let image = Image::plain(kind);
+
+    // Canvas size and the image's placed size, in pixels.
+    let aspect = image.width() / image.height();
+    let (canvas, placed) = match fit {
+        Fit::Contain => {
+            let (w, h) = match (width, height) {
+                (Some(w), None) => (w as f64, w as f64 / aspect),
+                (None, Some(h)) => (h as f64 * aspect, h as f64),
+                (Some(w), Some(h)) if w as f64 / h as f64 > aspect => (h as f64 * aspect, h as f64),
+                (Some(w), _) => (w as f64, w as f64 / aspect),
+                (None, None) => unreachable!("checked by the caller"),
+            };
+            let size = (w.round().max(1.0), h.round().max(1.0));
+            (size, size)
+        }
+        Fit::Cover => {
+            let (w, h) = both(width, height, "cover", span)?;
+            let (w, h) = (w as f64, h as f64);
+            let placed = if w / h > aspect {
+                (w, w / aspect)
+            } else {
+                (h * aspect, h)
+            };
+            ((w, h), placed)
+        }
+        Fit::Stretch => {
+            let (w, h) = both(width, height, "stretch", span)?;
+            let size = (w as f64, h as f64);
+            (size, size)
+        }
+    };
+
+    // Center the image (only `cover` overflows; the canvas crops it).
+    let mut frame = Frame::hard(Size::new(Abs::pt(canvas.0), Abs::pt(canvas.1)));
+    let offset = Point::new(
+        Abs::pt((canvas.0 - placed.0) / 2.0),
+        Abs::pt((canvas.1 - placed.1) / 2.0),
+    );
+    let placed = Size::new(Abs::pt(placed.0), Abs::pt(placed.1));
+    frame.push(offset, FrameItem::Image(image, placed, span));
+    let page = Page {
+        frame,
+        fill: Smart::Custom(opaque.then(|| Color::WHITE.into())),
+        numbering: None,
+        supplement: Content::empty(),
+        number: 1,
+    };
+    let pixmap = typst_render::render(&page, 1.0);
+
+    let mut rgba = Vec::with_capacity(pixmap.data().len());
+    for pixel in pixmap.pixels() {
+        let c = pixel.demultiply();
+        rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    let buf = image::RgbaImage::from_raw(pixmap.width(), pixmap.height(), rgba)
+        .expect("pixmap is width × height RGBA");
+    Ok(DynamicImage::ImageRgba8(buf))
 }
 
 /// Require both dimensions for a fit mode that crops/stretches.

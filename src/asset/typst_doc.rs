@@ -391,6 +391,32 @@ fn err_at(span: Span, msg: impl std::fmt::Display) -> ecow::EcoVec<SourceDiagnos
     )]
 }
 
+/// A recording [`World`] with no meaningful `main`, for loading files *outside*
+/// a compile — `asset.image`'s vector rasterization hands it to
+/// [`SvgImage::with_fonts_images`](typst::visualize::SvgImage::with_fonts_images)
+/// so an SVG's linked images are read through `rec` (and join the asset's
+/// deps) instead of the live world's `FileStore`. Library, fonts and date
+/// delegate to the live `world`.
+pub(crate) fn file_world<'a>(
+    world: Tracked<'a, dyn World + 'a>,
+    ctx: &'a TwylaContext,
+    packages: &'a SystemPackages,
+    rec: &'a DepRecorder,
+) -> TypstWorld<'a> {
+    let main = Source::detached("");
+    TypstWorld {
+        library: world.library().clone(),
+        world,
+        main_id: main.id(),
+        main_src: Some(main),
+        root: &ctx.root,
+        packages,
+        rec,
+        loaded: Mutex::new(HashMap::new()),
+        located: Mutex::new(HashMap::new()),
+    }
+}
+
 /// A [`World`] for an `asset.typst` sub-compile: serves a stock library + a
 /// `main` (a synthetic source for inline content, or the real project file for
 /// a path source), reads project and package files itself through the
@@ -399,7 +425,7 @@ fn err_at(span: Span, msg: impl std::fmt::Display) -> ecow::EcoVec<SourceDiagnos
 /// Owns the stock library (it returns a reference, so it can't be borrowed
 /// across the `Tracked` boundary — the same reason `SnippetWorld` clones). The
 /// font book is read off the live world per call.
-struct TypstWorld<'a> {
+pub(crate) struct TypstWorld<'a> {
     world: Tracked<'a, dyn World + 'a>,
     library: LazyHash<Library>,
     main_id: FileId,
