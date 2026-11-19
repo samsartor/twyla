@@ -42,7 +42,8 @@ pub enum DepKind {
     Read,
     /// The build asked whether something exists at the path (e.g. sass import
     /// resolution trying `_partial.scss`, `partial.scss`, …). Valid while the
-    /// answer — missing, file, or directory — stays the same. Its stamp is
+    /// answer — missing, regular file, directory, or something else (a FIFO)
+    /// — stays the same. Its stamp is
     /// always [`Stamp::Missing`] or [`Stamp::Exists`].
     Probe,
     /// The build listed a directory. Valid while the entry names are the same.
@@ -69,7 +70,8 @@ pub struct Dep {
     pub sha256: Option<[u8; 32]>,
     /// Why the access failed, if it did (`NotFound`, `PermissionDenied`,
     /// `IsADirectory`, …). Kept for diagnosis; validity is decided by the
-    /// stamp (see [`revalidate`]).
+    /// stamp (see [`revalidate`]), except that a [transient](is_transient)
+    /// error is never valid.
     pub error: Option<io::ErrorKind>,
     /// Wall-clock time just before the stamp was taken. A file changed
     /// within the timestamp granularity of this may be rewritten without its
@@ -108,26 +110,33 @@ impl Dep {
     /// current clock, so it can't reproduce it. So a future-dated file is
     /// re-hashed at most until its stamp settles, not on every compile.
     pub fn is_racy(&self) -> bool {
-        let (DepKind::Read, Stamp::File { mtime, ctime, .. }, Some(_)) =
-            (self.kind, &self.stamp, self.sha256)
-        else {
-            return false;
-        };
-        let changed = ctime.unwrap_or(*mtime);
-        let whole_second = changed
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .is_ok_and(|d| d.subsec_nanos() == 0);
-        let window = if whole_second {
-            RACY_WINDOW
-        } else {
-            FINE_RACY_WINDOW
-        };
-        let gap = match changed.duration_since(self.observed_at) {
-            Ok(ahead) => ahead,
-            Err(behind) => behind.duration(),
-        };
-        gap < window
+        self.kind == DepKind::Read
+            && self.sha256.is_some()
+            && stamp_is_racy(&self.stamp, self.observed_at)
     }
+}
+
+/// Whether a file `stamp` taken at `observed_at` is racy: see
+/// [`Dep::is_racy`]. Also used by the watcher's poll to decide when a racy
+/// polled file has settled.
+pub fn stamp_is_racy(stamp: &Stamp, observed_at: SystemTime) -> bool {
+    let Stamp::File { mtime, ctime, .. } = stamp else {
+        return false;
+    };
+    let changed = ctime.unwrap_or(*mtime);
+    let whole_second = changed
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .is_ok_and(|d| d.subsec_nanos() == 0);
+    let window = if whole_second {
+        RACY_WINDOW
+    } else {
+        FINE_RACY_WINDOW
+    };
+    let gap = match changed.duration_since(observed_at) {
+        Ok(ahead) => ahead,
+        Err(behind) => behind.duration(),
+    };
+    gap < window
 }
 
 // ---------------------------------------------------------------------------
@@ -199,20 +208,17 @@ pub fn observe_probe(path: &Path) -> (Dep, Option<fs::Metadata>) {
     (dep, meta)
 }
 
-/// List `path`'s entry names, recording the access.
+/// List `path`'s entry names, recording the access (names and entry kinds,
+/// see [`Stamp::Dir`]).
 pub fn observe_dir(path: &Path) -> (Dep, io::Result<Vec<OsString>>) {
     let path = absolute(path);
     let observed_at = SystemTime::now();
     // For a failed listing, the baseline is what was there *before* (one
     // stat, no listing), as for a failed read.
     let before = fs::metadata(&path);
-    let result = fs::read_dir(&path).and_then(|entries| {
-        entries
-            .map(|entry| entry.map(|e| e.file_name()))
-            .collect::<io::Result<Vec<_>>>()
-    });
+    let result = crate::watch::read_dir_entries(&path);
     let (stamp, error) = match &result {
-        Ok(names) => (Stamp::dir_listing(names.clone()), None),
+        Ok(entries) => (Stamp::dir_listing(entries.clone()), None),
         Err(err) => {
             let stamp = match &before {
                 Err(_) => Stamp::Missing,
@@ -230,7 +236,10 @@ pub fn observe_dir(path: &Path) -> (Dep, io::Result<Vec<OsString>>) {
         error,
         observed_at,
     };
-    (dep, result)
+    (
+        dep,
+        result.map(|entries| entries.into_iter().map(|(name, _)| name).collect()),
+    )
 }
 
 /// The racy-read guard: the stamp taken before a successful read, if the path
@@ -263,6 +272,21 @@ fn failed_read(path: PathBuf, before: Stamp, error: io::ErrorKind, observed_at: 
         error: Some(error),
         observed_at,
     }
+}
+
+/// Whether an I/O error says nothing about the file, only about the moment:
+/// out of file descriptors (`EMFILE`/`ENFILE`), interrupted, would block,
+/// timed out, out of memory. A build that failed this way is retried by the
+/// next compile instead of being cached against the (unchanged) stamp —
+/// otherwise nothing would ever retry it, since the file never changes.
+/// Retried on the next compile only, never forcing one, so a persistent
+/// `EMFILE` can't loop the dev server.
+pub fn is_transient(kind: io::ErrorKind) -> bool {
+    use io::ErrorKind::*;
+    matches!(kind, Interrupted | WouldBlock | TimedOut | OutOfMemory)
+        // `ErrorKind::TooManyOpenFiles` (EMFILE/ENFILE) is unstable
+        // (`io_error_too_many_open_files`), so it can't be named here yet.
+        || format!("{kind:?}") == "TooManyOpenFiles"
 }
 
 /// Make `path` absolute without touching the filesystem (it may not exist).
@@ -499,7 +523,8 @@ pub enum Revalidation {
 ///   re-hash by streaming: same digest → valid with a fresh stamp (so a
 ///   `touch` doesn't redo an image pipeline); different → changed. A read
 ///   that *failed* is valid while its pre-access stamp still matches (see
-///   [`failed_read`]): the same state fails the same way.
+///   [`failed_read`]): the same state fails the same way — unless the error
+///   was [transient](is_transient), which is always retried.
 /// - **Probe**: valid while the path is still missing / a file / a directory.
 /// - **Dir**: valid while the listing is the same.
 ///
@@ -507,6 +532,9 @@ pub enum Revalidation {
 pub fn revalidate(deps: &[Dep], content_reads: &mut usize) -> Revalidation {
     let mut restamped: Option<Vec<Dep>> = None;
     for (i, dep) in deps.iter().enumerate() {
+        if dep.error.is_some_and(is_transient) {
+            return Revalidation::Changed;
+        }
         let fresh = match dep.kind {
             DepKind::Read => {
                 let now = Stamp::now(&dep.path);

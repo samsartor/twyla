@@ -13,7 +13,7 @@ use std::{fmt, fs, io};
 
 use iddqd::{IdHashItem, IdHashMap, id_upcast};
 
-use typst::diag::{FileError, FileResult, PackageResult, SourceDiagnostic, Warned};
+use typst::diag::{FileError, FileResult, PackageError, PackageResult, SourceDiagnostic, Warned};
 use typst::foundations::{
     Binding, Bytes, Datetime, Dict, Duration, IntoValue, Module, Scope, Value, Version,
 };
@@ -677,7 +677,29 @@ pub(crate) fn locate_package(
             return Ok(FsRoot::new(dir));
         }
     }
-    packages.obtain(spec)
+    // Not installed locally (as recorded). Go straight to the download cache
+    // and Universe — the same steps as `SystemPackages::obtain` after its own
+    // local lookup, which isn't repeated: a package installed between the
+    // recorded miss and a second lookup would load while the ledger says
+    // `Missing`, and the first watch update would rebuild for nothing.
+    let Some(cache) = packages.cache() else {
+        return Err(PackageError::NotFound(spec.clone()));
+    };
+    if let Some(root) = cache.obtain(spec) {
+        return Ok(root);
+    }
+    if spec.namespace == UniversePackages::NAMESPACE {
+        let mut archive = packages.universe().package(spec)?;
+        cache.store(spec, |tempdir| {
+            archive
+                .unpack(tempdir)
+                .map_err(|err| PackageError::MalformedArchive(Some(ecow::eco_format!("{err}"))))
+        })?;
+        if let Some(root) = cache.obtain(spec) {
+            return Ok(root);
+        }
+    }
+    Err(PackageError::NotFound(spec.clone()))
 }
 
 /// FileLoader for [`FileStore`]: serves project files from the on-disk

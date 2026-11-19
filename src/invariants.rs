@@ -9,13 +9,15 @@
 //!
 //! - **Completeness** ([`watch_set_is_complete`]): build the site cold, then
 //!   for every file and directory under the project root and the package dir,
-//!   apply each mutation (rewrite, delete, add a file to a directory) to a
+//!   apply each mutation (rewrite, same-length rewrite keeping the mtime,
+//!   delete, file replaced by a directory, add a file to a directory) to a
 //!   fresh copy. A mutation the watch set can't see must leave a cold build's
 //!   output unchanged.
 //! - **Incremental = cold** ([`incremental_matches_cold`]): drive one
 //!   persistent [`DevSession`] through a seeded pseudo-random edit sequence,
 //!   as serve would, and after every step compare its output with a fresh
-//!   cold build of the same tree.
+//!   cold build of the same tree. [`polling_watcher_schedules_targeted_rebuilds`]
+//!   drives a few targeted edits through the real (polling) watcher instead.
 //! - **Determinism** ([`cold_builds_are_deterministic`]): two cold builds of
 //!   one tree agree. See [`inline_document_names_are_stable_across_processes`]
 //!   for the cross-process case.
@@ -27,9 +29,10 @@
 //! and resolver — in the same process, so it still shares comemo's global
 //! memo cache (and, in test builds, the font scan; see `render::load_fonts`).
 //! comemo validates every memo hit against the tracked world, so sharing it
-//! can only hide a bug where twyla feeds typst data comemo doesn't track; a
-//! run with `comemo::evict(0)` before each cold build and no parallelism
-//! passed too (it's ~3× slower, so it isn't the default).
+//! can only hide a bug where twyla feeds typst data comemo doesn't track.
+//! [`incremental_matches_cold_evicted`] is the one lane that clears it
+//! (`comemo::evict(0)`) before every cold build — short and serial, since
+//! that's ~3× slower.
 //!
 //! The racy-stamp path (a same-length rewrite within one timestamp tick of
 //! the read) is exercised by the differential edits but rarely *needed*:
@@ -302,10 +305,11 @@ fn context(base: &Path) -> TwylaContext {
 /// what's written there, or the error text with the base dir replaced by
 /// `<base>` and colors stripped.
 ///
-/// Path-backed outputs (static files, `asset.file` copies) are compared by
-/// their source path, not bytes: the rebuild's output is the reference, and
-/// serve reads the bytes live (an `asset.file`'s fingerprint is in its output
-/// path, so its contents are still covered).
+/// Path-backed outputs are compared by their source path, not bytes read
+/// now: serve reads the bytes live. Static files by path alone; `asset.file`
+/// copies also by the digest the build captured, since a fixed `output:`
+/// path keeps the key and source across an edit while a stale build's digest
+/// (and so its `.sha256`/`.read()` results) would differ.
 type Snapshot = Result<BTreeMap<String, String>, String>;
 
 fn snapshot(result: &Result<Outputs, RenderError>, base: &Path) -> Snapshot {
@@ -324,7 +328,12 @@ fn snapshot(result: &Result<Outputs, RenderError>, base: &Path) -> Snapshot {
                         Emit::Bytes(bytes) => {
                             format!("bytes {}", hex::encode(crate::ledger::sha256(bytes)))
                         }
-                        Emit::Copy(src) => format!("copy {}", rel(src)),
+                        // The digest captured at build time, not the bytes
+                        // there now: a stale build of an edited source keeps
+                        // its output path and source, but not its digest.
+                        Emit::Copy(src) => {
+                            format!("copy {} {}", rel(src), hex::encode(asset.built.sha256))
+                        }
                     },
                     Output::Static(_, src) => format!("static {}", rel(src)),
                 };
@@ -438,6 +447,16 @@ enum Mutation {
     /// Prefix the file's contents (changes every file kind's meaning: a
     /// `.typ` page's text, a stylesheet's syntax, an image's decodability).
     Rewrite,
+    /// Change the first byte in place, keeping the length, then set the
+    /// mtime back: only the ctime (unix) or a racy hash can see it. Exposes
+    /// any stamp weaker than that (mtime + length alone; or no length,
+    /// which every other rewrite here would mask by changing it).
+    RewriteSameLength,
+    /// Replace the file with a same-named directory holding `new.typ`. The
+    /// parent's entry names don't change, so only the entry kind in its
+    /// listing stamp can see it (e.g. an ignored `notes.txt` under
+    /// `content/` becoming a section with a page).
+    ReplaceWithDir,
     /// Remove the file, or the directory and everything under it.
     Delete,
     /// Create `new.typ` in the directory (a routed page under `content/`).
@@ -502,8 +521,18 @@ fn mutations_of(rel: &Path, is_dir: bool) -> Vec<Mutation> {
         // Deleting the project root makes the context itself fail.
         (true, true) => vec![Mutation::AddFile],
         (true, false) => vec![Mutation::Delete, Mutation::AddFile],
-        (false, _) => vec![Mutation::Rewrite, Mutation::Delete],
+        (false, _) => vec![
+            Mutation::Rewrite,
+            Mutation::RewriteSameLength,
+            Mutation::Delete,
+        ],
     };
+    // Only the scanned trees discover files by listing directories; anywhere
+    // else a file turned directory is just the file gone (`Delete`), and the
+    // extra cold builds would double the test's runtime.
+    if !is_dir && (rel.starts_with("site/content") || rel.starts_with("site/static")) {
+        mutations.push(Mutation::ReplaceWithDir);
+    }
     if rel.extension().is_some_and(|e| e == "scss") {
         let shadows: &[&'static str] = &[
             "{bare}.scss",
@@ -525,6 +554,23 @@ fn mutate(base: &Path, rel: &Path, mutation: Mutation) {
             let mut bytes = b"twyla-mutated\n".to_vec();
             bytes.extend(fs::read(&path).unwrap());
             fs::write(&path, bytes).unwrap();
+        }
+        Mutation::RewriteSameLength => {
+            let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[0] = if bytes[0] == b'#' { b'%' } else { b'#' };
+            fs::write(&path, bytes).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        }
+        Mutation::ReplaceWithDir => {
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("new.typ"), "new page").unwrap();
         }
         Mutation::Delete if path.is_dir() => fs::remove_dir_all(&path).unwrap(),
         Mutation::Delete => fs::remove_file(&path).unwrap(),
@@ -552,23 +598,26 @@ fn mutate(base: &Path, rel: &Path, mutation: Mutation) {
     }
 }
 
-/// Whether `watch`, taken from a build of the pristine tree at `pristine`,
-/// would notice the difference between it and the (mutated) copy at `copy`.
+/// For a mutation of a path the watch set doesn't contain: whether `watch`,
+/// taken from a build of the pristine tree at `pristine`, would notice the
+/// difference between it and the (mutated) copy at `copy`. Saves a build
+/// per job; mutations of *watched* paths are checked with the real stamps
+/// on their own tree instead (see [`watch_set_is_complete`]).
 ///
 /// Stamps are per-tree (inodes, times), so they can't be compared across
 /// copies directly. Every stamp kind except [`Stamp::File`] is a function of
-/// names and file types only, so it's checked with the real
-/// [`Stamp::matches_now`] against the copy. A `File` stamp changes on any
-/// write; every [`Mutation`] changes the bytes (or removes the file), so the
-/// copy-independent equivalent is "same bytes and permissions".
-fn copy_differs(watch: &WatchSet, pristine: &Path, copy: &Path) -> Vec<PathBuf> {
-    let mut stale = Vec::new();
-    for (path, stamp) in &watch.paths {
+/// names and entry kinds only, so it's checked with the real
+/// [`Stamp::matches_now`] against the copy. A mutation of an unwatched path
+/// leaves every watched file's bytes alone (it can only delete one, by
+/// deleting a directory), so for a `File` stamp "same bytes and permissions"
+/// is the copy-independent equivalent — and can't credit a weak stamp.
+fn copy_differs(watch: &WatchSet, pristine: &Path, copy: &Path) -> bool {
+    watch.paths.iter().any(|(path, stamp)| {
         let Ok(rel) = path.strip_prefix(pristine) else {
             panic!("watched path outside the fixture: {}", path.display());
         };
         let there = copy.join(rel);
-        let differs = match stamp {
+        match stamp {
             Stamp::Unknown => true,
             Stamp::File { .. } => {
                 let perm = |p: &Path| fs::metadata(p).map(|m| m.permissions()).ok();
@@ -577,12 +626,8 @@ fn copy_differs(watch: &WatchSet, pristine: &Path, copy: &Path) -> Vec<PathBuf> 
                     || perm(path) != perm(&there)
             }
             stamp => !stamp.matches_now(&there),
-        };
-        if differs {
-            stale.push(rel.to_path_buf());
         }
-    }
-    stale
+    })
 }
 
 /// The key test. For the passing fixture and every failing variant: build it
@@ -593,8 +638,12 @@ fn copy_differs(watch: &WatchSet, pristine: &Path, copy: &Path) -> Vec<PathBuf> 
 ///
 /// Watched paths are mutated too: the "can it see it" check is the real
 /// question (a watched path with a too-weak stamp is as bad as an unwatched
-/// one), and it's cheap — a detected mutation needs no second build.
-/// Over-watching is fine and not checked.
+/// one). Such a job builds its copy cold first, mutates that same copy, and
+/// checks the copy's own watch set with the real stamp check
+/// ([`stale_paths`]: stamps, then racy hashes) — stamps are per-tree, so
+/// only that tests them. Mutations of unwatched paths use the pristine
+/// watch set ([`copy_differs`]). A detected mutation needs no further
+/// build. Over-watching is fine and not checked.
 #[test]
 fn watch_set_is_complete() {
     let start = Instant::now();
@@ -620,6 +669,11 @@ fn watch_set_is_complete() {
                     .into_iter()
                     .map(move |m| (rel.clone(), m))
             })
+            // A same-length rewrite tests a stamp's strength; an unwatched
+            // file has none, and `Rewrite` already covers its invisibility.
+            .filter(|(rel, m)| {
+                *m != Mutation::RewriteSameLength || watch.contains(pristine.path().join(rel))
+            })
             .chain(
                 CREATIONS
                     .iter()
@@ -630,8 +684,15 @@ fn watch_set_is_complete() {
         checked += jobs.len();
         let results = parallel(&jobs, |(rel, mutation)| {
             let copy = materialize(&files);
-            mutate(copy.path(), rel, *mutation);
-            if !copy_differs(&watch, pristine.path(), copy.path()).is_empty() {
+            let detected = if watch.contains(pristine.path().join(rel)) {
+                let (_, own_watch) = cold(copy.path());
+                mutate(copy.path(), rel, *mutation);
+                !stale_paths(&own_watch).is_empty()
+            } else {
+                mutate(copy.path(), rel, *mutation);
+                copy_differs(&watch, pristine.path(), copy.path())
+            };
+            if detected {
                 return None;
             }
             let (after, _) = cold(copy.path());
@@ -972,10 +1033,14 @@ struct Serve {
     /// The last rebuild's output and watch set.
     output: Snapshot,
     watch: WatchSet,
+    /// Clear comemo's process-wide memo cache before each cold build, so the
+    /// reference can't reuse anything the session memoized (see
+    /// [`incremental_matches_cold_evicted`]).
+    evict: bool,
 }
 
 impl Serve {
-    fn new(base: &Path) -> Serve {
+    fn new(base: &Path, evict: bool) -> Serve {
         let mut session = DevSession::new(&context(base)).unwrap();
         let first = session.rebuild();
         Serve {
@@ -983,6 +1048,7 @@ impl Serve {
             output: snapshot(&first.result, base),
             watch: first.watch,
             session,
+            evict,
         }
     }
 
@@ -992,6 +1058,9 @@ impl Serve {
     /// build; (c) the new watch set must be quiescent (or serve would
     /// rebuild forever).
     fn rebuild_and_check(&mut self) -> Result<(), String> {
+        if self.evict {
+            comemo::evict(0);
+        }
         let (cold_output, _) = cold(&self.base);
         if stale_paths(&self.watch).is_empty() && cold_output != self.output {
             return Err(format!(
@@ -1020,10 +1089,10 @@ impl Serve {
 
 /// One seeded run of `steps` edits, each followed by a checked rebuild.
 /// Returns the failure report, if any.
-fn differential_run(seed: u64, steps: usize) -> Option<String> {
+fn differential_run(seed: u64, steps: usize, evict: bool) -> Option<String> {
     let pristine = site_files();
     let base = materialize(&pristine);
-    let mut serve = Serve::new(base.path());
+    let mut serve = Serve::new(base.path(), evict);
     let mut rng = Rng(seed);
     let mut history = Vec::new();
     for step in 0..steps {
@@ -1056,12 +1125,110 @@ fn differential_run(seed: u64, steps: usize) -> Option<String> {
 fn incremental_matches_cold() {
     let start = Instant::now();
     let seeds = [0x5eed_0001_u64, 0x0bad_cafe_f00d, 0x1234_5678_9abc_def1];
-    let failures: Vec<String> = parallel(&seeds, |&seed| differential_run(seed, 40))
+    let failures: Vec<String> = parallel(&seeds, |&seed| differential_run(seed, 40, false))
         .into_iter()
         .flatten()
         .collect();
     eprintln!("incremental_matches_cold: {:?}", start.elapsed());
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// [`incremental_matches_cold`] with an independent oracle: one seed, run
+/// serially, with comemo's memo cache cleared before every cold build. The
+/// cold reference otherwise shares the process-wide cache with the session
+/// it's checking, so a stale result the session fed comemo from an input
+/// comemo doesn't track could be reused by the reference too and compare
+/// equal. (Other tests running concurrently can repopulate the cache, but
+/// only from their own trees.)
+#[test]
+fn incremental_matches_cold_evicted() {
+    let start = Instant::now();
+    let failure = differential_run(0x00c0_1d00_5eed, 12, true);
+    eprintln!("incremental_matches_cold_evicted: {:?}", start.elapsed());
+    assert!(failure.is_none(), "{}", failure.unwrap_or_default());
+}
+
+/// A [`Backend`](crate::watch::Backend) that refuses every path, so the
+/// watcher polls everything — the path the targeted cases below exercise.
+struct RefuseAll;
+
+impl crate::watch::Backend for RefuseAll {
+    fn watch(&mut self, _: &Path) -> notify::Result<()> {
+        Err(notify::Error::generic("refused (test)"))
+    }
+    fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+        Ok(())
+    }
+}
+
+/// Targeted edits driven through the real [`Watcher`](crate::watch::Watcher)
+/// rather than [`stale_paths`]: every subscription refused, so `update`'s
+/// re-check and the poll decide alone. For each edit that changes the cold
+/// build, the watcher must actually report a change (schedule the rebuild);
+/// the rebuild must then match cold, and the watcher go quiet again.
+#[test]
+fn polling_watcher_schedules_targeted_rebuilds() {
+    type Edit = fn(&Path);
+    let cases: &[(&str, Edit)] = &[
+        ("same-length rewrite right after the read", |base| {
+            fs::write(base.join("site/styles/partials/_colors.scss"), "$c: tan;").unwrap();
+        }),
+        ("same-length rewrite with the mtime preserved", |base| {
+            let path = base.join("site/data/notes.txt");
+            let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+            fs::write(&path, "SOME NOTES").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        }),
+        ("ignored file replaced by a same-named section", |base| {
+            let path = base.join("site/content/blog/notes.txt");
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("new.typ"), "new page").unwrap();
+        }),
+        ("asset.file source rewritten", |base| {
+            fs::write(base.join("site/files/doc.txt"), "a DOCUMENT").unwrap();
+        }),
+    ];
+    for (name, edit) in cases {
+        let base = materialize(&site_files());
+        let mut serve = Serve::new(base.path(), false);
+        // No events ever arrive; the sender only keeps the channel open.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = crate::watch::Watcher::with_backend(RefuseAll, rx);
+        watcher.update(&serve.watch).unwrap();
+        let quiet = watcher.poll_now();
+        assert!(
+            quiet.is_empty(),
+            "{name}: not quiet before the edit: {quiet:?}"
+        );
+
+        edit(base.path());
+        let (cold_output, _) = cold(base.path());
+        assert_ne!(
+            cold_output, serve.output,
+            "{name}: edit doesn't change the build"
+        );
+        let changed = watcher.poll_now();
+        assert!(
+            !changed.is_empty(),
+            "{name}: the watcher scheduled no rebuild"
+        );
+
+        serve
+            .rebuild_and_check()
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        watcher.update(&serve.watch).unwrap();
+        let quiet = watcher.poll_now();
+        assert!(
+            quiet.is_empty(),
+            "{name}: not quiet after the rebuild: {quiet:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1153,7 +1320,7 @@ fn incremental_matches_cold_soak() {
     let seeds: Vec<u64> = (1..=64)
         .map(|i| 0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(i))
         .collect();
-    let failures: Vec<String> = parallel(&seeds, |&seed| differential_run(seed, 80))
+    let failures: Vec<String> = parallel(&seeds, |&seed| differential_run(seed, 80, false))
         .into_iter()
         .flatten()
         .collect();

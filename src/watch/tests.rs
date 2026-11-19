@@ -299,8 +299,14 @@ fn stamps() {
     fs::write(dir.path().join("b"), "").unwrap();
     assert_ne!(Stamp::now(dir.path()), d1);
     assert_eq!(
-        Stamp::dir_listing(vec!["x".into(), "y".into()]),
-        Stamp::dir_listing(vec!["y".into(), "x".into()]),
+        Stamp::dir_listing(vec![
+            ("x".into(), None),
+            ("y".into(), Some(EntryKind::File))
+        ]),
+        Stamp::dir_listing(vec![
+            ("y".into(), Some(EntryKind::File)),
+            ("x".into(), None)
+        ]),
     );
 }
 
@@ -938,4 +944,72 @@ fn notify_create_in_watched_dir() {
     let file = root.join("b.css");
     fs::write(&file, "").unwrap();
     wait_for(w, &file);
+}
+
+/// Rev 3b (#2): a racy file the backend refused is polled, and its stamp
+/// can't vouch for its contents: a same-length rewrite after `update` in
+/// the same timestamp tick leaves the probe unchanged. Deterministic: the
+/// poll's baseline is re-taken after the rewrite, as if the filesystem's
+/// timestamps were too coarse to show it. The poll must re-hash.
+#[test]
+fn polled_racy_same_stamp_rewrite_is_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("_colors.scss");
+    fs::write(&a, "$c: red;").unwrap();
+    let mut set = observed(&[&a]);
+    set.racy
+        .insert(a.clone(), crate::ledger::sha256(b"$c: red;"));
+    let (mut w, _tx, _log) = fake_with({
+        let mut f = Fake::default();
+        f.refuse = vec![a.clone()];
+        f
+    });
+    w.update(&set).unwrap();
+    assert!(w.pending.is_empty(), "{:?}", w.pending);
+    assert!(w.polled.contains_key(&a));
+
+    fs::write(&a, "$c: tan;").unwrap();
+    w.polled.insert(a.clone(), Probe::now(&a)); // the same-stamp case
+    let mut polled = ChangedPaths::default();
+    w.poll(&mut polled);
+    assert!(polled.paths.contains(&a), "{polled:?}");
+
+    // Unchanged contents: no change, and once clear of the racy window the
+    // poll stops re-hashing (no hash-every-poll forever).
+    fs::write(&a, "$c: red;").unwrap();
+    w.polled.insert(a.clone(), Probe::now(&a));
+    std::thread::sleep(crate::ledger::FINE_RACY_WINDOW + Duration::from_millis(10));
+    let mut polled = ChangedPaths::default();
+    w.poll(&mut polled);
+    assert!(polled.is_empty(), "{polled:?}");
+    assert!(w.polled_racy.is_empty(), "racy entry never settled");
+}
+
+/// Rev 3b (#6): a directory's stamp records each entry's kind, so a file
+/// replaced by a same-named directory changes it (the names don't).
+#[test]
+fn listing_stamp_sees_file_replaced_by_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let notes = dir.path().join("notes.txt");
+    fs::write(&notes, "not a page").unwrap();
+    let before = Stamp::now(dir.path());
+    fs::remove_file(&notes).unwrap();
+    fs::create_dir(&notes).unwrap();
+    assert!(!before.matches_now(dir.path()));
+    // And through the watcher's poll of a refused directory.
+    fs::remove_dir(&notes).unwrap();
+    fs::write(&notes, "not a page").unwrap();
+    let (mut w, _tx, _log) = fake_with({
+        let mut f = Fake::default();
+        f.refuse = vec![dir.path().to_path_buf()];
+        f
+    });
+    w.update(&observed(&[dir.path()])).unwrap();
+    assert!(w.pending.is_empty(), "{:?}", w.pending);
+    fs::remove_file(&notes).unwrap();
+    fs::create_dir(&notes).unwrap();
+    fs::write(notes.join("new.typ"), "new page").unwrap();
+    let mut polled = ChangedPaths::default();
+    w.poll(&mut polled);
+    assert!(polled.paths.contains(dir.path()), "{polled:?}");
 }

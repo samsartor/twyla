@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::watch::Stamp;
+use crate::watch::{EntryKind, Stamp};
 use crate::{asset, render::Output};
 
 /// Everything a twyla command needs to operate on a project. Cheap to
@@ -472,9 +472,13 @@ fn scan_tree(
                 continue;
             }
         };
-        names.push(entry.file_name());
         let path = entry.path();
-        match fs::metadata(&path) {
+        // The listing stamp records each entry's kind, from this same
+        // `metadata` call (see `Stamp::Dir`): a decoy file replaced by a
+        // same-named directory of pages changes the stamp.
+        let meta = fs::metadata(&path);
+        names.push((entry.file_name(), meta.as_ref().ok().map(EntryKind::of)));
+        match meta {
             Ok(meta) if meta.is_dir() => subdirs.push(path),
             Ok(_) => {
                 if keep(&path) {

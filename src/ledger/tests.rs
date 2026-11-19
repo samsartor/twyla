@@ -50,7 +50,12 @@ fn read_records_stamp_and_hash_and_failures() {
         (deps[2].kind, &deps[2].stamp),
         (DepKind::Probe, &Stamp::Missing)
     );
-    assert_eq!(deps[3].stamp, Stamp::Exists { dir: true });
+    assert_eq!(
+        deps[3].stamp,
+        Stamp::Exists {
+            kind: crate::watch::EntryKind::Dir
+        }
+    );
 }
 
 #[test]
@@ -290,8 +295,95 @@ fn dir_probe_does_not_list() {
     assert!(rec.is_dir(dir.path()));
     assert!(!rec.is_file(dir.path()));
     let deps = rec.take();
-    assert_eq!(deps[0].stamp, Stamp::Exists { dir: true });
+    assert_eq!(
+        deps[0].stamp,
+        Stamp::Exists {
+            kind: crate::watch::EntryKind::Dir
+        }
+    );
     std::fs::write(dir.path().join("new"), "").unwrap();
     let mut reads = 0;
     assert_eq!(revalidate(&deps, &mut reads), Revalidation::Valid);
+}
+
+/// Rev 3b (#3): a probe records the actual answer. A FIFO at
+/// `_partial.scss` isn't a file to sass; replacing it with a regular
+/// stylesheet must invalidate the probe.
+#[cfg(unix)]
+#[test]
+fn probe_tells_fifo_from_regular_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("_partial.scss");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&p)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let rec = DepRecorder::new();
+    assert!(!rec.is_file(&p));
+    let deps = rec.take();
+    assert_eq!(
+        deps[0].stamp,
+        Stamp::Exists {
+            kind: crate::watch::EntryKind::Other
+        }
+    );
+    let mut reads = 0;
+    assert_eq!(revalidate(&deps, &mut reads), Revalidation::Valid);
+    std::fs::remove_file(&p).unwrap();
+    std::fs::write(&p, "$c: red;").unwrap();
+    assert_eq!(revalidate(&deps, &mut reads), Revalidation::Changed);
+}
+
+/// Rev 3b (#6): a listing records each entry's kind, so a file replaced by
+/// a same-named directory changes it.
+#[test]
+fn dir_listing_sees_file_replaced_by_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let notes = dir.path().join("notes.txt");
+    std::fs::write(&notes, "x").unwrap();
+    let rec = DepRecorder::new();
+    rec.list_dir(dir.path()).unwrap();
+    let deps = rec.take();
+    let mut reads = 0;
+    assert_eq!(revalidate(&deps, &mut reads), Revalidation::Valid);
+    std::fs::remove_file(&notes).unwrap();
+    std::fs::create_dir(&notes).unwrap();
+    assert_eq!(revalidate(&deps, &mut reads), Revalidation::Changed);
+}
+
+/// Rev 3b (#1): a read that failed for a reason that says nothing about the
+/// file (out of file descriptors, interrupted, …) isn't cached against the
+/// unchanged stamp; the next compile retries it. A stable failure is.
+#[test]
+fn transient_failures_are_not_cached() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    std::fs::write(&a, "x").unwrap();
+    let failed = |error| Dep {
+        path: a.clone(),
+        kind: DepKind::Read,
+        stamp: Stamp::now(&a),
+        sha256: None,
+        error: Some(error),
+        observed_at: SystemTime::now(),
+    };
+    // EMFILE: `ErrorKind::TooManyOpenFiles` is unstable, so build it from errno.
+    #[cfg(target_os = "linux")]
+    let emfile = io::Error::from_raw_os_error(24).kind();
+    #[cfg(not(target_os = "linux"))]
+    let emfile = io::ErrorKind::Interrupted;
+    let mut reads = 0;
+    for transient in [emfile, io::ErrorKind::Interrupted, io::ErrorKind::TimedOut] {
+        assert!(is_transient(transient), "{transient:?}");
+        assert_eq!(
+            revalidate(&[failed(transient)], &mut reads),
+            Revalidation::Changed,
+            "{transient:?}"
+        );
+    }
+    assert_eq!(
+        revalidate(&[failed(io::ErrorKind::PermissionDenied)], &mut reads),
+        Revalidation::Valid
+    );
 }

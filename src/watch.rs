@@ -96,32 +96,73 @@ pub enum Stamp {
         /// filesystems whose ctime is too coarse to show it.
         perm: u32,
     },
-    /// A directory, by a hash of its sorted entry names (see
-    /// [`Stamp::dir_listing`]). Only the *names* matter: a directory is
-    /// watched for pages/files appearing or disappearing; edits to the files
-    /// inside are observed through their own stamps or events.
+    /// A directory, by a hash of its sorted entry names and each entry's
+    /// [`EntryKind`] (see [`Stamp::dir_listing`]). Only names and types
+    /// matter: a directory is watched for pages/files appearing or
+    /// disappearing; edits to the files inside are observed through their own
+    /// stamps or events. The type is there because a file replaced by a
+    /// same-named directory (or the reverse) keeps every name: an ignored
+    /// `notes.txt` with no stamp of its own turning into a `notes.txt/`
+    /// holding a page must still change its parent's stamp.
     Dir { listing: u64 },
     /// A directory that exists but can't be listed (e.g. permission
     /// denied). A stable observation, unlike [`Stamp::Unknown`]: an
     /// unreadable directory that stays unreadable has not changed, and
     /// treating it as changed would rebuild forever.
     Unreadable,
-    /// Something exists here — a directory if `dir`, otherwise a file — and
-    /// nothing else about it was observed: the stamp of an existence probe
-    /// (sass import resolution asking "is `_partial.scss` a file?", a package
-    /// lookup asking "is this version installed?"). Taken from a single
-    /// `metadata` call ([`Stamp::existence`]), so a probed directory is never
-    /// listed. Matches any later observation of the same type, so `touch`ing
-    /// a probed file doesn't invalidate the probe; in a [`WatchSet`] it
-    /// merges with a full observation of the same path (see
+    /// Something of type `kind` exists here, and nothing else about it was
+    /// observed: the stamp of an existence probe (sass import resolution
+    /// asking "is `_partial.scss` a file?", a package lookup asking "is this
+    /// version installed?"). Taken from a single `metadata` call
+    /// ([`Stamp::existence`]), so a probed directory is never listed. The
+    /// kind is the probe's actual answer: a FIFO at `_partial.scss` is "not a
+    /// file" to sass, so replacing it with a regular stylesheet must change
+    /// the stamp. Matches any later observation of the same kind, so
+    /// `touch`ing a probed file doesn't invalidate the probe; in a
+    /// [`WatchSet`] it merges with a full observation of the same path (see
     /// [`WatchSet::observe`]).
-    Exists { dir: bool },
+    Exists { kind: EntryKind },
     /// The observation can't be trusted: the file changed while the compile
     /// was reading it (see [`crate::ledger`]'s racy-read guard). Never
     /// matches, so re-checking it always reports a change. Only produced by
     /// an actual change, never by a stable state, so it forces at most one
     /// extra rebuild per change rather than a loop.
     Unknown,
+}
+
+/// What a path is, as far as a listing or an existence probe records it.
+/// Follows symlinks (like the compile, and like the content scan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EntryKind {
+    /// A regular file.
+    File,
+    Dir,
+    /// Anything else that exists: a FIFO, socket, or device.
+    Other,
+}
+
+impl EntryKind {
+    pub fn of(meta: &fs::Metadata) -> EntryKind {
+        if meta.is_dir() {
+            EntryKind::Dir
+        } else if meta.is_file() {
+            EntryKind::File
+        } else {
+            EntryKind::Other
+        }
+    }
+
+    /// The kind of a listed entry, or `None` if it can't be stat'ed (a
+    /// dangling symlink). Free for anything but a symlink (the listing
+    /// already carries the type); a symlink is followed with one `stat`.
+    pub fn of_entry(entry: &fs::DirEntry) -> Option<EntryKind> {
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => Some(EntryKind::Dir),
+            Ok(t) if t.is_file() => Some(EntryKind::File),
+            Ok(t) if !t.is_symlink() => Some(EntryKind::Other),
+            _ => fs::metadata(entry.path()).ok().map(|m| EntryKind::of(&m)),
+        }
+    }
 }
 
 impl Stamp {
@@ -131,8 +172,8 @@ impl Stamp {
             return Stamp::Missing;
         };
         if meta.is_dir() {
-            return match read_dir_names(path) {
-                Ok(names) => Stamp::dir_listing(names),
+            return match read_dir_entries(path) {
+                Ok(entries) => Stamp::dir_listing(entries),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Stamp::Missing,
                 Err(_) => Stamp::Unreadable,
             };
@@ -173,19 +214,28 @@ impl Stamp {
     /// result (`None`: not found or not stat-able). See [`Stamp::Exists`].
     pub fn existence(meta: Option<&fs::Metadata>) -> Stamp {
         match meta {
-            Some(meta) => Stamp::Exists { dir: meta.is_dir() },
+            Some(meta) => Stamp::Exists {
+                kind: EntryKind::of(meta),
+            },
             None => Stamp::Missing,
         }
     }
 
-    /// A directory stamp from its entry names, in any order. FNV-1a over the
-    /// sorted names (each followed by a 0 byte): stable across runs and
-    /// platforms' hash seeds, so it can be persisted.
-    pub fn dir_listing(mut names: Vec<OsString>) -> Stamp {
-        names.sort();
+    /// A directory stamp from its entries (name and kind, `None` for one
+    /// that can't be stat'ed), in any order. FNV-1a over the sorted entries
+    /// (each name followed by a 0 byte and a kind byte): stable across runs
+    /// and platforms' hash seeds, so it can be persisted.
+    pub fn dir_listing(mut entries: Vec<(OsString, Option<EntryKind>)>) -> Stamp {
+        entries.sort();
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for name in &names {
-            for &b in name.as_encoded_bytes().iter().chain(&[0]) {
+        for (name, kind) in &entries {
+            let kind = match kind {
+                None => b'?',
+                Some(EntryKind::File) => b'f',
+                Some(EntryKind::Dir) => b'd',
+                Some(EntryKind::Other) => b'o',
+            };
+            for &b in name.as_encoded_bytes().iter().chain(&[0, kind]) {
                 hash ^= u64::from(b);
                 hash = hash.wrapping_mul(0x0100_0000_01b3);
             }
@@ -216,9 +266,10 @@ fn unix_time(secs: i64, nsec: i64) -> SystemTime {
     }
 }
 
-fn read_dir_names(dir: &Path) -> io::Result<Vec<OsString>> {
+/// `dir`'s entries as [`Stamp::dir_listing`] takes them.
+pub fn read_dir_entries(dir: &Path) -> io::Result<Vec<(OsString, Option<EntryKind>)>> {
     fs::read_dir(dir)?
-        .map(|entry| entry.map(|e| e.file_name()))
+        .map(|entry| entry.map(|e| (e.file_name(), EntryKind::of_entry(&e))))
         .collect()
 }
 
@@ -315,16 +366,21 @@ impl WatchSet {
 /// reads it, and after a `touch` the read's stamp is refreshed (by
 /// revalidation) while the probe's needn't be — comparing them for equality
 /// would merge a stable state into a never-matching `Unknown` on every
-/// rebuild.
+/// rebuild. A [`Stamp::File`] is the full observation of any non-directory
+/// (regular file or [`EntryKind::Other`]); it can stand in for the probe
+/// because a different file at the path (a FIFO replaced by a stylesheet)
+/// is a different inode, which changes it.
 fn merge(a: &Stamp, b: &Stamp) -> Option<Stamp> {
-    let same_type = |dir: bool, full: &Stamp| match full {
-        Stamp::File { .. } => !dir,
-        Stamp::Dir { .. } | Stamp::Unreadable => dir,
+    let same_type = |kind: EntryKind, full: &Stamp| match full {
+        Stamp::File { .. } => kind != EntryKind::Dir,
+        Stamp::Dir { .. } | Stamp::Unreadable => kind == EntryKind::Dir,
         _ => false,
     };
     match (a, b) {
         _ if a == b && *a != Stamp::Unknown => Some(a.clone()),
-        (Stamp::Exists { dir }, full) | (full, Stamp::Exists { dir }) if same_type(*dir, full) => {
+        (Stamp::Exists { kind }, full) | (full, Stamp::Exists { kind })
+            if same_type(*kind, full) =>
+        {
             Some(full.clone())
         }
         _ => None,
@@ -412,6 +468,14 @@ pub struct Watcher<B: Backend = RecommendedWatcher> {
     /// the backend refused — polled by `wait` against how they looked when
     /// `update` gave up on subscribing them.
     polled: BTreeMap<PathBuf, Probe>,
+    /// The expected content hash of polled paths whose observation was racy
+    /// ([`WatchSet::racy`]). A racy stamp can't vouch for the contents: a
+    /// same-length rewrite landing after `update`, in the same timestamp
+    /// tick, leaves the [`Probe`] unchanged. So each poll also re-hashes these
+    /// — until a poll finds the stamp clear of the racy window (any later
+    /// write then changes it) and drops the entry, so a racy file costs a
+    /// few re-hashes, not one per poll forever.
+    polled_racy: BTreeMap<PathBuf, [u8; 32]>,
     /// Paths already warned about as unwatchable, so a path that stays
     /// unwatchable is reported once, not on every `update`. A path leaves
     /// this set when it's subscribed or leaves the watch set.
@@ -462,6 +526,7 @@ impl<B: Backend> Watcher<B> {
             rx,
             watched: HashMap::new(),
             polled: BTreeMap::new(),
+            polled_racy: BTreeMap::new(),
             warned: BTreeSet::new(),
             pending: ChangedPaths::default(),
             metadata_relevant: false,
@@ -484,6 +549,7 @@ impl<B: Backend> Watcher<B> {
             *seen = false;
         }
         self.polled.clear();
+        self.polled_racy.clear();
         self.warned.retain(|p| set.paths.contains_key(p));
 
         for (path, observed) in &set.paths {
@@ -524,6 +590,11 @@ impl<B: Backend> Watcher<B> {
                     .is_some_and(|hash| crate::ledger::observe_hash(path).1.ok() != Some(*hash));
             if changed {
                 self.pending.paths.insert(path.clone());
+            }
+            if let Some(hash) = set.racy.get(path)
+                && self.polled.contains_key(path)
+            {
+                self.polled_racy.insert(path.clone(), *hash);
             }
         }
 
@@ -581,13 +652,36 @@ impl<B: Backend> Watcher<B> {
         }
     }
 
+    /// What [`wait`](Self::wait) would return right now from `update`'s
+    /// re-check and one poll, ignoring backend events, without blocking.
+    /// For tests that drive a watcher whose backend refuses everything.
+    #[cfg(test)]
+    pub(crate) fn poll_now(&mut self) -> ChangedPaths {
+        let mut changed = std::mem::take(&mut self.pending);
+        self.poll(&mut changed);
+        changed
+    }
+
     /// Add every polled path that no longer looks the way it did when
-    /// `update` started polling it.
-    fn poll(&self, changed: &mut ChangedPaths) {
+    /// `update` started polling it, or (for a racy one, see
+    /// [`Watcher::polled_racy`]) whose contents no longer hash the same.
+    fn poll(&mut self, changed: &mut ChangedPaths) {
+        let mut settled = Vec::new();
         for (path, probe) in &self.polled {
-            if Probe::now(path) != *probe {
+            let observed_at = SystemTime::now();
+            let now = Probe::now(path);
+            if now != *probe {
                 changed.paths.insert(path.clone());
+            } else if let Some(hash) = self.polled_racy.get(path) {
+                if crate::ledger::observe_hash(path).1.ok() != Some(*hash) {
+                    changed.paths.insert(path.clone());
+                } else if !crate::ledger::stamp_is_racy(&now.stamp, observed_at) {
+                    settled.push(path.clone());
+                }
             }
+        }
+        for path in settled {
+            self.polled_racy.remove(&path);
         }
     }
 
