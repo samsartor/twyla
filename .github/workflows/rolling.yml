@@ -13,9 +13,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
       - run: tar czf twyla-x86_64-unknown-linux-gnu.tar.gz -C target/release twyla
+      # Fully static build: runs on any x86_64 Linux regardless of glibc (e.g.
+      # Cloudflare Pages' build image). zig provides a musl C toolchain for the
+      # C deps (libwebp, vendored OpenSSL); the pip package bundles zig itself.
+      - run: pip install cargo-zigbuild
+      - run: cargo zigbuild --release --locked --target x86_64-unknown-linux-musl
+      - run: tar czf twyla-x86_64-unknown-linux-musl.tar.gz -C target/x86_64-unknown-linux-musl/release twyla
       - env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -25,7 +33,8 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "Latest (main)" \
             --notes "Rolling build from $GITHUB_SHA" \
-            twyla-x86_64-unknown-linux-gnu.tar.gz
+            twyla-x86_64-unknown-linux-gnu.tar.gz \
+            twyla-x86_64-unknown-linux-musl.tar.gz
       # Build twyla.dev with the binary we just compiled, so the site always
       # reflects this exact commit (no waiting on a separate release pickup).
       # --test-examples gates the deploy: a broken example/code block fails here.
