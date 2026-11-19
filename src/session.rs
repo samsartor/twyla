@@ -512,6 +512,13 @@ mod tests {
         set_mtime(path, SystemTime::now() - Duration::from_secs(3600));
     }
 
+    /// Wait until files changed just now are clear of the (fine) racy
+    /// window: setting an mtime moves the ctime, which can't be set back, so
+    /// tests asserting "no content reads" wait it out instead.
+    fn settle_ctime() {
+        std::thread::sleep(crate::ledger::FINE_RACY_WINDOW + Duration::from_millis(10));
+    }
+
     fn png(width: u32, height: u32) -> Vec<u8> {
         let img = ::image::RgbImage::from_pixel(width, height, ::image::Rgb([10, 120, 200]));
         let mut buf = Vec::new();
@@ -743,6 +750,7 @@ mod tests {
         for f in ["photo.png", "main.scss", "_partial.scss", "data.txt"] {
             age(&ctx.content_dir().join(f));
         }
+        settle_ctime();
         let mut session = DevSession::new(&ctx).unwrap();
         let out1 = session.rebuild().result.unwrap();
         let cold = session.resolver.stats;
@@ -758,6 +766,7 @@ mod tests {
         // `touch`: same bytes, new mtime. One re-hash, no rebuild, same output.
         let photo = ctx.content_dir().join("photo.png");
         set_mtime(&photo, SystemTime::now() - Duration::from_secs(1800));
+        settle_ctime();
         let out2 = session.rebuild().result.unwrap();
         let stats = session.resolver.stats;
         assert_eq!(stats.builds, cold.builds, "touch rebuilt the image");
@@ -778,11 +787,12 @@ mod tests {
         assert_eq!(session.resolver.stats, stats);
     }
 
-    /// A same-length rewrite that keeps the mtime the build saw (racy:
-    /// written within the filesystem-granularity window of the read) is
-    /// caught on the next rebuild by its hash.
+    /// A same-length in-place rewrite that restores the mtime the build saw
+    /// is still a change: on unix the stamp includes the ctime, which nothing
+    /// can set back. (Elsewhere this is only caught while the stamp is racy.)
+    #[cfg(unix)]
     #[test]
-    fn racy_same_length_rewrite_rebuilds() {
+    fn same_length_rewrite_with_preserved_mtime_rebuilds() {
         let (ctx, _dir) = site(&[
             (
                 "content/main.typ",
@@ -792,28 +802,19 @@ mod tests {
         ]);
         let scss = ctx.content_dir().join("main.scss");
         let mut session = DevSession::new(&ctx).unwrap();
-        // Racy = modified within the window *of the read*. On a loaded test
-        // machine the read can happen seconds after the write, so pin the
-        // mtime slightly ahead instead: racy however long the compile takes.
-        set_mtime(&scss, SystemTime::now() + Duration::from_secs(30));
         let r1 = session.rebuild();
         let html = |out: &Outputs| out.docs().next().unwrap().html.clone();
         assert!(html(&r1.result.unwrap()).contains("red"));
         let Some(Stamp::File { mtime, .. }) = r1.watch.paths.get(&scss).cloned() else {
             panic!("{:?}", r1.watch)
         };
-        assert!(
-            r1.watch.racy.contains_key(&scss),
-            "fresh file not marked racy"
-        );
 
         std::fs::write(&scss, ".a { color: tan; }").unwrap();
         set_mtime(&scss, mtime);
         assert!(
-            r1.watch.paths[&scss].matches_now(&scss),
-            "stamp sees nothing"
+            !r1.watch.paths[&scss].matches_now(&scss),
+            "stamp missed the rewrite"
         );
-
         let r2 = session.rebuild();
         assert!(html(&r2.result.unwrap()).contains("tan"));
     }
@@ -843,6 +844,181 @@ mod tests {
             );
         }
         assert_eq!(resolver.stats.builds, 1);
+    }
+
+    /// Rev 2b finding 4: an `asset.typst` document importing a `@local`
+    /// package that isn't installed fails — and the cached failure records
+    /// the package lookup, so installing the package (without touching the
+    /// asset's own file) rebuilds it. Its files are then deps too.
+    #[test]
+    fn installing_missing_local_package_rebuilds_typst_asset() {
+        let (mut ctx, _dir) = site(&[
+            (
+                "content/main.typ",
+                "#context asset.typst(\"/assets/doc.typ\", format: \"svg\").url()",
+            ),
+            ("assets/doc.typ", "#import \"@local/greet:0.1.0\": hi\n#hi"),
+        ]);
+        let packages = tempfile::tempdir().unwrap();
+        ctx.package_dir = Some(packages.path().to_path_buf());
+        let pkg = packages.path().join("local/greet/0.1.0");
+        let mut session = DevSession::new(&ctx).unwrap();
+
+        let r1 = session.rebuild();
+        assert!(r1.result.is_err(), "expected a missing-package error");
+        assert_eq!(r1.watch.paths.get(&pkg), Some(&Stamp::Missing));
+        assert_eq!(
+            session.rebuild().watch.paths.get(&pkg),
+            Some(&Stamp::Missing)
+        );
+        assert_eq!(session.resolver.stats.builds, 1);
+
+        write(
+            &pkg,
+            "typst.toml",
+            "[package]\nname = \"greet\"\nversion = \"0.1.0\"\nentrypoint = \"lib.typ\"\n",
+        );
+        write(&pkg, "lib.typ", "#let hi = [hello]");
+        let r2 = session.rebuild();
+        if let Err(err) = &r2.result {
+            panic!("still failing after installing the package:\n{err}");
+        }
+        assert!(r2.watch.contains(pkg.join("lib.typ")), "{:?}", r2.watch);
+
+        // Editing the installed package rebuilds the asset too.
+        std::thread::sleep(Duration::from_millis(10));
+        write(&pkg, "lib.typ", "#let hi = [hello again]");
+        let builds = session.resolver.stats.builds;
+        assert!(session.rebuild().result.is_ok());
+        assert_eq!(session.resolver.stats.builds, builds + 1);
+    }
+
+    fn page_id(rel: &str) -> typst::syntax::FileId {
+        use typst::syntax::{FileId, RootedPath, VirtualPath, VirtualRoot};
+        FileId::new(RootedPath::new(
+            VirtualRoot::Project,
+            VirtualPath::new(rel).unwrap(),
+        ))
+    }
+
+    /// Rev 2b finding 8: warnings queued by an asset earlier in a discovery
+    /// pass are reported by the compile whose pass then fails on another
+    /// asset — not lost, and not left queued to leak into the next compile.
+    #[test]
+    fn warnings_before_a_failing_asset_are_reported() {
+        let (ctx, _dir) = site(&[
+            (
+                "content/main.typ",
+                "#context asset.svg(\"bad.svg\").url()\n\
+                 #context asset.file(\"missing.txt\").url()",
+            ),
+            ("content/bad.svg", "<svg><open></svg>"),
+        ]);
+        let world = RenderWorld::new(&ctx).unwrap();
+        let mut resolver = Resolver::new(&ctx);
+        let warned = crate::compile::compile_bundle(
+            &ctx,
+            &world,
+            &[page_id("content/main.typ")],
+            &mut resolver,
+        );
+        assert!(warned.output.is_err());
+        assert!(
+            warned.warnings.iter().any(|w| w.message.contains("svg")),
+            "warning lost: {:?}",
+            warned.warnings
+        );
+        assert!(resolver.take_warnings().is_empty(), "warnings left queued");
+    }
+
+    /// Rev 2b finding 8: an output-policy error on a cached asset blames the
+    /// request as it is *now*, not where it was when the asset was built.
+    #[test]
+    fn moved_request_with_invalid_output_blames_new_location() {
+        let (ctx, dir) = site(&[
+            (
+                "content/main.typ",
+                "#context asset.file(\"data.txt\", output: \"../x.txt\").url()",
+            ),
+            ("content/data.txt", "data"),
+        ]);
+        let main = page_id("content/main.typ");
+        let mut world = RenderWorld::new(&ctx).unwrap();
+        let mut resolver = Resolver::new(&ctx);
+        let error_line = |world: &RenderWorld, resolver: &mut Resolver| {
+            let warned = crate::compile::compile_bundle(&ctx, world, &[main], resolver);
+            let errors = warned.output.err().expect("expected an output error");
+            let error = errors
+                .iter()
+                .find(|e| e.message.contains("escapes"))
+                .unwrap_or_else(|| panic!("{errors:?}"));
+            let id = error.span.id().expect("error has a location");
+            let source = typst::World::source(world, id).unwrap();
+            let range = source.range(error.span).unwrap();
+            source.lines().byte_to_line(range.start).unwrap()
+        };
+        assert_eq!(error_line(&world, &mut resolver), 0);
+
+        write(
+            dir.path(),
+            "content/main.typ",
+            "first line\n\nsecond\n#context asset.file(\"data.txt\", output: \"../x.txt\").url()",
+        );
+        world.files.reset();
+        assert_eq!(error_line(&world, &mut resolver), 3);
+        assert_eq!(resolver.stats.builds, 1, "the asset itself is cached");
+    }
+
+    /// Rev 2b findings 8 and 9: an `asset.typst` sub-compile's warnings are
+    /// kept with the cached entry, and its errors render with a snippet of
+    /// the sub-document taken from the build — the live world never loads
+    /// the sub-document into its persistent `FileStore`.
+    #[test]
+    fn typst_asset_diagnostics_come_from_the_build() {
+        let (ctx, dir) = site(&[
+            (
+                "content/main.typ",
+                "#context asset.typst(\"/assets/doc.typ\", format: \"svg\").url()",
+            ),
+            (
+                "assets/doc.typ",
+                "#set text(font: \"twyla-no-such-font\")\nhello",
+            ),
+        ]);
+        let world = RenderWorld::new(&ctx).unwrap();
+        let mut resolver = Resolver::new(&ctx);
+        for round in 0..2 {
+            let warned = crate::compile::compile_bundle(
+                &ctx,
+                &world,
+                &[page_id("content/main.typ")],
+                &mut resolver,
+            );
+            assert!(warned.output.is_ok(), "round {round}");
+            assert!(
+                warned.warnings.iter().any(|w| w.message.contains("font")),
+                "round {round}: sub-compile warning missing: {:?}",
+                warned.warnings
+            );
+        }
+        assert_eq!(resolver.stats.builds, 1);
+
+        write(
+            dir.path(),
+            "assets/doc.typ",
+            "#let x = 1\n#oops-undefined-name",
+        );
+        let world = RenderWorld::new(&ctx).unwrap();
+        let mut resolver = Resolver::new(&ctx);
+        let err = world.compile_bundle(&mut resolver).err().expect("an error");
+        let doc = ctx.root.join("assets/doc.typ");
+        assert!(
+            !world.take_loads().iter().any(|dep| dep.path == doc),
+            "the live world loaded the sub-document"
+        );
+        let text = err.to_string();
+        assert!(text.contains("oops-undefined-name"), "no snippet:\n{text}");
+        assert!(text.contains("assets/doc.typ"), "no file name:\n{text}");
     }
 
     /// A panic in the middle of an asset build: what the build touched so far

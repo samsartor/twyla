@@ -90,7 +90,7 @@ use typst::foundations::{
 };
 use typst::introspection::{History, Introspect, Introspector};
 use typst::loading::{Encoding, Readable};
-use typst::syntax::{FileId, Span};
+use typst::syntax::{FileId, Source, Span};
 use typst_utils::hash128;
 
 use crate::ledger::Dep;
@@ -526,6 +526,12 @@ pub struct ResolvedAsset {
     /// part of the asset's resolved identity, and the resolved record flows
     /// through introspection convergence, which must not churn as usage grows.
     pub outputs: Vec<OutputReq>,
+    /// For each of [`outputs`](Self::outputs), the span of the first request
+    /// *this compile* that asked for it: what an output-policy error (an
+    /// invalid `output:` path) blames. Not [`span`](Self::span), which is the
+    /// request that ran the build, possibly compiles ago and since moved.
+    /// Cleared with `outputs`; excluded from [`Hash`]/[`PartialEq`].
+    pub output_spans: Vec<(OutputReq, Span)>,
     /// Every file the build touched, recorded at access time by the
     /// resolver's [`DepRecorder`](crate::ledger::DepRecorder). Drives
     /// revalidation and the dev server's watch set. Excluded from
@@ -535,6 +541,11 @@ pub struct ResolvedAsset {
     /// Warnings the build raised, re-emitted on every compile that uses the
     /// asset. Excluded from [`Hash`]/[`PartialEq`] like `deps`.
     pub warnings: Vec<SourceDiagnostic>,
+    /// The sources `warnings` point into that the build itself loaded (an
+    /// `asset.typst` sub-document and its imports), captured from the build
+    /// so rendering a warning's snippet doesn't load them into the live
+    /// world's persistent `FileStore`. Excluded from [`Hash`]/[`PartialEq`].
+    pub diag_sources: Vec<Source>,
 }
 
 // Identity is the resolved result (spec → built → path → url), *not* `outputs`

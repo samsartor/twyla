@@ -13,10 +13,11 @@ use std::{fmt, fs, io};
 
 use iddqd::{IdHashItem, IdHashMap, id_upcast};
 
-use typst::diag::{FileError, FileResult, SourceDiagnostic, Warned};
+use typst::diag::{FileError, FileResult, PackageResult, SourceDiagnostic, Warned};
 use typst::foundations::{
     Binding, Bytes, Datetime, Dict, Duration, IntoValue, Module, Scope, Value, Version,
 };
+use typst::syntax::package::PackageSpec;
 use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
@@ -25,9 +26,10 @@ use typst_bundle::{BundleDocument, BundleFile};
 use typst_kit::diagnostics::termcolor::{Buffer, ColorChoice, StandardStream};
 use typst_kit::diagnostics::{self, DiagnosticFormat, DiagnosticWorld};
 use typst_kit::downloader::SystemDownloader;
+use typst_kit::files::FsRoot;
 use typst_kit::files::{FileLoader, FileStore};
 use typst_kit::fonts::FontStore;
-use typst_kit::packages::SystemPackages;
+use typst_kit::packages::{FsPackages, SystemPackages, UniversePackages};
 use typst_library::Feature;
 
 use crate::asset::ResolvedAsset;
@@ -36,6 +38,7 @@ use crate::document::ResolvedDocument;
 use crate::ledger::{self, Dep};
 use crate::project::{ContentScan, TwylaContext};
 use crate::resolver::Resolver;
+use crate::watch::Stamp;
 
 /// The `type` attribute marking a raw-HTML carrier `<script>`. The builtin
 /// [`crate::content::raw_html`] produces an element with this type; the
@@ -104,6 +107,15 @@ pub struct OutputDoc {
 }
 
 /// Some data which can be emitted to the output directory.
+///
+/// TODO(on-disk cache): `Copy` re-opens the live source path for `.read()`,
+/// output writing and HTTP serving, but the asset's fingerprint was hashed
+/// from an earlier read. A source replaced in between publishes new bytes
+/// under the old fingerprint (serve can hit this even after a successful
+/// build, while the next rebuild is pending). The planned content-addressed
+/// cache fixes it: builds stream into an immutable snapshot while hashing,
+/// and every consumer reads the snapshot. (`Bytes` residency in the warm
+/// resolver goes away with it too.)
 #[derive(Clone, Debug, PartialEq)]
 pub enum Emit {
     Bytes(Bytes),
@@ -383,10 +395,7 @@ impl RenderWorld {
         let loader = TwylaLoader {
             root: ctx.root.clone(),
             observed: Mutex::new(Vec::new()),
-            packages: SystemPackages::new(SystemDownloader::new(concat!(
-                "twyla/",
-                env!("CARGO_PKG_VERSION"),
-            ))),
+            packages: system_packages(&ctx),
         };
 
         let mut inputs = Dict::new();
@@ -466,13 +475,19 @@ impl RenderWorld {
             .collect();
         let Warned { output, warnings } =
             crate::compile::compile_bundle(&self.ctx, self, &fileids, resolver);
-        emit_warnings(self, &warnings);
+        // Diagnostics can point into files only an asset build loaded (an
+        // `asset.typst` sub-document): render those from the build's sources.
+        let diag_world = DiagWorld {
+            world: self,
+            sources: resolver.diag_sources(),
+        };
+        emit_warnings(&diag_world, &warnings);
 
         let CompiledBundle {
             bundle,
             pages,
             assets,
-        } = output.map_err(|errors| compile_err(self, &errors))?;
+        } = output.map_err(|errors| compile_err(&diag_world, &errors))?;
 
         let mut all = IdHashMap::new();
         for (path, file) in bundle.files.iter() {
@@ -480,7 +495,7 @@ impl RenderWorld {
                 BundleFile::Document(BundleDocument::Html(doc)) => doc,
                 _ => continue,
             };
-            let raw = typst_html::html(doc).map_err(|errors| compile_err(self, &errors))?;
+            let raw = typst_html::html(doc).map_err(|errors| compile_err(&diag_world, &errors))?;
             if let Err(err) = all.insert_unique(Output::Doc(OutputDoc {
                 html: resolve_raw_html_placeholders(&raw),
                 output_path: path.get_without_slash().to_owned(),
@@ -584,6 +599,50 @@ fn install_sys(global: &mut Scope) {
     global.bind("sys".into(), Binding::detached(sys));
 }
 
+/// The package sources every compile of `ctx` uses — the outer world's
+/// loader and each `asset.typst` sub-world alike: local packages from
+/// [`TwylaContext::package_dir`] (or the system data dir), downloads cached in
+/// the system cache dir, fetched from Typst Universe on a miss.
+pub(crate) fn system_packages(ctx: &TwylaContext) -> SystemPackages {
+    let data = match &ctx.package_dir {
+        Some(dir) => Some(FsPackages::new(dir)),
+        None => FsPackages::system_data(),
+    };
+    SystemPackages::from_parts(
+        data,
+        FsPackages::system_cache(),
+        UniversePackages::new(SystemDownloader::new(concat!(
+            "twyla/",
+            env!("CARGO_PKG_VERSION"),
+        ))),
+    )
+}
+
+/// Find `spec`'s root directory, recording the lookup as a ledger probe
+/// through `record`: the local candidate `<data>/<ns>/<name>/<version>`,
+/// whose existence decides the lookup — a missing `@local` package fails
+/// until it's installed there, and a local copy overrides a cached download.
+/// The answer is derived from that same probe, so it can't disagree with the
+/// record. (Downloads land in the cache dir, which only the compile itself
+/// writes, so it isn't recorded.)
+pub(crate) fn locate_package(
+    packages: &SystemPackages,
+    spec: &PackageSpec,
+    record: &mut dyn FnMut(Dep),
+) -> PackageResult<FsRoot> {
+    if let Some(data) = packages.data() {
+        let dir = data
+            .path()
+            .join(format!("{}/{}/{}", spec.namespace, spec.name, spec.version));
+        let (dep, meta) = ledger::observe_probe(&dir);
+        record(dep);
+        if meta.is_some() {
+            return Ok(FsRoot::new(dir));
+        }
+    }
+    packages.obtain(spec)
+}
+
 /// FileLoader for [`FileStore`]: serves project files from the on-disk
 /// project root and package files from the package dirs, recording every
 /// load into the ledger as it happens.
@@ -596,8 +655,7 @@ pub struct TwylaLoader {
     /// stat'ing dependencies after the compile (which can't see a file that
     /// changed in between).
     observed: Mutex<Vec<Dep>>,
-    /// Serves packages from the  standard data/cache dirs, downloading from
-    /// Typst Universe on a cache miss.
+    /// See [`system_packages`].
     packages: SystemPackages,
 }
 
@@ -605,31 +663,19 @@ impl FileLoader for TwylaLoader {
     fn load(&self, id: FileId) -> FileResult<Bytes> {
         let path = match id.root() {
             VirtualRoot::Project => self.root.join(id.vpath().get_without_slash()),
-            // Packages resolve to a (possibly just-downloaded) cache dir.
-            VirtualRoot::Package(spec) => match self.packages.obtain(spec) {
-                Ok(root) => root.resolve(id.vpath()),
-                Err(err) => {
-                    // A missing local package: record where it would be, so
-                    // installing it is noticed. (Universe packages are
-                    // downloaded on demand; nothing local to wait for.)
-                    if spec.namespace != "preview"
-                        && let Some(data) = self.packages.data()
-                    {
-                        let dir = data
-                            .path()
-                            .join(format!("{}/{}/{}", spec.namespace, spec.name, spec.version));
-                        self.record(ledger::observe_probe(&dir));
-                    }
-                    return Err(err.into());
-                }
-            },
+            VirtualRoot::Package(spec) => {
+                locate_package(&self.packages, spec, &mut |dep| self.record(dep))?
+                    .resolve(id.vpath())
+            }
         };
         let (dep, result) = ledger::observe_read(&path);
+        // `read` on a directory: typst's own loader reports this specially
+        // (`FsRoot::load`); match it. Decided from the recorded observation,
+        // not a second lookup.
+        let is_dir = matches!(dep.stamp, Stamp::Dir { .. } | Stamp::Unreadable);
         self.record(dep);
         result.map(Bytes::new).map_err(|err| {
-            // `read` on a directory: typst's own loader reports this
-            // specially (`FsRoot::load`); match it.
-            if path.is_dir() {
+            if is_dir {
                 FileError::IsDirectory
             } else {
                 FileError::from_io(err, &path)
@@ -641,6 +687,53 @@ impl FileLoader for TwylaLoader {
 impl TwylaLoader {
     fn record(&self, dep: Dep) {
         self.observed.lock().unwrap().push(dep);
+    }
+}
+
+/// The world diagnostics are rendered against: the live [`RenderWorld`],
+/// except for the files asset builds loaded themselves
+/// ([`Resolver::diag_sources`]), which are served from the sources captured
+/// by the build. Asking the live world for those would load them into its
+/// persistent `FileStore` just to draw a snippet — and could show different
+/// bytes than the build saw.
+struct DiagWorld<'a> {
+    world: &'a RenderWorld,
+    sources: std::collections::HashMap<FileId, Source>,
+}
+
+impl DiagnosticWorld for DiagWorld<'_> {
+    fn name(&self, id: FileId) -> String {
+        self.world.name(id)
+    }
+}
+
+impl World for DiagWorld<'_> {
+    fn library(&self) -> &LazyHash<Library> {
+        self.world.library()
+    }
+    fn book(&self) -> &LazyHash<FontBook> {
+        self.world.book()
+    }
+    fn main(&self) -> FileId {
+        self.world.main()
+    }
+    fn source(&self, id: FileId) -> FileResult<Source> {
+        match self.sources.get(&id) {
+            Some(source) => Ok(source.clone()),
+            None => self.world.source(id),
+        }
+    }
+    fn file(&self, id: FileId) -> FileResult<Bytes> {
+        match self.sources.get(&id) {
+            Some(source) => Ok(Bytes::from_string(source.text().to_owned())),
+            None => self.world.file(id),
+        }
+    }
+    fn font(&self, index: usize) -> Option<Font> {
+        self.world.font(index)
+    }
+    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
+        self.world.today(offset)
     }
 }
 

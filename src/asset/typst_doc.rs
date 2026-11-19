@@ -36,32 +36,44 @@
 //! each lands in the asset's ledger deps with the stamp and hash of exactly
 //! the bytes the compile used (the typst-native analogue of sass's
 //! `RecordingFs`), and nothing stays resident once the build is done. Editing
-//! the document or any of its imports re-triggers a rebuild. Package files
-//! still come from the live world: they're immutable.
+//! the document or any of its imports re-triggers a rebuild. Package files are
+//! read the same way, after a recorded package lookup
+//! ([`locate_package`]), so installing a missing `@local` package (or editing
+//! one) invalidates the asset too.
+//!
+//! The sub-compile's warnings are kept with the cached entry, and the sources
+//! its diagnostics point into are captured from the build and kept alongside
+//! (`diag_sources`), so rendering a snippet never loads a sub-document file
+//! into the live world's persistent `FileStore`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use super::{AssetSpec, Built, OutputReq, emit_or_request, sha256};
 use crate::ledger::DepRecorder;
 use crate::project::TwylaContext;
-use crate::render::Emit;
+use crate::render::{Emit, locate_package};
 use comemo::Tracked;
 use ecow::{EcoString, eco_format, eco_vec};
-use typst::diag::{FileError, FileResult, HintedStrResult, SourceDiagnostic, SourceResult, Warned};
+use typst::diag::{
+    FileError, FileResult, HintedStrResult, PackageResult, SourceDiagnostic, SourceResult, Warned,
+};
 use typst::foundations::{
     Bytes, Cast, Content, Datetime, Duration, IntoValue, Packed, PathOrStr, ShowFn, StyleChain,
     cast, elem, func, scope,
 };
 use typst::layout::Abs;
 use typst::loading::Encoding;
+use typst::syntax::package::PackageSpec;
 use typst::syntax::{FileId, RootedPath, Source, Span, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::visualize::Color;
 use typst::{Library, LibraryExt, World};
 use typst_html::HtmlDocument;
+use typst_kit::files::FsRoot;
+use typst_kit::packages::SystemPackages;
 use typst_layout::PagedDocument;
 use typst_library::Feature;
 use typst_pdf::PdfOptions;
@@ -214,10 +226,14 @@ impl Format {
 /// Compile a typst document and serialize it to `format`.
 ///
 /// Runs in-process against a **stock** [`Library`] (no twyla builtins), with
-/// file/font/package loading delegated to the live `world`. A path source
-/// compiles the real project file as `main`; an inline content value is bound
-/// into the stock global scope and compiled through a one-line synthetic
-/// `main`. Every project file the sub-compile reads goes through `rec`.
+/// fonts and the date delegated to the live `world`. A path source compiles
+/// the real project file as `main`; an inline content value is bound into the
+/// stock global scope and compiled through a one-line synthetic `main`. Every
+/// project and package file the sub-compile reads goes through `rec`.
+///
+/// The sub-compile's warnings go to `warnings`. The sources the build's
+/// diagnostics (warnings, or the returned errors) point into are pushed to
+/// `diag_sources`, for rendering them later without the live world.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build(
     world: Tracked<dyn World + '_>,
@@ -226,9 +242,11 @@ pub(crate) fn build(
     ppi: i64,
     minify: bool,
     ctx: &TwylaContext,
+    packages: &SystemPackages,
     span: Span,
     rec: &DepRecorder,
     warnings: &mut Vec<SourceDiagnostic>,
+    diag_sources: &mut Vec<Source>,
 ) -> SourceResult<Built> {
     // A stock library: the standard typst stdlib (with the HTML feature, needed
     // for `format: "html"` and harmless otherwise) but NONE of twyla's
@@ -239,8 +257,8 @@ pub(crate) fn build(
 
     let (main_id, main_src, stem) = match input {
         TypstInput::File(file) => {
-            // Compile the real project file as `main`; the delegating loader
-            // reads it (and its imports) through the live world.
+            // Compile the real project file as `main`; the sub-world reads it
+            // (and its imports) through the recorder.
             let stem = Path::new(file.vpath().get_without_slash())
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -270,39 +288,20 @@ pub(crate) fn build(
         main_id,
         main_src,
         root: &ctx.root,
+        packages,
         rec,
         loaded: Mutex::new(HashMap::new()),
+        located: Mutex::new(HashMap::new()),
     };
 
-    let bytes = match format {
-        Format::Html => {
-            let doc = compile_html(&subworld)?;
-            typst_html::html(&doc)?.into_bytes()
-        }
-        Format::Svg | Format::Png | Format::Pdf => {
-            let doc = compile_paged(&subworld)?;
-            match format {
-                Format::Svg => {
-                    let svg = typst_svg::svg_merged(&doc, Abs::zero());
-                    if minify {
-                        super::svg::minify_str(svg, span, warnings).into_bytes()
-                    } else {
-                        svg.into_bytes()
-                    }
-                }
-                Format::Pdf => typst_pdf::pdf(&doc, &PdfOptions::default())?,
-                Format::Png => {
-                    let ppp = ppi as f32 / 72.0;
-                    let pixmap =
-                        typst_render::render_merged(&doc, ppp, Abs::zero(), Some(Color::WHITE));
-                    pixmap
-                        .encode_png()
-                        .map_err(|err| err_at(span, eco_format!("PNG encode failed: {err}")))?
-                }
-                Format::Html => unreachable!("html handled above"),
-            }
-        }
-    };
+    let mut sub_warnings = Vec::new();
+    let result = serialize(&subworld, format, ppi, minify, span, &mut sub_warnings);
+    // Capture the sources of everything the sub-compile has to say, while
+    // the sub-world still holds them.
+    let errors = result.as_ref().err().map(|e| e.as_slice()).unwrap_or(&[]);
+    subworld.capture_sources(errors.iter().chain(&sub_warnings), diag_sources);
+    warnings.extend(sub_warnings);
+    let bytes = result?;
 
     if format == Format::Html
         && bytes
@@ -334,23 +333,54 @@ pub(crate) fn build(
     })
 }
 
-/// Compile the sub-document to a [`PagedDocument`] (svg/png/pdf), discarding
-/// warnings (there is no engine sink to route them to from an asset build).
-fn compile_paged(world: &TypstWorld) -> SourceResult<PagedDocument> {
-    let Warned {
-        output,
-        warnings: _,
-    } = typst::compile::<PagedDocument>(world);
-    output
-}
-
-/// Compile the sub-document to an [`HtmlDocument`] (html format).
-fn compile_html(world: &TypstWorld) -> SourceResult<HtmlDocument> {
-    let Warned {
-        output,
-        warnings: _,
-    } = typst::compile::<HtmlDocument>(world);
-    output
+/// Compile the sub-document and serialize it to `format`. The sub-compile's
+/// warnings go to `warnings`.
+fn serialize(
+    world: &TypstWorld,
+    format: Format,
+    ppi: i64,
+    minify: bool,
+    span: Span,
+    warnings: &mut Vec<SourceDiagnostic>,
+) -> SourceResult<Vec<u8>> {
+    Ok(match format {
+        Format::Html => {
+            let Warned {
+                output,
+                warnings: w,
+            } = typst::compile::<HtmlDocument>(world);
+            warnings.extend(w);
+            typst_html::html(&output?)?.into_bytes()
+        }
+        Format::Svg | Format::Png | Format::Pdf => {
+            let Warned {
+                output,
+                warnings: w,
+            } = typst::compile::<PagedDocument>(world);
+            warnings.extend(w);
+            let doc = output?;
+            match format {
+                Format::Svg => {
+                    let svg = typst_svg::svg_merged(&doc, Abs::zero());
+                    if minify {
+                        super::svg::minify_str(svg, span, warnings).into_bytes()
+                    } else {
+                        svg.into_bytes()
+                    }
+                }
+                Format::Pdf => typst_pdf::pdf(&doc, &PdfOptions::default())?,
+                Format::Png => {
+                    let ppp = ppi as f32 / 72.0;
+                    let pixmap =
+                        typst_render::render_merged(&doc, ppp, Abs::zero(), Some(Color::WHITE));
+                    pixmap
+                        .encode_png()
+                        .map_err(|err| err_at(span, eco_format!("PNG encode failed: {err}")))?
+                }
+                Format::Html => unreachable!("html handled above"),
+            }
+        }
+    })
 }
 
 /// A spanned error from any `Display` payload.
@@ -363,8 +393,8 @@ fn err_at(span: Span, msg: impl std::fmt::Display) -> ecow::EcoVec<SourceDiagnos
 
 /// A [`World`] for an `asset.typst` sub-compile: serves a stock library + a
 /// `main` (a synthetic source for inline content, or the real project file for
-/// a path source), reads project files itself through the recorder, and
-/// delegates packages, fonts and the date to the live world.
+/// a path source), reads project and package files itself through the
+/// recorder, and delegates fonts and the date to the live world.
 ///
 /// Owns the stock library (it returns a reference, so it can't be borrowed
 /// across the `Tracked` boundary — the same reason `SnippetWorld` clones). The
@@ -378,14 +408,18 @@ struct TypstWorld<'a> {
     main_src: Option<Source>,
     /// The project root project-file ids resolve against.
     root: &'a Path,
+    /// Where package-file ids resolve (see [`locate_package`]).
+    packages: &'a SystemPackages,
     rec: &'a DepRecorder,
-    /// Project files loaded so far, so each is read (and recorded) once per
-    /// build — typst asks for the same file many times. Dropped with the
-    /// sub-world when the build ends.
+    /// Files loaded so far, so each is read (and recorded) once per build —
+    /// typst asks for the same file many times. Dropped with the sub-world
+    /// when the build ends.
     loaded: Mutex<HashMap<FileId, FileResult<Loaded>>>,
+    /// Package roots looked up so far, so each lookup is recorded once.
+    located: Mutex<HashMap<PackageSpec, PackageResult<FsRoot>>>,
 }
 
-/// A loaded project file: its bytes, and its parsed source once asked for.
+/// A loaded file: its bytes, and its parsed source once asked for.
 #[derive(Clone)]
 struct Loaded {
     bytes: Bytes,
@@ -393,11 +427,26 @@ struct Loaded {
 }
 
 impl TypstWorld<'_> {
-    /// Load a project file through the recorder, once per build.
+    /// Where file `id` lives on disk. A package id first looks the package
+    /// up, recording the lookup.
+    fn path(&self, id: FileId) -> FileResult<PathBuf> {
+        match id.root() {
+            VirtualRoot::Project => Ok(self.root.join(id.vpath().get_without_slash())),
+            VirtualRoot::Package(spec) => {
+                let mut located = self.located.lock().unwrap();
+                let root = located.entry(spec.clone()).or_insert_with(|| {
+                    locate_package(self.packages, spec, &mut |dep| self.rec.ingest([dep]))
+                });
+                Ok(root.clone()?.resolve(id.vpath()))
+            }
+        }
+    }
+
+    /// Load a file through the recorder, once per build.
     fn load(&self, id: FileId, as_source: bool) -> FileResult<Loaded> {
         let mut loaded = self.loaded.lock().unwrap();
         let entry = loaded.entry(id).or_insert_with(|| {
-            let path = self.root.join(id.vpath().get_without_slash());
+            let path = self.path(id)?;
             self.rec
                 .read(&path)
                 .map(|bytes| Loaded {
@@ -414,6 +463,38 @@ impl TypstWorld<'_> {
             file.source = Some(Source::new(id, text.into()));
         }
         entry.clone()
+    }
+
+    /// Push the source of every file `diags` point into (their spans, hints
+    /// and traces) that this build loaded, parsing it if it was only loaded
+    /// as bytes. Files that failed to load (and so can't be pointed into)
+    /// are skipped.
+    fn capture_sources<'d>(
+        &self,
+        diags: impl Iterator<Item = &'d SourceDiagnostic>,
+        out: &mut Vec<Source>,
+    ) {
+        for diag in diags {
+            let spans = std::iter::once(diag.span)
+                .chain(diag.hints.iter().map(|hint| hint.span))
+                .chain(diag.trace.iter().map(|point| point.span));
+            for id in spans.filter_map(|span| span.id()) {
+                if out.iter().any(|source| source.id() == id) {
+                    continue;
+                }
+                let source = match &self.main_src {
+                    Some(src) if id == self.main_id => Some(src.clone()),
+                    _ => match self.loaded.lock().unwrap().get(&id) {
+                        Some(Ok(file)) => file.source.clone().or_else(|| {
+                            let text = std::str::from_utf8(&file.bytes).ok()?;
+                            Some(Source::new(id, text.into()))
+                        }),
+                        _ => None,
+                    },
+                };
+                out.extend(source);
+            }
+        }
     }
 }
 
@@ -433,10 +514,7 @@ impl World for TypstWorld<'_> {
         {
             return Ok(src.clone());
         }
-        match id.root() {
-            VirtualRoot::Project => Ok(self.load(id, true)?.source.expect("parsed by load")),
-            VirtualRoot::Package(_) => self.world.source(id),
-        }
+        Ok(self.load(id, true)?.source.expect("parsed by load"))
     }
     fn file(&self, id: FileId) -> FileResult<Bytes> {
         if id == self.main_id
@@ -444,10 +522,7 @@ impl World for TypstWorld<'_> {
         {
             return Ok(Bytes::new(src.text().as_bytes().to_vec()));
         }
-        match id.root() {
-            VirtualRoot::Project => Ok(self.load(id, false)?.bytes),
-            VirtualRoot::Package(_) => self.world.file(id),
-        }
+        Ok(self.load(id, false)?.bytes)
     }
     fn font(&self, index: usize) -> Option<Font> {
         self.world.font(index)

@@ -42,7 +42,8 @@ pub enum DepKind {
     Read,
     /// The build asked whether something exists at the path (e.g. sass import
     /// resolution trying `_partial.scss`, `partial.scss`, …). Valid while the
-    /// answer — missing, file, or directory — stays the same.
+    /// answer — missing, file, or directory — stays the same. Its stamp is
+    /// always [`Stamp::Missing`] or [`Stamp::Exists`].
     Probe,
     /// The build listed a directory. Valid while the entry names are the same.
     Dir,
@@ -55,45 +56,77 @@ pub struct Dep {
     /// are different dependencies, like they are to the build).
     pub path: PathBuf,
     pub kind: DepKind,
-    /// The path as observed when it was accessed. For a read, taken before the
-    /// read and re-checked after it: if the two differ the file changed under
-    /// the read, and the stamp is [`Stamp::Unknown`], which never matches.
+    /// The path as observed when it was accessed, taken *before* the access.
+    /// For a successful read it's re-checked after the read: if the two
+    /// differ the file changed under the read, and the stamp is
+    /// [`Stamp::Unknown`], which never matches. For a failed access it's kept
+    /// as is — the baseline the failure is compared against, so a fix that
+    /// lands between the failure and the watcher subscribing still differs
+    /// from it.
     pub stamp: Stamp,
     /// [`DepKind::Read`] only: SHA-256 of the bytes the build consumed. `None`
-    /// when the read failed (or for other kinds).
+    /// when the read failed or was abandoned (or for other kinds).
     pub sha256: Option<[u8; 32]>,
-    /// Wall-clock time the stamp was taken. A file whose mtime is within
-    /// [`RACY_WINDOW`] of this may be rewritten without its stamp changing
-    /// (same length, mtime granularity), so its stamp alone can't vouch for
-    /// it — see [`Dep::is_racy`].
+    /// Why the access failed, if it did (`NotFound`, `PermissionDenied`,
+    /// `IsADirectory`, …). Kept for diagnosis; validity is decided by the
+    /// stamp (see [`revalidate`]).
+    pub error: Option<io::ErrorKind>,
+    /// Wall-clock time just before the stamp was taken. A file changed
+    /// within the timestamp granularity of this may be rewritten without its
+    /// stamp changing, so its stamp alone can't vouch for it — see
+    /// [`Dep::is_racy`].
     pub observed_at: SystemTime,
 }
 
-/// How close an mtime may be to the observation time before the stamp is
-/// "racy" (git's racy-index problem): filesystems with coarse timestamps
-/// (FAT: 2s; ext3, HFS+: 1s) can record a later same-length write with the
-/// same mtime. 2s covers all of them. A racy stamp costs one re-hash on the
-/// next check; it never forces a rebuild by itself.
+/// How close a file's change time may be to the observation time before
+/// its stamp is "racy" (git's racy-index problem), on a filesystem with
+/// whole-second timestamps (FAT: 2s; ext3, HFS+: 1s): a later write within
+/// the same tick can leave every timestamp unchanged. 2s covers all of
+/// them. A racy stamp costs one re-hash per check; it never forces a
+/// rebuild by itself.
 pub const RACY_WINDOW: Duration = Duration::from_secs(2);
 
-impl Dep {
-    /// Whether this read's stamp can't vouch for its contents: the file was
-    /// modified within [`RACY_WINDOW`] of being read (or has an mtime in the
-    /// future, e.g. clock skew). Such a dep is verified by hash instead.
-    pub fn is_racy(&self) -> bool {
-        match (&self.kind, &self.stamp, self.sha256) {
-            (DepKind::Read, Stamp::File { mtime, .. }, Some(_)) => {
-                *mtime + RACY_WINDOW > self.observed_at
-            }
-            _ => false,
-        }
-    }
+/// [`RACY_WINDOW`] for timestamps with sub-second precision (ext4, xfs,
+/// btrfs, tmpfs, APFS, NTFS). Linux stamps files from a coarse clock that
+/// lags real time by up to one scheduler tick (≤10ms), so a later write can
+/// share a timestamp only within that lag; 50ms leaves margin.
+pub const FINE_RACY_WINDOW: Duration = Duration::from_millis(50);
 
-    /// A read that failed on a path that *exists* (permission denied, a
-    /// directory, an I/O error). Its stamp can't tell a fix apart — `chmod`
-    /// touches neither mtime nor length — so [`revalidate`] always retries it.
-    pub fn is_failed_read(&self) -> bool {
-        self.kind == DepKind::Read && self.sha256.is_none() && self.stamp != Stamp::Missing
+impl Dep {
+    /// Whether this read's stamp can't vouch for its contents: the file
+    /// changed within the timestamp granularity of being read, so a later
+    /// same-length rewrite could have left the stamp unchanged. Such a dep is
+    /// verified by hash instead.
+    ///
+    /// Keyed off the change time the kernel sets on every write (unix ctime;
+    /// mtime elsewhere), compared within a window *either side* of the
+    /// observation. The granularity is guessed from the timestamp itself: a
+    /// whole-second change time means a whole-second filesystem
+    /// ([`RACY_WINDOW`]), anything else a fine one ([`FINE_RACY_WINDOW`]). A
+    /// change time far in the *future* (clock skew, or on non-unix an mtime
+    /// set ahead by `touch -d`) isn't racy: a later write is stamped with the
+    /// current clock, so it can't reproduce it. So a future-dated file is
+    /// re-hashed at most until its stamp settles, not on every compile.
+    pub fn is_racy(&self) -> bool {
+        let (DepKind::Read, Stamp::File { mtime, ctime, .. }, Some(_)) =
+            (self.kind, &self.stamp, self.sha256)
+        else {
+            return false;
+        };
+        let changed = ctime.unwrap_or(*mtime);
+        let whole_second = changed
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .is_ok_and(|d| d.subsec_nanos() == 0);
+        let window = if whole_second {
+            RACY_WINDOW
+        } else {
+            FINE_RACY_WINDOW
+        };
+        let gap = match changed.duration_since(self.observed_at) {
+            Ok(ahead) => ahead,
+            Err(behind) => behind.duration(),
+        };
+        gap < window
     }
 }
 
@@ -108,16 +141,16 @@ pub fn observe_read(path: &Path) -> (Dep, io::Result<Vec<u8>>) {
     let observed_at = SystemTime::now();
     let before = Stamp::now(&path);
     let result = fs::read(&path);
-    let (stamp, sha256) = match &result {
-        Ok(bytes) => (settle(&path, before), Some(sha256(bytes))),
-        Err(_) => (failed_stamp(&path), None),
-    };
-    let dep = Dep {
-        path,
-        kind: DepKind::Read,
-        stamp,
-        sha256,
-        observed_at,
+    let dep = match &result {
+        Ok(bytes) => Dep {
+            stamp: settle(&path, before),
+            sha256: Some(sha256(bytes)),
+            error: None,
+            path,
+            kind: DepKind::Read,
+            observed_at,
+        },
+        Err(err) => failed_read(path, before, err.kind(), observed_at),
     };
     (dep, result)
 }
@@ -133,50 +166,68 @@ pub fn observe_hash(path: &Path) -> (Dep, io::Result<[u8; 32]>) {
         io::copy(&mut file, &mut hasher)?;
         Ok(<[u8; 32]>::from(hasher.finalize()))
     });
-    let (stamp, sha256) = match &result {
-        Ok(hash) => (settle(&path, before), Some(*hash)),
-        Err(_) => (failed_stamp(&path), None),
-    };
-    let dep = Dep {
-        path,
-        kind: DepKind::Read,
-        stamp,
-        sha256,
-        observed_at,
+    let dep = match &result {
+        Ok(hash) => Dep {
+            stamp: settle(&path, before),
+            sha256: Some(*hash),
+            error: None,
+            path,
+            kind: DepKind::Read,
+            observed_at,
+        },
+        Err(err) => failed_read(path, before, err.kind(), observed_at),
     };
     (dep, result)
 }
 
-/// Record an existence check.
-pub fn observe_probe(path: &Path) -> Dep {
+/// Record an existence check, returning the `metadata` (following symlinks)
+/// it was decided from: callers derive their answer ("is it a file?") from
+/// this same lookup, so the answer and the record can't disagree. Never lists
+/// a directory.
+pub fn observe_probe(path: &Path) -> (Dep, Option<fs::Metadata>) {
     let path = absolute(path);
-    Dep {
-        observed_at: SystemTime::now(),
-        stamp: Stamp::now(&path),
+    let observed_at = SystemTime::now();
+    let meta = fs::metadata(&path).ok();
+    let dep = Dep {
+        stamp: Stamp::existence(meta.as_ref()),
         path,
         kind: DepKind::Probe,
         sha256: None,
-    }
+        error: None,
+        observed_at,
+    };
+    (dep, meta)
 }
 
 /// List `path`'s entry names, recording the access.
 pub fn observe_dir(path: &Path) -> (Dep, io::Result<Vec<OsString>>) {
     let path = absolute(path);
     let observed_at = SystemTime::now();
+    // For a failed listing, the baseline is what was there *before* (one
+    // stat, no listing), as for a failed read.
+    let before = fs::metadata(&path);
     let result = fs::read_dir(&path).and_then(|entries| {
         entries
             .map(|entry| entry.map(|e| e.file_name()))
             .collect::<io::Result<Vec<_>>>()
     });
-    let stamp = match &result {
-        Ok(names) => Stamp::dir_listing(names.clone()),
-        Err(_) => Stamp::now(&path),
+    let (stamp, error) = match &result {
+        Ok(names) => (Stamp::dir_listing(names.clone()), None),
+        Err(err) => {
+            let stamp = match &before {
+                Err(_) => Stamp::Missing,
+                Ok(meta) if meta.is_dir() => Stamp::Unreadable,
+                Ok(meta) => Stamp::file(meta),
+            };
+            (stamp, Some(err.kind()))
+        }
     };
     let dep = Dep {
         path,
         kind: DepKind::Dir,
         stamp,
         sha256: None,
+        error,
         observed_at,
     };
     (dep, result)
@@ -194,14 +245,24 @@ fn settle(path: &Path, before: Stamp) -> Stamp {
     }
 }
 
-/// The stamp for a failed read: how the path looks now — `Missing` for
-/// not-found, otherwise the existing file or directory. Deliberately *not* a
-/// never-matching stamp: the failure would recur on every rebuild, and so
-/// would the forced recheck. A fix that doesn't change the stamp (`chmod`) is
-/// caught by [`Dep::is_failed_read`] and the watcher's metadata events
-/// instead.
-fn failed_stamp(path: &Path) -> Stamp {
-    Stamp::now(path)
+/// The dep of a read that failed with `error`, stamped with the state
+/// observed *before* the attempt. A stable observation, deliberately: a
+/// failure that persists (a missing file, a directory, no permission)
+/// re-checks as unchanged and stays cached, instead of being retried — and
+/// rebuilding — on every compile. A fix is a change to that baseline: the
+/// file appearing, or (on unix) any write, replace or `chmod`, which moves
+/// its ctime and permission bits (see [`Stamp::File`]). Taking the baseline
+/// before the attempt, not after, means a fix that lands between the failure
+/// and the stamp still registers as a change.
+fn failed_read(path: PathBuf, before: Stamp, error: io::ErrorKind, observed_at: SystemTime) -> Dep {
+    Dep {
+        path,
+        kind: DepKind::Read,
+        stamp: before,
+        sha256: None,
+        error: Some(error),
+        observed_at,
+    }
 }
 
 /// Make `path` absolute without touching the filesystem (it may not exist).
@@ -234,9 +295,9 @@ impl DepRecorder {
     }
 
     /// Open `path` for streaming. The returned reader hashes what it reads;
-    /// [`TrackedFile::finish`] records the dep (and the reader records a
-    /// failed read if dropped before reaching EOF). A failed open is recorded
-    /// immediately.
+    /// [`TrackedFile::finish`] records the dep (and the reader records it on
+    /// drop if the read failed or was abandoned before EOF). A failed open is
+    /// recorded immediately.
     pub fn open(&self, path: &Path) -> io::Result<TrackedFile<'_>> {
         let path = absolute(path);
         let observed_at = SystemTime::now();
@@ -249,16 +310,11 @@ impl DepRecorder {
                 hasher: Sha256::new(),
                 path: Some(path),
                 before,
+                error: None,
                 observed_at,
             }),
             Err(err) => {
-                self.push(Dep {
-                    stamp: failed_stamp(&path),
-                    path,
-                    kind: DepKind::Read,
-                    sha256: None,
-                    observed_at,
-                });
+                self.push(failed_read(path, before, err.kind(), observed_at));
                 Err(err)
             }
         }
@@ -275,18 +331,16 @@ impl DepRecorder {
 
     /// Whether `path` is a file (following symlinks), recorded as a probe.
     pub fn is_file(&self, path: &Path) -> bool {
-        let dep = observe_probe(path);
-        let found = path.is_file();
+        let (dep, meta) = observe_probe(path);
         self.push(dep);
-        found
+        meta.is_some_and(|m| m.is_file())
     }
 
     /// Whether `path` is a directory (following symlinks), recorded as a probe.
     pub fn is_dir(&self, path: &Path) -> bool {
-        let dep = observe_probe(path);
-        let found = path.is_dir();
+        let (dep, meta) = observe_probe(path);
         self.push(dep);
-        found
+        meta.is_some_and(|m| m.is_dir())
     }
 
     /// The entry names of directory `path`, recorded by listing.
@@ -337,23 +391,37 @@ pub struct TrackedFile<'a> {
     recorder: &'a DepRecorder,
     file: fs::File,
     hasher: Sha256,
-    /// Taken by `finish`; still set on drop means the read was abandoned.
+    /// Taken by `finish`; still set on drop means the read failed or was
+    /// abandoned.
     path: Option<PathBuf>,
     before: Stamp,
+    /// The error a read returned, if one did. Tells a *failed* read (a
+    /// stable failure, e.g. `EISDIR` reading a directory) apart from an
+    /// *abandoned* one when the reader is dropped.
+    error: Option<io::ErrorKind>,
     observed_at: SystemTime,
 }
 
 impl Read for TrackedFile<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.file.read(buf)?;
-        self.hasher.update(&buf[..n]);
-        Ok(n)
+        match self.file.read(buf) {
+            Ok(n) => {
+                self.hasher.update(&buf[..n]);
+                Ok(n)
+            }
+            Err(err) => {
+                if err.kind() != io::ErrorKind::Interrupted {
+                    self.error = Some(err.kind());
+                }
+                Err(err)
+            }
+        }
     }
 }
 
 impl TrackedFile<'_> {
     /// Read whatever is left (discarding it), record the dep, and return the
-    /// SHA-256 of the whole file.
+    /// SHA-256 of the whole file. On a read error, the drop records it.
     pub fn finish(mut self) -> io::Result<[u8; 32]> {
         io::copy(&mut self, &mut io::sink())?;
         let path = self.path.take().expect("finish runs once");
@@ -364,6 +432,7 @@ impl TrackedFile<'_> {
             kind: DepKind::Read,
             stamp,
             sha256: Some(hash),
+            error: None,
             observed_at: self.observed_at,
         });
         Ok(hash)
@@ -372,17 +441,28 @@ impl TrackedFile<'_> {
 
 impl Drop for TrackedFile<'_> {
     fn drop(&mut self) {
-        // Abandoned mid-read (an I/O error, or the caller bailed): what the
-        // build consumed is unknown, so record a stamp that never matches.
-        if let Some(path) = self.path.take() {
-            self.recorder.push(Dep {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        let before = std::mem::replace(&mut self.before, Stamp::Unknown);
+        let dep = match self.error {
+            // The read *failed*: as stable as a failed open (see
+            // `failed_read`). Recording `Unknown` here would evict and
+            // rebuild the asset on every compile, and keep a polled path
+            // rebuilding forever.
+            Some(error) => failed_read(path, before, error, self.observed_at),
+            // Abandoned mid-read (the caller bailed): what the build consumed
+            // is unknown, so record a stamp that never matches.
+            None => Dep {
                 path,
                 kind: DepKind::Read,
                 stamp: Stamp::Unknown,
                 sha256: None,
+                error: None,
                 observed_at: self.observed_at,
-            });
-        }
+            },
+        };
+        self.recorder.push(dep);
     }
 }
 
@@ -418,9 +498,8 @@ pub enum Revalidation {
 /// - **Read**: stamp equal (and not [racy](Dep::is_racy)) → valid. Otherwise
 ///   re-hash by streaming: same digest → valid with a fresh stamp (so a
 ///   `touch` doesn't redo an image pipeline); different → changed. A read
-///   that failed on an existing path is always retried
-///   ([`Dep::is_failed_read`]); one that failed as missing is valid while the
-///   path stays missing.
+///   that *failed* is valid while its pre-access stamp still matches (see
+///   [`failed_read`]): the same state fails the same way.
 /// - **Probe**: valid while the path is still missing / a file / a directory.
 /// - **Dir**: valid while the listing is the same.
 ///
@@ -430,31 +509,31 @@ pub fn revalidate(deps: &[Dep], content_reads: &mut usize) -> Revalidation {
     for (i, dep) in deps.iter().enumerate() {
         let fresh = match dep.kind {
             DepKind::Read => {
-                if dep.is_failed_read() {
-                    return Revalidation::Changed;
-                }
                 let now = Stamp::now(&dep.path);
-                if now == dep.stamp && !dep.is_racy() {
+                if dep.sha256.is_none() {
+                    // A failed (or abandoned: `Unknown`) read.
+                    if now != dep.stamp || dep.stamp == Stamp::Unknown {
+                        return Revalidation::Changed;
+                    }
                     None
-                } else if dep.sha256.is_none() {
-                    // Failed as missing (the only failed read that gets
-                    // here), and no longer missing.
-                    return Revalidation::Changed;
+                } else if now == dep.stamp && !dep.is_racy() {
+                    None
                 } else {
                     *content_reads += 1;
                     let (fresh, hash) = observe_hash(&dep.path);
                     match hash {
-                        Ok(hash) if Some(hash) == dep.sha256 => (fresh.stamp != dep.stamp
-                            || fresh.observed_at != dep.observed_at)
-                            .then_some(fresh),
+                        Ok(hash) if Some(hash) == dep.sha256 => Some(fresh),
                         _ => return Revalidation::Changed,
                     }
                 }
             }
-            DepKind::Probe => match (existence(&dep.stamp), existence(&Stamp::now(&dep.path))) {
-                (Some(then), Some(now)) if then == now => None,
-                _ => return Revalidation::Changed,
-            },
+            DepKind::Probe => {
+                // One `metadata` call, as when it was recorded: never a listing.
+                if Stamp::existence(fs::metadata(&dep.path).ok().as_ref()) != dep.stamp {
+                    return Revalidation::Changed;
+                }
+                None
+            }
             DepKind::Dir => {
                 if Stamp::now(&dep.path) != dep.stamp {
                     return Revalidation::Changed;
@@ -469,25 +548,6 @@ pub fn revalidate(deps: &[Dep], content_reads: &mut usize) -> Revalidation {
     match restamped {
         Some(deps) => Revalidation::Restamped(deps),
         None => Revalidation::Valid,
-    }
-}
-
-/// What a probe cares about: is anything there, and is it a directory.
-#[derive(PartialEq, Eq)]
-enum Existence {
-    Missing,
-    File,
-    Dir,
-}
-
-/// `None` for an [`Stamp::Unknown`] observation, which can't vouch for
-/// anything (so it never compares equal).
-fn existence(stamp: &Stamp) -> Option<Existence> {
-    match stamp {
-        Stamp::Missing => Some(Existence::Missing),
-        Stamp::File { .. } => Some(Existence::File),
-        Stamp::Dir { .. } | Stamp::Unreadable => Some(Existence::Dir),
-        Stamp::Unknown => None,
     }
 }
 

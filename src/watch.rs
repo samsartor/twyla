@@ -16,7 +16,9 @@
 //! then [`Watcher::wait`] for a batch of relevant events. What's new:
 //!
 //! - **Observations.** Every [`WatchSet`] entry carries the [`Stamp`] the
-//!   compile observed (file mtime+len, a directory's listing, or "missing").
+//!   compile observed (a file's mtime, length and — on unix — ctime, inode
+//!   and permissions; a directory's listing; existence alone for a probe;
+//!   or "missing").
 //!   When `update` subscribes a path it wasn't already watching, it re-stamps
 //!   the path *after* subscribing and compares: a difference means the path
 //!   changed in the window no subscription covered, and the next `wait`
@@ -71,9 +73,29 @@ pub enum Stamp {
     /// The path didn't exist (or couldn't be stat'ed — the watcher treats
     /// both the same way, by polling `exists()`).
     Missing,
-    /// A file (anything that isn't a directory), by modification time and
-    /// length. Not a content hash: cheap enough to take for every dependency.
-    File { mtime: SystemTime, len: u64 },
+    /// A file (anything that isn't a directory). Not a content hash: cheap
+    /// enough to take for every dependency, but (on unix) strong enough that
+    /// any write, replace or `chmod` changes it — see [`Stamp::file`].
+    File {
+        mtime: SystemTime,
+        len: u64,
+        /// Unix: the inode change time (`st_ctime`). The kernel bumps it on
+        /// every write, rename, link or permission change, and — unlike
+        /// mtime — nothing can set it back, so an in-place rewrite that keeps
+        /// the length and restores the mtime still changes the stamp. It is
+        /// also what [`Dep::is_racy`](crate::ledger::Dep::is_racy) keys off.
+        /// `None` elsewhere.
+        ctime: Option<SystemTime>,
+        /// Unix: `(st_dev, st_ino)`. A file replaced by a rename (an
+        /// editor's atomic save) is a different file even if every time and
+        /// the length agree. `None` elsewhere.
+        inode: Option<(u64, u64)>,
+        /// Permission bits (unix: `st_mode & 0o7777`; elsewhere 1 if
+        /// read-only, else 0). A `chmod` can fix (or break) a failed read
+        /// without touching anything else, so it must be a change — even on
+        /// filesystems whose ctime is too coarse to show it.
+        perm: u32,
+    },
     /// A directory, by a hash of its sorted entry names (see
     /// [`Stamp::dir_listing`]). Only the *names* matter: a directory is
     /// watched for pages/files appearing or disappearing; edits to the files
@@ -84,6 +106,16 @@ pub enum Stamp {
     /// unreadable directory that stays unreadable has not changed, and
     /// treating it as changed would rebuild forever.
     Unreadable,
+    /// Something exists here — a directory if `dir`, otherwise a file — and
+    /// nothing else about it was observed: the stamp of an existence probe
+    /// (sass import resolution asking "is `_partial.scss` a file?", a package
+    /// lookup asking "is this version installed?"). Taken from a single
+    /// `metadata` call ([`Stamp::existence`]), so a probed directory is never
+    /// listed. Matches any later observation of the same type, so `touch`ing
+    /// a probed file doesn't invalidate the probe; in a [`WatchSet`] it
+    /// merges with a full observation of the same path (see
+    /// [`WatchSet::observe`]).
+    Exists { dir: bool },
     /// The observation can't be trusted: the file changed while the compile
     /// was reading it (see [`crate::ledger`]'s racy-read guard). Never
     /// matches, so re-checking it always reports a change. Only produced by
@@ -105,12 +137,44 @@ impl Stamp {
                 Err(_) => Stamp::Unreadable,
             };
         }
-        match meta.modified() {
-            Ok(mtime) => Stamp::File {
+        Stamp::file(&meta)
+    }
+
+    /// The stamp of a non-directory from its metadata. Every field comes from
+    /// this one `stat`, so they describe one moment. A platform that can't
+    /// report an mtime gets the epoch: a stable (if weak) stamp, never
+    /// [`Stamp::Unknown`], which would rebuild forever.
+    pub fn file(meta: &fs::Metadata) -> Stamp {
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Stamp::File {
                 mtime,
                 len: meta.len(),
-            },
-            Err(_) => Stamp::Unknown,
+                ctime: Some(unix_time(meta.ctime(), meta.ctime_nsec())),
+                inode: Some((meta.dev(), meta.ino())),
+                perm: meta.mode() & 0o7777,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Stamp::File {
+                mtime,
+                len: meta.len(),
+                ctime: None,
+                inode: None,
+                perm: u32::from(meta.permissions().readonly()),
+            }
+        }
+    }
+
+    /// The stamp of an existence probe, from the probe's own `metadata`
+    /// result (`None`: not found or not stat-able). See [`Stamp::Exists`].
+    pub fn existence(meta: Option<&fs::Metadata>) -> Stamp {
+        match meta {
+            Some(meta) => Stamp::Exists { dir: meta.is_dir() },
+            None => Stamp::Missing,
         }
     }
 
@@ -130,11 +194,25 @@ impl Stamp {
     }
 
     /// Whether `path` still looks the way it did when this stamp was taken.
+    /// An [`Exists`](Stamp::Exists) stamp only checks existence and type
+    /// (one `metadata` call, no listing).
     pub fn matches_now(&self, path: &Path) -> bool {
         match self {
             Stamp::Unknown => false,
+            Stamp::Exists { .. } => *self == Stamp::existence(fs::metadata(path).ok().as_ref()),
             stamp => *stamp == Stamp::now(path),
         }
+    }
+}
+
+/// A unix `(seconds, nanoseconds)` timestamp as a [`SystemTime`].
+#[cfg(unix)]
+fn unix_time(secs: i64, nsec: i64) -> SystemTime {
+    let nsec = Duration::from_nanos(nsec.clamp(0, 999_999_999) as u64);
+    if secs >= 0 {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64) + nsec
+    } else {
+        SystemTime::UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs()) + nsec
     }
 }
 
@@ -150,17 +228,18 @@ fn read_dir_names(dir: &Path) -> io::Result<Vec<OsString>> {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WatchSet {
     pub paths: BTreeMap<PathBuf, Stamp>,
-    /// Content hashes of files whose stamp is *racy* (modified within
-    /// [`RACY_WINDOW`](crate::ledger::RACY_WINDOW) of being read, so a
-    /// same-length rewrite could keep the stamp). When [`Watcher::update`]
-    /// re-checks such a path and its stamp still matches, it re-hashes it.
-    /// A matching hash is a stable answer, so a racy file (even one with an
-    /// mtime in the future) never forces a rebuild by itself.
+    /// Content hashes of files whose stamp is *racy* (changed within the
+    /// timestamp granularity of being read, so a same-length rewrite could
+    /// keep the stamp — see [`Dep::is_racy`](crate::ledger::Dep::is_racy)).
+    /// When [`Watcher::update`] re-checks such a path and its stamp still
+    /// matches, it re-hashes it. A matching hash is a stable answer, so a
+    /// racy file never forces a rebuild by itself.
     pub racy: BTreeMap<PathBuf, [u8; 32]>,
     /// The compile that produced this set failed. A failure can be fixed by
-    /// a change no stamp captures — `chmod` on an unreadable dependency — so
-    /// while this is set the watcher also treats metadata-only events as
-    /// changes. (When the build succeeds, metadata events stay ignored, as
+    /// a metadata-only change — `chmod` on an unreadable dependency (in a
+    /// file's stamp on unix, but not in a directory's listing, nor in any
+    /// stamp elsewhere) — so while this is set the watcher also treats
+    /// metadata-only events as changes. (When the build succeeds, metadata events stay ignored, as
     /// they're noise: editors and backup tools touch them constantly.)
     pub failed: bool,
 }
@@ -178,32 +257,33 @@ impl WatchSet {
 
     /// Merge one of several observations of `path` made during one compile
     /// (a file both typst and an asset read, or a sass probe followed by the
-    /// read). Agreeing observations merge; disagreeing ones mean the path
-    /// changed mid-compile, so neither can be trusted and the result is
-    /// [`Stamp::Unknown`] (one recheck). `racy_hash` is the content hash for
-    /// a racy read (see [`WatchSet::racy`]).
+    /// read). Compatible observations merge (see [`merge`]); disagreeing ones
+    /// mean the path changed mid-compile, so neither can be trusted and the
+    /// result is [`Stamp::Unknown`] (one recheck). `racy_hash` is the content
+    /// hash for a racy read (see [`WatchSet::racy`]).
     pub fn observe(&mut self, path: PathBuf, stamp: Stamp, racy_hash: Option<[u8; 32]>) {
-        match self.paths.get(&path) {
-            Some(seen) if *seen != stamp => {
-                self.racy.remove(&path);
-                self.paths.insert(path, Stamp::Unknown);
-            }
-            _ => {
-                if let Some(hash) = racy_hash {
-                    match self.racy.get(&path) {
-                        Some(seen) if *seen != hash => {
-                            self.racy.remove(&path);
-                            self.paths.insert(path, Stamp::Unknown);
-                            return;
-                        }
-                        _ => {
-                            self.racy.insert(path.clone(), hash);
-                        }
-                    }
+        let merged = match self.paths.get(&path) {
+            None => Some(stamp),
+            Some(seen) => merge(seen, &stamp),
+        };
+        let Some(merged) = merged else {
+            self.racy.remove(&path);
+            self.paths.insert(path, Stamp::Unknown);
+            return;
+        };
+        if let Some(hash) = racy_hash {
+            match self.racy.get(&path) {
+                Some(seen) if *seen != hash => {
+                    self.racy.remove(&path);
+                    self.paths.insert(path, Stamp::Unknown);
+                    return;
                 }
-                self.paths.insert(path, stamp);
+                _ => {
+                    self.racy.insert(path.clone(), hash);
+                }
             }
         }
+        self.paths.insert(path, merged);
     }
 
     /// Add every path of `older` that this set doesn't have, stamped as it
@@ -225,6 +305,29 @@ impl WatchSet {
                 self.paths.insert(path.clone(), Stamp::now(path));
             }
         }
+    }
+}
+
+/// Two observations of one path from one compile, combined — or `None` if
+/// they disagree. Equal observations agree. An existence probe
+/// ([`Stamp::Exists`]) agrees with any full observation of the same type,
+/// which is kept as the more precise: grass probes `_partial.scss` and then
+/// reads it, and after a `touch` the read's stamp is refreshed (by
+/// revalidation) while the probe's needn't be — comparing them for equality
+/// would merge a stable state into a never-matching `Unknown` on every
+/// rebuild.
+fn merge(a: &Stamp, b: &Stamp) -> Option<Stamp> {
+    let same_type = |dir: bool, full: &Stamp| match full {
+        Stamp::File { .. } => !dir,
+        Stamp::Dir { .. } | Stamp::Unreadable => dir,
+        _ => false,
+    };
+    match (a, b) {
+        _ if a == b && *a != Stamp::Unknown => Some(a.clone()),
+        (Stamp::Exists { dir }, full) | (full, Stamp::Exists { dir }) if same_type(*dir, full) => {
+            Some(full.clone())
+        }
+        _ => None,
     }
 }
 

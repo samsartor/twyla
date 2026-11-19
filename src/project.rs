@@ -39,6 +39,11 @@ pub struct TwylaContext {
     /// one-page site and fail the build if any don't compile (the
     /// `--test-examples` / `TWYLA_TEST_EXAMPLES` opt-in). See [`crate::examples`].
     pub test_examples: bool,
+    /// Where local packages (`@local/…`, or any package installed by hand)
+    /// are looked up, like typst's `--package-path`. `None`: the system
+    /// default, `$XDG_DATA_HOME/typst/packages` or its platform equivalent.
+    /// See [`crate::render::system_packages`].
+    pub package_dir: Option<PathBuf>,
 }
 
 /// Build a document's public URL from the site `base_url` and its bundle output
@@ -95,6 +100,7 @@ impl TwylaContext {
             base_url,
             reflect: false,
             test_examples: false,
+            package_dir: None,
         })
     }
 
@@ -109,6 +115,7 @@ impl TwylaContext {
             base_url: None,
             reflect: false,
             test_examples: false,
+            package_dir: None,
         }
     }
 

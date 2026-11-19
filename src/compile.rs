@@ -355,7 +355,7 @@ fn compile_bundle_loop(
 
         // Resolve every asset and collect every document this realization
         // requested (recorded as introspections), growing the resolver's stores.
-        discover_requests(resolver, world, subsink.introspections())?;
+        let discovered = discover_requests(resolver, world, subsink.introspections());
 
         // Surface the warnings of the assets this pass requested (e.g. a
         // best-effort svg minify that fell back to verbatim) — stored with
@@ -364,9 +364,14 @@ fn compile_bundle_loop(
         // straight to the parent sink: the iteration that discovers/builds an
         // asset normally does not converge, so its `subsink` is discarded. The
         // parent sink deduplicates, so each fires once per compile.
+        //
+        // Drained *before* a discovery error propagates: warnings queued by
+        // assets requested earlier in the failing pass belong to this compile
+        // (and would otherwise surface in the next one).
         for warning in resolver.take_warnings() {
             sink.warn(warning);
         }
+        discovered?;
 
         // Rebuild the engine after `subsink.introspections()`'s borrow ends, so
         // output-derivation closures can run against the same world/library and
@@ -453,7 +458,7 @@ fn discover_requests(
 }
 
 fn resolve_outputs(resolver: &mut Resolver, engine: &mut Engine) -> SourceResult<()> {
-    resolver.resolve_outputs(|func, asset| {
+    resolver.resolve_outputs(|func, asset, span| {
         let ext = Str::from(asset.built.ext.as_deref().unwrap_or("bin"));
         let stem = Str::from(asset.built.stem.as_deref().unwrap_or(""));
         let value = func.call(
@@ -461,7 +466,7 @@ fn resolve_outputs(resolver: &mut Resolver, engine: &mut Engine) -> SourceResult
             Context::none().track(),
             [Str::from(asset.built.sha256_hex().as_str()), ext, stem],
         )?;
-        let path: Str = value.cast().map_err(|err| hinted_error(asset.span, err))?;
+        let path: Str = value.cast().map_err(|err| hinted_error(span, err))?;
         Ok(path.to_string())
     })
 }

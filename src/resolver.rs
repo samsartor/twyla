@@ -39,7 +39,8 @@ use crate::asset::{
 use crate::document::ResolvedDocument;
 use crate::ledger::{self, Dep, DepRecorder, Revalidation};
 use crate::project::TwylaContext;
-use typst::syntax::Span;
+use typst::syntax::{FileId, Source, Span};
+use typst_kit::packages::SystemPackages;
 
 /// Owns every resolved asset and discovered document for a build.
 ///
@@ -72,6 +73,10 @@ pub struct Resolver {
     /// unwind: [`asset_deps`](Self::asset_deps) includes it, and the dev
     /// server collects those before discarding the resolver.
     building: DepRecorder,
+    /// Package sources for `asset.typst` sub-compiles, which read package
+    /// files themselves (through `building`) rather than through the live
+    /// world. See [`crate::render::system_packages`].
+    packages: SystemPackages,
     /// Counters for tests: how much work the asset pass did.
     pub stats: ResolverStats,
     /// Test hook: panic right after the next asset build, before its deps
@@ -89,6 +94,8 @@ pub struct FailedAsset {
     pub deps: Vec<Dep>,
     pub warnings: Vec<SourceDiagnostic>,
     pub errors: EcoVec<SourceDiagnostic>,
+    /// See [`ResolvedAsset::diag_sources`].
+    pub diag_sources: Vec<Source>,
 }
 
 /// How much work the asset pass did over a resolver's lifetime. Lets tests
@@ -114,6 +121,7 @@ impl Resolver {
             documents: IdHashMap::new(),
             warnings: Vec::new(),
             building: DepRecorder::new(),
+            packages: crate::render::system_packages(ctx),
             stats: ResolverStats::default(),
             #[cfg(test)]
             inject_build_panic: false,
@@ -123,6 +131,18 @@ impl Resolver {
     /// Drain the warnings asset builds queued since the last call.
     pub fn take_warnings(&mut self) -> Vec<SourceDiagnostic> {
         std::mem::take(&mut self.warnings)
+    }
+
+    /// The sources cached entries' diagnostics point into that their builds
+    /// loaded themselves (see [`ResolvedAsset::diag_sources`]): what the
+    /// compile's diagnostics are rendered against, ahead of the live world.
+    pub fn diag_sources(&self) -> HashMap<FileId, Source> {
+        self.assets
+            .iter()
+            .flat_map(|asset| asset.diag_sources.iter())
+            .chain(self.failed.values().flat_map(|f| f.diag_sources.iter()))
+            .map(|source| (source.id(), source.clone()))
+            .collect()
     }
 
     // -- snapshots: cheap Arc clones for the introspector + convergence history -
@@ -208,6 +228,7 @@ impl Resolver {
         for mut asset in self.assets.iter_mut() {
             let asset = Arc::make_mut(&mut *asset);
             asset.outputs.clear();
+            asset.output_spans.clear();
             asset.resolutions.clear();
         }
     }
@@ -238,8 +259,15 @@ impl Resolver {
             // The recorder belongs to the resolver, not the build: whatever
             // the build touched before failing (or panicking) is kept.
             let mut warnings = Vec::new();
-            let result =
-                self.build_asset(world, &req.spec, req.span, &self.building, &mut warnings);
+            let mut diag_sources = Vec::new();
+            let result = self.build_asset(
+                world,
+                &req.spec,
+                req.span,
+                &self.building,
+                &mut warnings,
+                &mut diag_sources,
+            );
             #[cfg(test)]
             if std::mem::take(&mut self.inject_build_panic) {
                 panic!("injected asset build panic");
@@ -251,6 +279,7 @@ impl Resolver {
                 Ok(mut asset) => {
                     asset.deps = deps;
                     asset.warnings = warnings;
+                    asset.diag_sources = diag_sources;
                     self.assets.insert_overwrite(Arc::new(asset));
                 }
                 Err(errors) => {
@@ -262,6 +291,7 @@ impl Resolver {
                             deps,
                             warnings,
                             errors: errors.clone(),
+                            diag_sources,
                         },
                     );
                     return Err(errors);
@@ -276,6 +306,7 @@ impl Resolver {
         for output in &req.outputs {
             if !asset.outputs.contains(output) {
                 asset.outputs.push(output.clone());
+                asset.output_spans.push((output.clone(), req.span));
             }
         }
         Ok(())
@@ -284,7 +315,11 @@ impl Resolver {
     /// Resolve per-usage output policies into concrete bundle paths and URLs.
     pub fn resolve_outputs(
         &mut self,
-        mut eval_derive: impl FnMut(&typst::foundations::Func, &ResolvedAsset) -> SourceResult<String>,
+        mut eval_derive: impl FnMut(
+            &typst::foundations::Func,
+            &ResolvedAsset,
+            Span,
+        ) -> SourceResult<String>,
     ) -> SourceResult<()> {
         let ctx = self.ctx.clone();
         for mut stored in self.assets.iter_mut() {
@@ -293,17 +328,22 @@ impl Resolver {
 
             let mut explicit = Vec::<(OutputReq, String)>::new();
             for policy in &asset.outputs {
+                // Blame the request that asked for this policy this compile.
+                let span = asset
+                    .output_spans
+                    .iter()
+                    .find(|(p, _)| p == policy)
+                    .map_or(asset.span, |(_, span)| *span);
                 let path = match policy {
                     OutputReq::Fixed(raw) => Some(
                         ctx.resolve_asset_output(raw.as_str())
-                            .map_err(|err| eco_vec![SourceDiagnostic::error(asset.span, err)])?,
+                            .map_err(|err| eco_vec![SourceDiagnostic::error(span, err)])?,
                     ),
                     OutputReq::Derive(func) => {
-                        let raw = eval_derive(func, asset)?;
+                        let raw = eval_derive(func, asset, span)?;
                         Some(
-                            ctx.resolve_asset_output(&raw).map_err(|err| {
-                                eco_vec![SourceDiagnostic::error(asset.span, err)]
-                            })?,
+                            ctx.resolve_asset_output(&raw)
+                                .map_err(|err| eco_vec![SourceDiagnostic::error(span, err)])?,
                         )
                     }
                     OutputReq::Read | OutputReq::Auto => None,
@@ -382,6 +422,7 @@ impl Resolver {
         span: Span,
         rec: &DepRecorder,
         warnings: &mut Vec<SourceDiagnostic>,
+        diag_sources: &mut Vec<Source>,
     ) -> SourceResult<ResolvedAsset> {
         let built = match spec {
             AssetSpec::File { file } => file::build(*file, &self.ctx, span, rec)?,
@@ -412,7 +453,17 @@ impl Resolver {
                 ppi,
                 minify,
             } => typst_doc::build(
-                world, input, *format, *ppi, *minify, &self.ctx, span, rec, warnings,
+                world,
+                input,
+                *format,
+                *ppi,
+                *minify,
+                &self.ctx,
+                &self.packages,
+                span,
+                rec,
+                warnings,
+                diag_sources,
             )?,
         };
 
@@ -428,9 +479,11 @@ impl Resolver {
             resolutions: Vec::new(),
             // Filled in by `resolve_asset` from the request(s) that reached it.
             outputs: Vec::new(),
+            output_spans: Vec::new(),
             // Filled in by `resolve_asset` from the recorder it owns.
             deps: Vec::new(),
             warnings: Vec::new(),
+            diag_sources: Vec::new(),
         })
     }
 

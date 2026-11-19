@@ -315,6 +315,9 @@ fn watch_set_keep_from_never_shrinks() {
         Stamp::File {
             mtime: SystemTime::UNIX_EPOCH,
             len: 1,
+            ctime: None,
+            inode: None,
+            perm: 0,
         },
     );
     old.insert(b.clone(), Stamp::Missing);
@@ -492,6 +495,8 @@ fn future_mtime_dependency_goes_idle() {
     for f in ["content/_lib.typ", "content/main.scss"] {
         set_mtime(&root.join(f), future);
     }
+    // Clear of the racy window (setting the mtime moved the ctime).
+    std::thread::sleep(crate::ledger::FINE_RACY_WINDOW + Duration::from_millis(10));
     // Refused paths are polled, the case the review found looping.
     let (mut w, _tx, _log) = fake_with({
         let mut f = Fake::default();
@@ -520,36 +525,203 @@ fn future_mtime_dependency_goes_idle() {
     }
     assert!(extra <= 1, "{extra} extra rebuilds: not idle");
     assert_eq!(session.resolver.stats.builds, 1, "asset rebuilt");
+    // Rev 2b: and it's not re-read either. Raciness keys off the ctime, so a
+    // future mtime doesn't put the stylesheet up for a re-hash every compile.
+    assert_eq!(
+        session.resolver.stats.content_reads, 1,
+        "future-mtime dependency re-read on unchanged rebuilds"
+    );
 }
 
-/// A racy file (modified within the filesystem-granularity window of its
-/// read) rewritten with the same length *and* mtime before the watcher
-/// subscribes: the stamp can't see it, the re-hash does.
+/// A racy observation (a file changed within the timestamp granularity of
+/// its read) whose stamp still matches is verified by hash when `update`
+/// re-checks it, so a same-tick rewrite the stamp can't show is reported.
 #[test]
 fn racy_rewrite_before_subscribe_is_reported() {
-    let (root, _dir, mut session) = session_site(&[
-        ("content/main.typ", "#import \"_lib.typ\": x\n#x"),
-        ("content/_lib.typ", "#let x = [aaa]"),
-    ]);
-    let lib = root.join("content/_lib.typ");
-    // Pinned ahead so it's racy however slowly the compile runs.
-    let mtime = SystemTime::now() + Duration::from_secs(30);
-    set_mtime(&lib, mtime);
-    let r = session.rebuild();
-    assert!(r.watch.racy.contains_key(&lib), "{r:?}", r = r.watch);
-
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("_lib.typ");
     fs::write(&lib, "#let x = [bbb]").unwrap();
-    set_mtime(&lib, mtime);
+    let mut set = observed(&[&lib]);
+    // As if the compile had read `[aaa]` and a rewrite in the same tick had
+    // kept the stamp.
+    set.racy
+        .insert(lib.clone(), crate::ledger::sha256(b"#let x = [aaa]"));
+    let (mut w, _tx, _log) = fake();
+    w.update(&set).unwrap();
+    assert!(w.pending.paths.contains(&lib), "{:?}", w.pending);
+
+    // The same set with the right hash re-checks clean.
+    set.racy
+        .insert(lib.clone(), crate::ledger::sha256(b"#let x = [bbb]"));
+    let (mut w, _tx, _log) = fake();
+    w.update(&set).unwrap();
+    assert!(w.pending.is_empty(), "{:?}", w.pending);
+}
+
+/// Rev 2b finding 6: a polled file rewritten in place *after* `update`, with
+/// its length and mtime preserved, is seen by the poll (the ctime moved).
+#[cfg(unix)]
+#[test]
+fn polled_rewrite_with_preserved_mtime_is_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a");
+    fs::write(&a, "red").unwrap();
+    let mtime = fs::metadata(&a).unwrap().modified().unwrap();
+    let (mut w, _tx, _log) = fake_with({
+        let mut f = Fake::default();
+        f.refuse = vec![a.clone()];
+        f
+    });
+    w.update(&observed(&[&a])).unwrap();
+    assert!(w.polled.contains_key(&a));
+
+    std::thread::sleep(crate::ledger::FINE_RACY_WINDOW);
+    fs::write(&a, "tan").unwrap();
+    set_mtime(&a, mtime);
+    let mut polled = ChangedPaths::default();
+    w.poll(&mut polled);
+    assert!(polled.paths.contains(&a), "{polled:?}");
+}
+
+/// Drive `rounds` rebuilds through `w` and assert the loop is idle: no
+/// `update` re-check queues a rebuild and no poll sees a change.
+fn assert_idle(session: &mut crate::session::DevSession, w: &mut Watcher<Fake>, rounds: usize) {
+    for round in 0..rounds {
+        let r = session.rebuild();
+        w.update(&r.watch).unwrap();
+        assert!(
+            w.pending.is_empty(),
+            "round {round}: re-check queued a rebuild: {:?}",
+            w.pending
+        );
+        let mut polled = ChangedPaths::default();
+        w.poll(&mut polled);
+        assert!(
+            polled.is_empty(),
+            "round {round}: poll saw a change: {polled:?}"
+        );
+    }
+}
+
+/// Rev 2b finding 1: `asset.file` on a directory opens fine and fails on the
+/// read (`EISDIR`). That failure used to be recorded as an *abandoned* read
+/// (`Unknown`): every compile evicted and rebuilt the asset, and a polled
+/// path re-queued a rebuild on every update. It's a stable failure: one
+/// failed build, then idle.
+#[cfg(unix)]
+#[test]
+fn asset_file_on_a_directory_fails_once_then_idles() {
+    let (root, _dir, mut session) =
+        session_site(&[("content/main.typ", "#context asset.file(\"data\").url()")]);
+    let data = root.join("content/data");
+    fs::create_dir(&data).unwrap();
+    let (mut w, _tx, _log) = fake_with({
+        let mut f = Fake::default();
+        f.refuse = vec![data.clone()];
+        f
+    });
+    let r = session.rebuild();
+    assert!(r.result.is_err());
+    w.update(&r.watch).unwrap();
+    assert!(w.polled.contains_key(&data));
+    w.pending = ChangedPaths::default();
+
+    assert_idle(&mut session, &mut w, 3);
+    assert_eq!(session.resolver.stats.builds, 1, "failed asset rebuilt");
+}
+
+/// Rev 2b finding 2: grass probes `_partial.scss` and then reads it. After a
+/// `touch`, revalidation restamps the read; the probe's observation must
+/// still merge with it — it used to merge into `Unknown` on every rebuild,
+/// which a polled partial turned into a rebuild loop.
+#[test]
+fn touched_sass_partial_does_not_loop() {
+    let (root, _dir, mut session) = session_site(&[
+        (
+            "content/main.typ",
+            "#context asset.sass(\"main.scss\").url()",
+        ),
+        ("content/main.scss", "@use \"partial\";\n.a { color: red; }"),
+        ("content/_partial.scss", ".b { color: blue; }"),
+    ]);
+    let partial = root.join("content/_partial.scss");
+    let (mut w, _tx, _log) = fake_with({
+        let mut f = Fake::default();
+        f.refuse = vec![partial.clone(), root.join("content/main.scss")];
+        f
+    });
+    let r = session.rebuild();
+    assert!(r.result.is_ok());
+    assert!(
+        matches!(r.watch.paths.get(&partial), Some(Stamp::File { .. })),
+        "probe + read should merge to the read: {:?}",
+        r.watch.paths.get(&partial)
+    );
+    w.update(&r.watch).unwrap();
+    w.pending = ChangedPaths::default();
+
+    std::thread::sleep(crate::ledger::FINE_RACY_WINDOW);
+    set_mtime(&partial, SystemTime::now() - Duration::from_secs(60));
+    std::thread::sleep(crate::ledger::FINE_RACY_WINDOW + Duration::from_millis(10));
+    let mut polled = ChangedPaths::default();
+    w.poll(&mut polled);
+    assert!(
+        polled.paths.contains(&partial),
+        "touch not seen: {polled:?}"
+    );
+
+    assert_idle(&mut session, &mut w, 3);
+    assert_eq!(
+        session.resolver.stats.builds, 1,
+        "touch rebuilt the stylesheet"
+    );
+}
+
+/// Rev 2b finding 3: a failure's baseline is the state *before* the failed
+/// access, so a fix that lands between the failure and the watcher
+/// subscribing is reported by the first `update` — here the missing file
+/// being created, and (unix) an unreadable file being `chmod`ed back.
+#[test]
+fn fix_between_failure_and_subscribe_is_reported() {
+    let (root, _dir, mut session) = session_site(&[(
+        "content/main.typ",
+        "#context asset.file(\"data.txt\").url()",
+    )]);
+    let data = root.join("content/data.txt");
+    let r = session.rebuild();
+    assert!(r.result.is_err());
+    fs::write(&data, "data").unwrap();
     let (mut w, _tx, _log) = fake();
     w.update(&r.watch).unwrap();
-    assert!(w.pending.paths.contains(&lib), "{:?}", w.pending);
+    assert!(w.pending.paths.contains(&data), "{:?}", w.pending);
+    assert!(session.rebuild().result.is_ok());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&data).is_ok() {
+            return; // running as root: permissions aren't enforced
+        }
+        let r = session.rebuild();
+        assert!(r.result.is_err(), "expected a permission failure");
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o644)).unwrap();
+        let (mut w, _tx, _log) = fake();
+        w.update(&r.watch).unwrap();
+        assert!(
+            w.pending.paths.contains(&data),
+            "chmod missed: {:?}",
+            w.pending
+        );
+        assert!(session.rebuild().result.is_ok());
+    }
 }
 
 /// Regression (rev 1c): a subscribed dependency becomes unreadable, the
 /// build fails on it, then `chmod` restores it. That's a metadata-only event,
 /// which the watcher filters as noise — so nothing ever rebuilt. While the
-/// last build failed, metadata events count; and the asset ledger retries a
-/// read that failed on an existing file even though its stamp is unchanged.
+/// last build failed, metadata events count; and the permission bits are part
+/// of the stamp, so the asset ledger sees the `chmod` as a change.
 #[cfg(unix)]
 #[test]
 fn permission_restore_after_failed_build_rebuilds() {
