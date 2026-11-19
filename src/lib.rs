@@ -33,3 +33,6 @@ pub mod serve;
 pub mod session;
 pub mod slug;
 pub mod watch;
+
+#[cfg(test)]
+mod invariants;

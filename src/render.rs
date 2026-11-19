@@ -382,9 +382,7 @@ impl RenderWorld {
     pub fn new(ctx: &TwylaContext) -> Result<Self, RenderError> {
         let ctx = ctx.clone();
 
-        let mut fonts = FontStore::new();
-        fonts.extend(typst_kit::fonts::embedded());
-        fonts.extend(typst_kit::fonts::system());
+        let fonts = load_fonts();
 
         // Static `FileId` allocated to act as the site "main".
         let main_id = FileId::unique(RootedPath::new(
@@ -597,6 +595,45 @@ fn install_sys(global: &mut Scope) {
     };
     sys.scope_mut().define("twyla-version", version);
     global.bind("sys".into(), Binding::detached(sys));
+}
+
+/// The embedded fonts, then the system's.
+#[cfg(not(test))]
+fn load_fonts() -> FontStore {
+    let mut fonts = FontStore::new();
+    fonts.extend(typst_kit::fonts::embedded());
+    fonts.extend(typst_kit::fonts::system());
+    fonts
+}
+
+/// Test builds: the same fonts in the same order, but the system scan (and
+/// parsing the embedded fonts) happens once per test process instead of once
+/// per world — it takes seconds in a debug build, and the end-to-end tests
+/// (`crate::invariants`) build hundreds of cold worlds.
+#[cfg(test)]
+fn load_fonts() -> FontStore {
+    use std::sync::OnceLock;
+    use typst::text::FontInfo;
+    use typst_kit::fonts::FontPath;
+    type Cached = (Vec<(Font, FontInfo)>, Vec<(PathBuf, u32, FontInfo)>);
+    static CACHE: OnceLock<Cached> = OnceLock::new();
+    let (embedded, system) = CACHE.get_or_init(|| {
+        let embedded = typst_kit::fonts::embedded().collect();
+        let system = typst_kit::fonts::system()
+            .map(|(font, info)| (font.path, font.index, info))
+            .collect();
+        (embedded, system)
+    });
+    let mut fonts = FontStore::new();
+    fonts.extend(embedded.iter().cloned());
+    fonts.extend(system.iter().map(|(path, index, info)| {
+        let font = FontPath {
+            path: path.clone(),
+            index: *index,
+        };
+        (font, info.clone())
+    }));
+    fonts
 }
 
 /// The package sources every compile of `ctx` uses — the outer world's
