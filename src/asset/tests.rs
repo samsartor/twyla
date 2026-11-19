@@ -448,6 +448,146 @@ fn cover_requires_both_dimensions() {
     );
 }
 
+/// A 200×100 SVG: left half red, right half blue.
+const HALVES_SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='100'>\
+    <rect width='100' height='100' fill='#ff0000'/>\
+    <rect x='100' width='100' height='100' fill='#0000ff'/></svg>";
+
+/// An SVG source is rasterized at the requested size (aspect from the SVG's
+/// intrinsic size), not decoded-and-resized: a 200×100 SVG at `width: 400`
+/// renders a 400×200 PNG with the halves where the SVG put them.
+#[test]
+fn image_rasterizes_svg_at_target_size() {
+    let (ctx, dir) = site(&[(
+        "content/main.typ",
+        "#context asset.image(\"halves.svg\", width: 400, format: \"png\").url()",
+    )]);
+    std::fs::write(dir.path().join("content/halves.svg"), HALVES_SVG).unwrap();
+
+    let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    let asset = &assets[0];
+    assert!(asset.output_path.starts_with("assets/halves-") && asset.output_path.ends_with(".png"));
+    assert_eq!(asset.built.dimensions, Some((400, 200)));
+    let decoded = ::image::load_from_memory(&asset.built.emit.read().unwrap())
+        .unwrap()
+        .to_rgba8();
+    assert_eq!((decoded.width(), decoded.height()), (400, 200));
+    assert_eq!(decoded.get_pixel(100, 100).0, [255, 0, 0, 255]);
+    assert_eq!(decoded.get_pixel(300, 100).0, [0, 0, 255, 255]);
+}
+
+/// `fit: "cover"` on a vector fills the box and crops the overflow, centered:
+/// the 2:1 SVG in a 100×100 box shows only its middle (red | blue split at the
+/// center column).
+#[test]
+fn image_rasterizes_svg_with_cover_crop() {
+    let (ctx, dir) = site(&[(
+        "content/main.typ",
+        "#context asset.image(\"halves.svg\", width: 100, height: 100, fit: \"cover\", format: \"png\").url()",
+    )]);
+    std::fs::write(dir.path().join("content/halves.svg"), HALVES_SVG).unwrap();
+
+    let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    let decoded = ::image::load_from_memory(&assets[0].built.emit.read().unwrap())
+        .unwrap()
+        .to_rgba8();
+    assert_eq!((decoded.width(), decoded.height()), (100, 100));
+    assert_eq!(decoded.get_pixel(25, 50).0, [255, 0, 0, 255]);
+    assert_eq!(decoded.get_pixel(75, 50).0, [0, 0, 255, 255]);
+}
+
+/// Vector sources must be transcoded to a raster format at an explicit size:
+/// `format: auto` and a missing width/height are both build errors.
+#[test]
+fn vector_image_requires_format_and_size() {
+    for (call, expected) in [
+        (
+            "asset.image(\"halves.svg\", width: 100)",
+            "explicit raster `format`",
+        ),
+        (
+            "asset.image(\"halves.svg\", format: \"png\")",
+            "needs `width` and/or `height`",
+        ),
+    ] {
+        let (ctx, dir) = site(&[("content/main.typ", &format!("#context {call}.url()"))]);
+        std::fs::write(dir.path().join("content/halves.svg"), HALVES_SVG).unwrap();
+        let err = RenderWorld::new(&ctx)
+            .unwrap()
+            .compile_bundle(&mut Resolver::new(&ctx))
+            .err()
+            .unwrap_or_else(|| panic!("{call} should fail"));
+        assert!(
+            err.to_string().contains(expected),
+            "{call}: expected {expected:?}, got:\n{err}"
+        );
+    }
+}
+
+/// A PDF source rasterizes its first page at the requested size. The PDF (a
+/// 2in×1in red page) is produced by a first `asset.typst` compile. JPEG output
+/// gets an opaque background (no alpha channel).
+#[test]
+fn image_rasterizes_pdf_first_page() {
+    let (pdf_ctx, _pdf_dir) = site(&[(
+        "content/main.typ",
+        "#asset.typst([#set page(width: 2in, height: 1in, margin: 0pt, fill: red)], format: \"pdf\")",
+    )]);
+    let (_html, pdf_assets) = compile(&RenderWorld::new(&pdf_ctx).unwrap());
+    let pdf = pdf_assets[0].built.emit.read().unwrap();
+
+    let (ctx, dir) = site(&[(
+        "content/main.typ",
+        "#context asset.image(\"page.pdf\", height: 50, format: \"jpeg\").url()",
+    )]);
+    std::fs::write(dir.path().join("content/page.pdf"), pdf).unwrap();
+
+    let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    let asset = assets
+        .iter()
+        .find(|asset| asset.output_path.ends_with(".jpg"))
+        .unwrap_or_else(|| panic!("no jpeg asset in {assets:?}"));
+    let decoded = ::image::load_from_memory(&asset.built.emit.read().unwrap())
+        .unwrap()
+        .to_rgb8();
+    assert_eq!((decoded.width(), decoded.height()), (100, 50));
+    // Typst's `red` is #ff4136; allow JPEG error.
+    let [r, g, b] = decoded.get_pixel(50, 25).0;
+    assert!(
+        r > 245 && g.abs_diff(0x41) < 10 && b.abs_diff(0x36) < 10,
+        "expected typst red, got {:?}",
+        (r, g, b)
+    );
+}
+
+/// Files an SVG links (`<image href>`) are read through the asset's recorder,
+/// so they join its deps and editing them invalidates the rasterized output.
+#[test]
+fn svg_linked_images_are_asset_deps() {
+    let (ctx, dir) = site(&[(
+        "content/main.typ",
+        "#context asset.image(\"wrap.svg\", width: 20, format: \"png\").url()",
+    )]);
+    std::fs::write(
+        dir.path().join("content/wrap.svg"),
+        "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'>\
+         <image href='dot.png' width='10' height='10'/></svg>",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("content/dot.png"), png(4, 4)).unwrap();
+
+    let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    let deps: Vec<_> = assets[0].deps.iter().map(|dep| dep.path.clone()).collect();
+    assert!(
+        deps.iter().any(|path| path.ends_with("content/dot.png")),
+        "linked image missing from deps: {deps:?}"
+    );
+    let decoded = ::image::load_from_memory(&assets[0].built.emit.read().unwrap())
+        .unwrap()
+        .to_rgba8();
+    assert_eq!(decoded.get_pixel(10, 10).0, [10, 120, 200, 255]);
+}
+
 /// A native/markdown image (`#image("x.png")` / `![](x.png)`) routes through
 /// the `asset.image` pipeline: the `<img>` gets a fingerprinted src *and* the
 /// output's intrinsic `width`/`height` attrs (no `#context` needed — the rule
