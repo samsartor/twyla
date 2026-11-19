@@ -186,15 +186,24 @@ fn site_files() -> Files {
     );
     // A second entry with the same options, on another page: one group
     // with `app.ts`, sharing `util/v.ts` as a chunk. It also imports a
-    // `?raw` and a `?url` file. And a `split: false` entry, a group of its
-    // own.
+    // `?raw` and a `?url` file (one root-absolute), and starts a worker
+    // (itself importing `util/v.ts`). And a `split: false` entry, a group of
+    // its own.
     add(
         "site/scripts/post.ts",
         text(
             "import { v } from \"@util/v\";\n\
-             import notes from \"../data/notes.txt?raw\";\n\
+             import notes from \"/data/notes.txt?raw\";\n\
              import pic from \"../images/pic.png?url\";\n\
-             console.log(\"post\", v, notes, pic);\n",
+             import W from \"./worker.ts?worker\";\n\
+             console.log(\"post\", v, notes, pic, new W());\n",
+        ),
+    );
+    add(
+        "site/scripts/worker.ts",
+        text(
+            "import { v } from \"/scripts/util/v.ts\";\n\
+             self.onmessage = () => postMessage(v);\n",
         ),
     );
     add(

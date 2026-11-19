@@ -579,29 +579,6 @@ fn non_js_imports_are_refused() {
     }
 }
 
-/// `new URL(.., import.meta.url)` isn't an import: it's left as written
-/// (rolldown's asset resolution for it is opt-in, and twyla leaves it off,
-/// since it reads the file behind the sandbox).
-#[test]
-fn new_url_is_left_alone() {
-    let (ctx, _dir) = project(&[
-        (
-            "content/main.typ",
-            &page("asset.js(\"/main.js\", minify: false)"),
-        ),
-        (
-            "main.js",
-            "console.log(new URL('./pic.png', import.meta.url));\n",
-        ),
-        ("pic.png", "not really"),
-    ]);
-    let outputs = compile(&ctx).unwrap();
-    assert_eq!(keys(&outputs).len(), 1, "{:?}", keys(&outputs));
-    assert!(entry(&outputs).contains("new URL(\"./pic.png\", import.meta.url)"));
-}
-
-/// Rolldown errors blame the `asset.js` call and carry rolldown's own
-/// location (file and line).
 #[test]
 fn syntax_errors_blame_the_call_and_name_the_module() {
     let (ctx, _dir) = project(&[
@@ -1726,7 +1703,11 @@ fn inline_is_a_data_url_with_the_files_mime_type() {
 
 #[test]
 fn unknown_or_combined_queries_are_errors() {
-    for (import, shown) in [("./x.txt?foo", "`?foo`"), ("./x.txt?raw&url", "`?raw&url`")] {
+    for (import, shown) in [
+        ("./x.txt?foo", "`?foo`"),
+        ("./x.txt?raw&url", "`?raw&url`"),
+        ("./x.txt?url&worker", "`?url&worker`"),
+    ] {
         let (ctx, _dir) = query_project(
             &format!("import x from '{import}';\nconsole.log(x);\n"),
             &[("x.txt", b"x")],
@@ -1734,7 +1715,7 @@ fn unknown_or_combined_queries_are_errors() {
         let err = compile_err(&ctx);
         assert!(
             err.contains(&format!("unsupported import query {shown}"))
-                && err.contains("`?raw`, `?url` and `?inline`"),
+                && err.contains("`?raw`, `?url`, `?inline`, `?worker` and `?worker&url`"),
             "{import}: {err}"
         );
     }
@@ -2074,4 +2055,644 @@ fn inline_mime_types_ignore_extension_case() {
         code.contains("\"data:text/plain;charset=utf-8;base64,aGk=\""),
         "{code}"
     );
+}
+
+// Root-absolute imports, `import.meta.env`, workers.
+
+/// `/x` in an import is relative to the project root, in every form an
+/// import takes: plain, queried, dynamic, and in `inject`.
+#[test]
+fn root_absolute_imports_resolve_against_the_project_root() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            &page(
+                "asset.js(\"/scripts/app/main.js\", minify: false, \
+                 inject: (h: \"/lib/h.js\"))",
+            ),
+        ),
+        (
+            "scripts/app/main.js",
+            "import { util } from '/lib/util.ts';\n\
+             import note from '/data/note.txt?raw';\n\
+             console.log(util, note, h('x'));\n\
+             import('/lib/lazy.js').then((m) => console.log(m.lazy));\n",
+        ),
+        ("lib/util.ts", "export const util: string = 'ROOT_UTIL';\n"),
+        ("lib/h.js", "export default (t) => 'ROOT_H:' + t;\n"),
+        ("lib/lazy.js", "export const lazy = 'ROOT_LAZY';\n"),
+        ("data/note.txt", "ROOT_NOTE"),
+    ]);
+    let outputs = compile(&ctx).unwrap();
+    let code = entry(&outputs);
+    for marker in ["ROOT_UTIL", "ROOT_NOTE", "ROOT_H:"] {
+        assert!(code.contains(marker), "{marker} missing:\n{code}");
+    }
+    let lazy = key(&outputs, "assets/lazy-");
+    assert!(text(&outputs, &lazy).contains("ROOT_LAZY"));
+    // The queried import's module id names it root-relatively.
+    assert!(!code.contains(&*ctx.root.to_string_lossy()), "{code}");
+}
+
+/// A root-absolute import can't climb out of the root, and every dep it
+/// records stays inside it.
+#[test]
+fn root_absolute_imports_stay_in_the_root() {
+    for import in ["/../secret.js", "/../secret.txt?raw"] {
+        let (ctx, dir) = project(&[
+            ("content/main.typ", &page("asset.js(\"/main.js\")")),
+            (
+                "main.js",
+                &format!("import s from '{import}';\nconsole.log(s);\n"),
+            ),
+        ]);
+        std::fs::write(dir.path().join("secret.js"), "export default 'SECRET';\n").unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "SECRET").unwrap();
+        let world = RenderWorld::new(&ctx).unwrap();
+        let mut resolver = Resolver::new(&ctx);
+        let err = world
+            .compile_bundle(&mut resolver)
+            .map(|o| keys(&o))
+            .expect_err(import);
+        let err = err.to_string();
+        assert!(!err.contains("SECRET"), "{import}: {err}");
+        assert!(
+            err.contains("outside the twyla project root"),
+            "{import}: {err}"
+        );
+        for dep in resolver.asset_deps() {
+            assert!(
+                dep.path.starts_with(&ctx.root),
+                "{import}: {}",
+                dep.path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn root_absolute_imports_warm_equals_cold() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            &page("asset.js(\"/main.js\", minify: false)"),
+        ),
+        (
+            "main.js",
+            "import { util } from '/lib/util.js';\nimport n from '/note.txt?raw';\n\
+             console.log(util, n);\n",
+        ),
+        ("lib/util.js", "export const util = 'UTIL_ONE';\n"),
+        ("note.txt", "NOTE_ONE"),
+    ]);
+    let mut session = DevSession::new(&ctx).unwrap();
+    assert!(rebuild_entry(&mut session).unwrap().contains("UTIL_ONE"));
+    edit(
+        &ctx.root,
+        "lib/util.js",
+        "export const util = 'UTIL_TWO';\n",
+    );
+    assert_warm_is_cold(&mut session, &ctx, "after editing util.js");
+    edit(&ctx.root, "note.txt", "NOTE_TWO");
+    assert_warm_is_cold(&mut session, &ctx, "after editing note.txt");
+    assert!(entry(&compile(&ctx).unwrap()).contains("NOTE_TWO"));
+}
+
+/// The `import.meta.env` recipe: flattened by `define`, and dead branches
+/// on it removed.
+#[test]
+fn import_meta_env_defines_fold() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            &page(
+                "asset.js(\"/main.js\", define: (\"import.meta.env\": \
+                 (MODE: \"production\", DEV: false, PROD: true)))",
+            ),
+        ),
+        (
+            "main.js",
+            "if (import.meta.env.DEV) console.log('DEV_ONLY');\n\
+             if (import.meta.env.PROD) console.log('PROD_ONLY');\n\
+             console.log(import.meta.env.MODE);\n",
+        ),
+    ]);
+    let code = entry(&compile(&ctx).unwrap());
+    assert!(!code.contains("DEV_ONLY"), "{code}");
+    assert!(code.contains("PROD_ONLY"), "{code}");
+    assert!(code.contains("production"), "{code}");
+    assert!(!code.contains("import.meta.env"), "{code}");
+}
+
+/// `import.meta.env.BASE_URL` is twyla's URL prefix (with a trailing
+/// slash) unless `define` sets it.
+#[test]
+fn import_meta_env_base_url_defaults_to_the_base_url() {
+    let cases = [
+        (None, "", "\"/\""),
+        (
+            Some("https://example.com/site"),
+            "",
+            "\"https://example.com/site/\"",
+        ),
+        (
+            Some("https://example.com/site/"),
+            "",
+            "\"https://example.com/site/\"",
+        ),
+        (
+            None,
+            ", define: (\"import.meta.env.BASE_URL\": \"/x/\")",
+            "\"/x/\"",
+        ),
+        (
+            Some("https://example.com/site"),
+            ", define: (\"import.meta.env\": (BASE_URL: \"/y/\"))",
+            "\"/y/\"",
+        ),
+    ];
+    for (base_url, define, expected) in cases {
+        let (mut ctx, _dir) = project(&[
+            (
+                "content/main.typ",
+                &page(&format!("asset.js(\"/main.js\", minify: false{define})")),
+            ),
+            ("main.js", "console.log(import.meta.env.BASE_URL);\n"),
+        ]);
+        ctx.base_url = base_url.map(str::to_string);
+        let code = entry(&compile(&ctx).unwrap());
+        assert!(code.contains(expected), "{base_url:?}{define}: {code}");
+    }
+}
+
+/// `new URL("<local path>", import.meta.url)` anywhere but as a module
+/// worker's URL would resolve next to the bundled chunk, where the file
+/// isn't: an error naming the file and line, blamed on the call, with the
+/// `?url` hint. That includes a script (a download link isn't a worker), a
+/// path without `./` (relative in a browser too), and a missing file.
+#[test]
+fn new_url_of_a_local_file_is_an_error() {
+    for (arg, file) in [
+        ("'./pic.png'", "pic.png"),
+        ("`./pic.png`", "pic.png"),
+        ("'/pic.png'", "pic.png"),
+        ("'pic.png'", "pic.png"),
+        ("'pkg/x.png'", "pkg/x.png"),
+        ("'./missing.png'", "missing.png"),
+        ("'./download.js'", "download.js"),
+    ] {
+        let (ctx, _dir) = project(&[
+            (
+                "content/main.typ",
+                &page("asset.js(\"/main.js\", minify: false)"),
+            ),
+            (
+                "main.js",
+                // The literal on line 1 (in a comment) isn't the call.
+                &format!("// see {arg}\nconsole.log(new URL({arg}, import.meta.url));\n"),
+            ),
+            ("pic.png", "not really"),
+            ("download.js", "export {};\n"),
+        ]);
+        let err = compile_err(&ctx);
+        assert!(err.contains("main.js:2:"), "{arg}: no line: {err}");
+        assert!(err.contains(&format!("{file}?url")), "{arg}: {err}");
+    }
+}
+
+#[test]
+fn new_url_of_non_literals_and_urls_is_left_alone() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            &page("asset.js(\"/main.js\", minify: false)"),
+        ),
+        (
+            "main.js",
+            "export function at(name) { return new URL(name, import.meta.url); }\n\
+             console.log(new URL('https://example.com/x.png', import.meta.url));\n\
+             console.log(new URL('//cdn.example.com/x.png', import.meta.url));\n\
+             console.log(import.meta.url);\n",
+        ),
+    ]);
+    let outputs = compile(&ctx).unwrap();
+    let code = entry(&outputs);
+    assert_eq!(keys(&outputs).len(), 1, "{:?}", keys(&outputs));
+    assert!(code.contains("new URL(name, import.meta.url)"), "{code}");
+    assert!(
+        code.contains("new URL(\"https://example.com/x.png\""),
+        "{code}"
+    );
+    assert!(code.contains("\"//cdn.example.com/x.png\""), "{code}");
+    assert!(code.contains("console.log(import.meta.url)"), "{code}");
+}
+
+const WORKER_TS: &str = "import { shared } from './shared.ts';\n\
+     self.onmessage = (e: MessageEvent) => postMessage(shared + e.data);\n";
+const WORKER_SHARED_TS: &str = "export const shared: string = 'WORKER_SHARED';\n";
+
+fn worker_project(main: &str, call: &str) -> (TwylaContext, tempfile::TempDir) {
+    project(&[
+        ("content/main.typ", &page(call)),
+        ("main.js", main),
+        ("w.ts", WORKER_TS),
+        ("shared.ts", WORKER_SHARED_TS),
+    ])
+}
+
+/// The one worker chunk among `outputs`: its key and code.
+fn worker_chunk(outputs: &Outputs) -> (String, String) {
+    let key = key(outputs, "assets/w-");
+    let code = text(outputs, &key);
+    (key, code)
+}
+
+#[test]
+fn worker_query_bundles_a_worker_entry() {
+    for base_url in [None, Some("https://example.com/site")] {
+        let (mut ctx, _dir) = worker_project(
+            "import W from './w.ts?worker';\nconst w = new W();\nw.postMessage('hi');\n",
+            "asset.js(\"/main.js\", minify: false)",
+        );
+        ctx.base_url = base_url.map(str::to_string);
+        let outputs = compile(&ctx).unwrap();
+        let code = entry(&outputs);
+        let (worker, worker_code) = worker_chunk(&outputs);
+        assert!(worker_code.contains("WORKER_SHARED"), "{worker_code}");
+        let url = ctx.asset_url(&worker);
+        assert!(
+            code.contains(&format!("\"{url}\"")),
+            "{url} not in:\n{code}"
+        );
+        assert!(code.contains("type: \"module\""), "{code}");
+        // Not a preload: a worker starts only when the code starts it.
+        assert!(!html(&outputs).contains("PRE"), "{}", html(&outputs));
+    }
+}
+
+#[test]
+fn worker_url_query_is_the_url() {
+    let (ctx, _dir) = worker_project(
+        "import u from './w.ts?worker&url';\nnew Worker(u, { type: 'module' });\n",
+        "asset.js(\"/main.js\", minify: false)",
+    );
+    let outputs = compile(&ctx).unwrap();
+    let (worker, _) = worker_chunk(&outputs);
+    let code = entry(&outputs);
+    assert!(code.contains(&format!("\"/{worker}\"")), "{code}");
+    assert!(!code.contains("WorkerWrapper"), "{code}");
+}
+
+#[test]
+fn new_worker_new_url_bundles_a_worker_entry() {
+    for arg in ["'./w.ts'", "'/w.ts'"] {
+        let (ctx, _dir) = worker_project(
+            &format!(
+                "const w = new Worker(new URL({arg}, import.meta.url), {{ type: 'module' }});\nw.postMessage(1);\n"
+            ),
+            "asset.js(\"/main.js\", minify: false)",
+        );
+        let outputs = compile(&ctx).unwrap();
+        let (worker, worker_code) = worker_chunk(&outputs);
+        assert!(worker_code.contains("WORKER_SHARED"), "{worker_code}");
+        let code = entry(&outputs);
+        let name = worker.strip_prefix("assets/").unwrap();
+        // Relative to the chunk (rolldown's rewrite): next to it in `assets/`.
+        assert!(
+            code.contains(&format!("new URL(\"{name}\", import.meta.url)")),
+            "{arg}: {code}"
+        );
+    }
+}
+
+#[test]
+fn workers_need_code_splitting() {
+    for (main, call) in [
+        (
+            "import W from './w.ts?worker';\nnew W();\n",
+            "asset.js(\"/main.js\", split: false)",
+        ),
+        (
+            "import W from './w.ts?worker';\nnew W();\n",
+            "asset.js(\"/main.js\", format: \"iife\")",
+        ),
+        (
+            "new Worker(new URL('./w.ts', import.meta.url), { type: 'module' });\n",
+            "asset.js(\"/main.js\", split: false)",
+        ),
+    ] {
+        let (ctx, _dir) = worker_project(main, call);
+        let err = compile_err(&ctx);
+        assert!(err.contains("code splitting"), "{call}: {err}");
+    }
+}
+
+/// A worker chunk (and the chunks it imports) go with every entry that
+/// reaches the importing module, even through a dynamic import, and with
+/// no other.
+#[test]
+fn worker_chunks_follow_the_entries_that_reach_them() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            "#context [A #asset.js(\"/a.js\", minify: false).url()]\n\n\
+             #context [B #asset.js(\"/b.js\", minify: false).url()]\n\n\
+             #context [C #asset.js(\"/c.js\", minify: false).url()]",
+        ),
+        ("a.js", "import('./lazy.js').then((m) => m.start());\n"),
+        ("b.js", "import { start } from './lazy.js';\nstart();\n"),
+        ("c.js", "console.log('C');\n"),
+        (
+            "lazy.js",
+            "import W from './w.ts?worker';\nexport function start() { return new W(); }\n",
+        ),
+        ("w.ts", WORKER_TS),
+        ("shared.ts", WORKER_SHARED_TS),
+    ]);
+    let outputs = compile(&ctx).unwrap();
+    let (worker, _) = worker_chunk(&outputs);
+    let companions_of = |prefix: &str| -> Vec<String> {
+        let key = key(&outputs, prefix);
+        match outputs.get(&key) {
+            Some(Output::Asset { asset, .. }) => asset
+                .built
+                .companions
+                .iter()
+                .map(|c| c.path.clone())
+                .collect(),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert!(companions_of("assets/a-").contains(&worker));
+    assert!(companions_of("assets/b-").contains(&worker));
+    assert!(!companions_of("assets/c-").contains(&worker));
+    let preload = |prefix: &str| -> Vec<String> {
+        match outputs.get(&key(&outputs, prefix)) {
+            Some(Output::Asset { asset, .. }) => asset.built.preload.clone(),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert!(!preload("assets/b-").contains(&worker));
+}
+
+#[test]
+fn workers_warm_equals_cold() {
+    let (ctx, _dir) = worker_project(
+        "import W from './w.ts?worker';\nnew W();\nnew Worker(new URL('./w.ts', import.meta.url), { type: 'module' });\n",
+        "asset.js(\"/main.js\", minify: false)",
+    );
+    let mut session = DevSession::new(&ctx).unwrap();
+    rebuild_entry(&mut session).unwrap();
+    edit(
+        &ctx.root,
+        "shared.ts",
+        "export const shared: string = 'WORKER_SHARED_TWO';\n",
+    );
+    assert_warm_is_cold(&mut session, &ctx, "after editing the worker's import");
+    let outputs = compile(&ctx).unwrap();
+    assert!(worker_chunk(&outputs).1.contains("WORKER_SHARED_TWO"));
+}
+
+/// A classic script has no `import.meta`: rolldown would replace it with
+/// `{}` and the code would see `undefined`. An error instead, unless
+/// `define` sets the value (as twyla does `import.meta.env.BASE_URL`).
+#[test]
+fn import_meta_in_an_iife_is_an_error() {
+    for code in [
+        "console.log(import.meta.url);\n",
+        "console.log(import.meta.env.MODE);\n",
+    ] {
+        let (ctx, _dir) = project(&[
+            (
+                "content/main.typ",
+                &page("asset.js(\"/main.js\", format: \"iife\")"),
+            ),
+            ("main.js", code),
+        ]);
+        let err = compile_err(&ctx);
+        assert!(
+            err.contains("main.js") && err.contains("classic"),
+            "{code}: {err}"
+        );
+    }
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            &page(
+                "asset.js(\"/main.js\", minify: false, format: \"iife\", \
+                 define: (\"import.meta.env.MODE\": \"production\"))",
+            ),
+        ),
+        (
+            "main.js",
+            "console.log(import.meta.env.MODE, import.meta.env.BASE_URL);\n",
+        ),
+    ]);
+    let code = entry(&compile(&ctx).unwrap());
+    assert!(code.contains("\"production\", \"/\""), "{code}");
+}
+
+/// `new Worker(new URL(..))` must be started as a module worker, with the
+/// options written out: the worker is bundled as a module.
+#[test]
+fn new_worker_must_say_type_module() {
+    for options in [
+        "",
+        ", {}",
+        ", { type: 'classic' }",
+        ", opts",
+        ", { ...opts }",
+    ] {
+        let (ctx, _dir) = worker_project(
+            &format!(
+                "const opts = {{ type: 'module' }};\n\
+                 new Worker(new URL('./w.ts', import.meta.url){options});\n"
+            ),
+            "asset.js(\"/main.js\", minify: false)",
+        );
+        let err = compile_err(&ctx);
+        assert!(
+            err.contains("main.js:2:") && err.contains("type: \"module\""),
+            "{options}: {err}"
+        );
+    }
+    for start in [
+        "new SharedWorker(new URL('./w.ts', import.meta.url), { type: 'module' })",
+        "new Worker(new URL('./w.ts', import.meta.url), { name: 'w', \"type\": \"module\" })",
+    ] {
+        let (ctx, _dir) = worker_project(
+            &format!("console.log({start});\n"),
+            "asset.js(\"/main.js\", minify: false)",
+        );
+        let outputs = compile(&ctx).unwrap();
+        assert!(
+            worker_chunk(&outputs).1.contains("WORKER_SHARED"),
+            "{start}"
+        );
+    }
+}
+
+/// A worker whose start was tree-shaken away isn't shipped.
+#[test]
+fn a_tree_shaken_worker_start_ships_nothing() {
+    for start in [
+        "new Worker(new URL('./w.ts', import.meta.url), { type: 'module' })",
+        "new W()",
+    ] {
+        let (ctx, _dir) = worker_project(
+            &format!(
+                "import W from './w.ts?worker';\n\
+                 function unused() {{ return {start}; }}\n\
+                 console.log('live');\n"
+            ),
+            "asset.js(\"/main.js\", minify: false)",
+        );
+        let outputs = compile(&ctx).unwrap();
+        assert!(
+            !keys(&outputs).iter().any(|k| k.starts_with("assets/w-")),
+            "{start}: {:?}",
+            keys(&outputs)
+        );
+    }
+}
+
+/// One file both an entry (on one page) and a worker (started on another),
+/// with the same options: each page gets the file its URL names.
+#[test]
+fn an_entry_that_is_also_a_worker() {
+    for start in [
+        "import W from './w.ts?worker';\nnew W();\n",
+        "new Worker(new URL('./w.ts', import.meta.url), { type: 'module' });\n",
+    ] {
+        let (ctx, _dir) = project(&[
+            (
+                "content/main.typ",
+                "#context [MAIN #asset.js(\"/main.js\", minify: false).url()]\n\n\
+                 #context [W #asset.js(\"/w.ts\", minify: false).url()]",
+            ),
+            ("main.js", start),
+            ("w.ts", WORKER_TS),
+            ("shared.ts", WORKER_SHARED_TS),
+        ]);
+        let outputs = compile(&ctx).unwrap();
+        let main = key(&outputs, "assets/main-");
+        let Some(Output::Asset { asset, .. }) = outputs.get(&main) else {
+            panic!()
+        };
+        let code = text(&outputs, &main);
+        let workers: Vec<&String> = asset
+            .built
+            .companions
+            .iter()
+            .filter(|c| c.path.starts_with("assets/w-") && c.path.ends_with(".js"))
+            .map(|c| &c.path)
+            .collect();
+        assert_eq!(workers.len(), 1, "{start}: {workers:?}");
+        let name = workers[0].strip_prefix("assets/").unwrap();
+        assert!(code.contains(name), "{start}: {name} not in\n{code}");
+        assert!(keys(&outputs).contains(workers[0]));
+        let html = html(&outputs);
+        let w_url = html
+            .split("W ")
+            .nth(1)
+            .unwrap()
+            .split('<')
+            .next()
+            .unwrap()
+            .trim();
+        let w_key = w_url.trim_start_matches('/');
+        assert!(keys(&outputs).iter().any(|k| k == w_key), "{w_key}");
+    }
+}
+
+/// An inlined (`.read()`) script can start a `?worker` (fetched by its
+/// absolute URL): the worker's files are emitted though the entry isn't.
+/// Not a relative `new URL` worker, and not a real chunk import.
+#[test]
+fn read_with_workers() {
+    let read = "#context html.elem(\"script\", attrs: (type: \"module\"), \
+                asset.js(\"/main.js\", minify: false).read())";
+    let (ctx, _dir) = project(&[
+        ("content/main.typ", read),
+        ("main.js", "import W from './w.ts?worker';\nnew W();\n"),
+        (
+            "w.ts",
+            "import { lazy } from './lazy.ts';\nconsole.log(lazy);\nimport('./lazy.ts');\n",
+        ),
+        ("lazy.ts", "export const lazy = 'LAZY';\n"),
+    ]);
+    let outputs = compile(&ctx).unwrap();
+    let keys = keys(&outputs);
+    assert!(keys.iter().any(|k| k.starts_with("assets/w-")), "{keys:?}");
+    assert!(
+        keys.iter().all(|k| !k.starts_with("assets/main-")),
+        "{keys:?}"
+    );
+    let worker = keys.iter().find(|k| k.starts_with("assets/w-")).unwrap();
+    assert!(
+        html(&outputs).contains(&format!("/{worker}")),
+        "{}",
+        html(&outputs)
+    );
+
+    let (ctx, _dir) = project(&[
+        ("content/main.typ", read),
+        (
+            "main.js",
+            "new Worker(new URL('./w.ts', import.meta.url), { type: 'module' });\n",
+        ),
+        ("w.ts", "console.log('W');\n"),
+    ]);
+    let err = compile_err(&ctx);
+    assert!(
+        err.contains("starts the worker `w-") && err.contains("relative"),
+        "{err}"
+    );
+
+    let (ctx, _dir) = project(&[
+        ("content/main.typ", read),
+        (
+            "main.js",
+            "import W from './w.ts?worker';\nnew W();\n\
+             import('./lazy.ts').then((m) => console.log(m.lazy));\n",
+        ),
+        ("w.ts", "console.log('W');\n"),
+        ("lazy.ts", "export const lazy = 'LAZY';\n"),
+    ]);
+    let err = compile_err(&ctx);
+    assert!(err.contains("imports a chunk (`lazy-"), "{err}");
+}
+
+/// Two modules in one chunk starting different workers: the companions are
+/// in file-name order whichever finished loading first, so warm and cold
+/// builds agree.
+#[test]
+fn several_workers_warm_equals_cold() {
+    let (ctx, _dir) = project(&[
+        (
+            "content/main.typ",
+            &page("asset.js(\"/main.js\", minify: false)"),
+        ),
+        (
+            "main.js",
+            "import A from './a.js';\nimport B from './b.js';\nconsole.log(A(), B());\n",
+        ),
+        (
+            "a.js",
+            "import W from './wa.ts?worker';\nexport default () => new W();\n",
+        ),
+        (
+            "b.js",
+            "export default () => new Worker(new URL('./wb.ts', import.meta.url), \
+             { type: 'module' });\n",
+        ),
+        ("wa.ts", "console.log('WA');\n"),
+        ("wb.ts", "console.log('WB');\n"),
+    ]);
+    let mut session = DevSession::new(&ctx).unwrap();
+    rebuild_entry(&mut session).unwrap();
+    edit(&ctx.root, "wb.ts", "console.log('WB2');\n");
+    assert_warm_is_cold(&mut session, &ctx, "after editing wb.ts");
+    edit(&ctx.root, "wa.ts", "console.log('WA2');\n");
+    assert_warm_is_cold(&mut session, &ctx, "after editing wa.ts");
 }

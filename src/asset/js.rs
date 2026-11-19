@@ -51,12 +51,16 @@ use rolldown::{
     CodeSplittingMode, Either, InjectImport, InputItem, IsExternal, ModuleType, OutputFormat,
     RawMinifyOptions, ResolveOptions, SourceMapType, TsConfig, merge_tsconfig,
 };
-use rolldown_common::Output;
+use rolldown_common::{
+    EmittedChunk, ExperimentalOptions, ImportKind, Output, ResolvedExternal, ResolvedId,
+};
 use rolldown_error::{BuildDiagnostic, DiagnosticOptions, EventKind};
 use rolldown_fs::OsFileSystem;
 use rolldown_plugin::{
-    HookLoadArgs, HookLoadOutput, HookLoadReturn, HookResolveIdArgs, HookResolveIdOutput,
-    HookResolveIdReturn, HookUsage, Plugin, PluginContext, SharedLoadPluginContext,
+    HookGenerateBundleArgs, HookLoadArgs, HookLoadOutput, HookLoadReturn, HookNoopReturn,
+    HookResolveFileUrlArgs, HookResolveFileUrlReturn, HookResolveIdArgs, HookResolveIdOutput,
+    HookResolveIdReturn, HookTransformAstArgs, HookTransformAstReturn, HookUsage, Plugin,
+    PluginContext, SharedLoadPluginContext,
 };
 use typst::diag::{HintedStrResult, HintedString};
 use typst::foundations::{
@@ -80,7 +84,10 @@ use crate::render::Emit;
 ///
 /// Imports resolve the way a bundler resolves them: relative paths, packages
 /// in `node_modules` (`package.json` `exports`, with the platform's
-/// conditions), and `tsconfig.json` `paths` aliases. TypeScript and JSX are
+/// conditions), and `tsconfig.json` `paths` aliases. A path starting with
+/// `/` (`import { x } from "/scripts/x.ts"`) is relative to the project
+/// root, as in typst, in every kind of import (static, dynamic, queried,
+/// `inject`). TypeScript and JSX are
 /// compiled using the `tsconfig.json` that governs the entry (its `jsx`,
 /// `jsxImportSource`, `jsxFactory`, decorator options, …), applied to every
 /// module in the bundle. Install packages with your package manager as
@@ -114,7 +121,42 @@ use crate::render::Emit;
 /// declare module "*?raw" { const source: string; export default source; }
 /// declare module "*?url" { const url: string; export default url; }
 /// declare module "*?inline" { const url: string; export default url; }
+/// declare module "*?worker" {
+///   const W: new (options?: WorkerOptions) => Worker; export default W;
+/// }
+/// declare module "*?worker&url" { const url: string; export default url; }
 /// ```
+///
+/// A web worker is a script of its own, bundled as an extra entry of the
+/// same build (sharing chunks with the rest of it):
+///
+/// - `import W from "./worker.ts?worker"`: a function that starts it,
+///   `new W()` (or `W()`) being `new Worker(url, {type: "module"})` (other
+///   `Worker` options can be passed: `new W({name: "w"})`).
+/// - `import url from "./worker.ts?worker&url"`: just its URL (the only
+///   combination of queries allowed).
+/// - `new Worker(new URL("./worker.ts", import.meta.url), { type: "module" })`
+///   (or `new SharedWorker(..)`), with a string literal path and the
+///   `type: "module"` option written out (the worker is bundled as a
+///   module; without it, it's an error): the URL is rewritten to the
+///   worker's file, relative to the script.
+///
+/// `?worker` URLs are twyla URLs, root-absolute with the `base_url`, like
+/// `?url`'s: they work from wherever the importing code runs, an inlined
+/// (`.read()`) script included. A `new URL` worker's URL is relative to
+/// the script, so a script that starts one can't be inlined. The worker's
+/// files are emitted along with every entry whose code (after
+/// tree-shaking) starts it, directly or from a chunk it imports (like a
+/// dynamic import: never in `.preload()`), and with an inlined entry too.
+/// A worker needs a file of its own, so it takes code splitting: with
+/// `split: false` or `format: "iife"`, it's an error.
+///
+/// Any other `new URL("<path>", import.meta.url)` with a string literal
+/// path is an error (a script included: a download link isn't a worker):
+/// the URL would resolve next to the bundled script in `assets/`, where
+/// the file isn't. Import its URL with `?url` instead. A `new URL` of
+/// anything but a string literal, or of a URL with a scheme (or
+/// `//host/…`), is left as written, and so is `import.meta.url`.
 ///
 /// Stylesheets are better loaded with `asset.sass` (or `asset.file`) and
 /// linked from the page.
@@ -160,6 +202,24 @@ use crate::render::Emit;
 /// debug code off it). Override it with
 /// `define: ("process.env.NODE_ENV": "production")`. Other platforms leave
 /// it alone.
+///
+/// `import.meta.env.BASE_URL` is replaced with the prefix of every twyla
+/// URL, with a trailing slash: the `base_url` (`"https://example.com/blog/"`),
+/// or `"/"` without one. `define` overrides it. Twyla sets no other
+/// `import.meta.env` value: there's no `MODE`, `DEV` or `PROD`, since twyla
+/// has no development mode (`twyla serve` serves exactly what
+/// `twyla build` writes). Code written for Vite that reads them can be
+/// given them with `define`, and dead branches on them are removed:
+///
+/// ```typ
+/// #asset.js("/main.ts", define: (
+///   "import.meta.env": (MODE: "production", DEV: false, PROD: true),
+/// ))
+/// ```
+///
+/// In an `"iife"` script, which has no `import.meta`, any other
+/// `import.meta` (`import.meta.url`, an `import.meta.env` value `define`
+/// doesn't set) is an error.
 #[elem(scope, name = "js")]
 pub struct JsAsset {
     /// The entry module (`.js`, `.mjs`, `.ts`, `.tsx`, `.jsx`, …), relative to
@@ -235,9 +295,9 @@ pub struct JsAsset {
     /// string (its default export) or a `(specifier, export)` array. An
     /// import is added only to modules that use the name. Specifiers are
     /// JavaScript ones, resolved like an import written in the module that
-    /// uses the global: a package name, a `virtual:` module, or a path
-    /// relative to that module (`/…` is a filesystem path, not the project
-    /// root).
+    /// uses the global: a package name, a `virtual:` module, a path
+    /// relative to that module, or a `/…` path, relative to the project
+    /// root.
     pub inject: Dict,
 }
 
@@ -283,18 +343,35 @@ impl JsAsset {
         let Some(asset) = introspect_asset(engine, spec, elem.span(), vec![OutputReq::Read]) else {
             return Ok(decode_empty(encoding));
         };
-        if let Some(chunk) = asset
-            .built
-            .companions
-            .iter()
-            .find(|c| c.kind == CompanionKind::Chunk)
-        {
-            return Err(HintedString::new(eco_format!(
-                "this script imports a chunk (`{}`), so it can't be inlined",
-                chunk.path.rsplit('/').next().unwrap_or(&chunk.path)
-            ))
-            .with_hint("an inline script can't resolve relative chunk imports")
-            .with_hint("link it with `.url()`, or bundle into one file with `split: false`"));
+        // Its `?url` files and `?worker`s are referenced by absolute URLs,
+        // which work from anywhere; a chunk referenced relatively doesn't.
+        for companion in &asset.built.companions {
+            let name = companion.path.rsplit('/').next().unwrap_or(&companion.path);
+            match companion.kind {
+                CompanionKind::Chunk => {
+                    return Err(HintedString::new(eco_format!(
+                        "this script imports a chunk (`{name}`), so it can't be inlined"
+                    ))
+                    .with_hint("an inline script can't resolve relative chunk imports")
+                    .with_hint(
+                        "link it with `.url()`, or bundle into one file with `split: false`",
+                    ));
+                }
+                CompanionKind::RelativeWorker => {
+                    return Err(HintedString::new(eco_format!(
+                        "this script starts the worker `{name}` by a URL relative to the script \
+                         (`new URL(.., import.meta.url)`), so it can't be inlined"
+                    ))
+                    .with_hint(
+                        "an inline script's `import.meta.url` is the page's URL, not the script's",
+                    )
+                    .with_hint(
+                        "link it with `.url()`, or import the worker with \
+                         `import W from \"./worker.ts?worker\"`, whose URL is absolute",
+                    ));
+                }
+                CompanionKind::SourceMap | CompanionKind::File | CompanionKind::Worker => {}
+            }
         }
         let bytes = asset
             .built
@@ -671,25 +748,60 @@ fn entry_built(output: &GroupOutput, entry_file: &str, entry: &Path) -> Built {
         .and_then(|s| s.to_str())
         .map(str::to_owned);
     let entry_bytes = &output.files[entry_file].bytes;
-    let mut companions: Vec<Companion> = output
-        .reachable(entry_file)
-        .into_iter()
-        .map(|name| {
-            let file = &output.files[&name];
-            Companion {
-                path: format!("assets/{name}"),
-                sha256: sha256(&file.bytes),
-                emit: Emit::Bytes(file.bytes.clone()),
-                kind: match file.kind {
-                    FileKind::Chunk { .. } => CompanionKind::Chunk,
-                    FileKind::SourceMap => CompanionKind::SourceMap,
-                },
+    let mut companions: Vec<Companion> = Vec::new();
+    let mut add = |name: &str, kind: CompanionKind| {
+        let path = format!("assets/{name}");
+        if companions.iter().any(|c| c.path == path) {
+            return;
+        }
+        let file = &output.files[name];
+        companions.push(Companion {
+            path,
+            sha256: sha256(&file.bytes),
+            emit: Emit::Bytes(file.bytes.clone()),
+            kind,
+        });
+    };
+    // The chunks the entry imports, statically or dynamically, by relative
+    // URLs, and their sourcemaps (and the entry's).
+    let imported = output.walk(entry_file, Follow::Imports);
+    for name in std::iter::once(entry_file).chain(imported.iter().map(String::as_str)) {
+        if name != entry_file {
+            add(name, CompanionKind::Chunk);
+        }
+        if let Some(map) = output.map_of(name) {
+            add(map, CompanionKind::SourceMap);
+        }
+    }
+    // The workers those start, and everything each worker needs (its own
+    // chunks and workers, and their sourcemaps). A worker the entry's code
+    // starts relatively (`new URL(..)`) can't be inlined; one started by its
+    // twyla URL (`?worker`) can.
+    let starts = std::iter::once(entry_file).chain(imported.iter().map(String::as_str));
+    let mut roots: Vec<&WorkerFile> = starts.flat_map(|name| output.workers_of(name)).collect();
+    roots.sort();
+    roots.dedup();
+    for root in &roots {
+        if root.relative {
+            add(&root.file, CompanionKind::RelativeWorker);
+        }
+    }
+    for root in &roots {
+        let tree = std::iter::once(root.file.clone()).chain(output.walk(&root.file, Follow::All));
+        for name in tree {
+            if name == entry_file {
+                continue;
             }
-        })
-        .collect();
+            add(&name, CompanionKind::Worker);
+            if let Some(map) = output.map_of(&name) {
+                add(map, CompanionKind::Worker);
+            }
+        }
+    }
     // The `?url` files of every module in the entry's chunk or a chunk it
-    // reaches (statically or dynamically).
-    let chunks = std::iter::once(entry_file.to_string()).chain(output.walk(entry_file, true));
+    // reaches (by an import or a worker).
+    let chunks =
+        std::iter::once(entry_file.to_string()).chain(output.walk(entry_file, Follow::All));
     for chunk in chunks {
         let Some(OutputFile {
             kind: FileKind::Chunk { urls, .. },
@@ -763,6 +875,8 @@ enum FileKind {
         map: Option<String>,
         /// The `?url` files its modules reference, in module order.
         urls: Vec<UrlFile>,
+        /// The worker entry chunks its code starts, in file-name order.
+        workers: Vec<WorkerFile>,
     },
     SourceMap,
 }
@@ -778,35 +892,48 @@ struct UrlFile {
     sha256: [u8; 32],
 }
 
+/// Which references [`GroupOutput::walk`] follows from a chunk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Follow {
+    /// Static imports: what loads with the chunk.
+    Static,
+    /// Static and dynamic imports: what the chunk imports by relative URLs.
+    Imports,
+    /// Imports and the workers chunks start: everything that must be
+    /// emitted for the chunk to run.
+    All,
+}
+
 impl GroupOutput {
     /// The chunks `file` imports statically, transitively, in breadth-first
     /// order; `file` itself excluded.
     pub fn static_imports(&self, file: &str) -> Vec<String> {
-        self.walk(file, false)
+        self.walk(file, Follow::Static)
     }
 
-    /// Every file that must be emitted with `file` for it to run: the chunks
-    /// it reaches through static *and* dynamic imports, transitively, plus
-    /// each one's sourcemap (and `file`'s own). `file` itself excluded.
-    pub fn reachable(&self, file: &str) -> Vec<String> {
-        let chunks = self.walk(file, true);
-        let mut out = Vec::new();
-        for name in std::iter::once(file).chain(chunks.iter().map(String::as_str)) {
-            if name != file {
-                out.push(name.to_string());
-            }
-            if let Some(OutputFile {
+    fn map_of(&self, file: &str) -> Option<&str> {
+        match self.files.get(file) {
+            Some(OutputFile {
                 kind: FileKind::Chunk { map: Some(map), .. },
                 ..
-            }) = self.files.get(name)
-            {
-                out.push(map.clone());
-            }
+            }) => Some(map),
+            _ => None,
         }
-        out
     }
 
-    fn walk(&self, file: &str, dynamic: bool) -> Vec<String> {
+    fn workers_of(&self, file: &str) -> &[WorkerFile] {
+        match self.files.get(file) {
+            Some(OutputFile {
+                kind: FileKind::Chunk { workers, .. },
+                ..
+            }) => workers,
+            _ => &[],
+        }
+    }
+
+    /// The chunks reached from `file` by `follow`, transitively, in
+    /// breadth-first order; `file` itself excluded.
+    fn walk(&self, file: &str, follow: Follow) -> Vec<String> {
         let mut seen = vec![file.to_string()];
         let mut queue = VecDeque::from([file.to_string()]);
         while let Some(name) = queue.pop_front() {
@@ -815,6 +942,7 @@ impl GroupOutput {
                     FileKind::Chunk {
                         imports,
                         dynamic_imports,
+                        workers,
                         ..
                     },
                 ..
@@ -822,13 +950,18 @@ impl GroupOutput {
             else {
                 continue;
             };
-            let next = imports
+            let dynamic = match follow {
+                Follow::Static => &[][..],
+                Follow::Imports | Follow::All => &dynamic_imports[..],
+            };
+            let workers = workers
                 .iter()
-                .chain(dynamic.then_some(dynamic_imports).into_iter().flatten());
-            for import in next {
-                if !seen.contains(import) {
-                    seen.push(import.clone());
-                    queue.push_back(import.clone());
+                .filter(|_| follow == Follow::All)
+                .map(|w| &w.file);
+            for next in imports.iter().chain(dynamic).chain(workers) {
+                if !seen.contains(next) {
+                    seen.push(next.clone());
+                    queue.push_back(next.clone());
                 }
             }
         }
@@ -901,13 +1034,7 @@ async fn bundle(
                     .collect::<Vec<_>>(),
             )
         }),
-        define: Some(
-            options
-                .define
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        ),
+        define: Some(define(ctx, options).into_iter().collect()),
         inject: Some(
             options
                 .inject
@@ -938,11 +1065,19 @@ async fn bundle(
         // its own `.sm.js` names instead.
         entry_filenames: Some(filename_template(options.sourcemap).into()),
         chunk_filenames: Some(filename_template(options.sourcemap).into()),
+        // Reports `new URL("<literal>", import.meta.url)` to the plugin as
+        // an import, which resolves every one (a worker entry, an external,
+        // or an error) before rolldown's asset handling could read the file.
+        experimental: Some(ExperimentalOptions {
+            resolve_new_url_to_asset: Some(true),
+            ..Default::default()
+        }),
         ..Default::default()
     };
 
     let refused = Arc::new(Mutex::new(Vec::new()));
     let urls = Arc::new(Mutex::new(BTreeMap::new()));
+    let worker_files = Arc::new(Mutex::new(Vec::new()));
     let plugin = TwylaPlugin {
         modules: options
             .modules
@@ -954,6 +1089,10 @@ async fn bundle(
         fs: fs.clone(),
         urls: Arc::clone(&urls),
         resolver: Arc::clone(&resolver),
+        split: options.split,
+        new_urls: Mutex::new(BTreeMap::new()),
+        emitted: Mutex::new(Vec::new()),
+        worker_files: Arc::clone(&worker_files),
     };
     // `BundleFactory::new` also builds a resolver and a filesystem of its
     // own, on the OS. `create_bundle_with_fs` keeps them out of the module
@@ -979,24 +1118,30 @@ async fn bundle(
         messages.extend(errs.iter().map(render));
         messages
     })?;
-    // rolldown leaves an import it can't resolve in the output as an external
-    // (with a warning), which would fail at runtime. Externals are explicit
-    // here (`external`), so it's an error.
-    let (unresolved, rest): (Vec<_>, Vec<_>) = out
-        .warnings
-        .iter()
-        .partition(|w| matches!(w.kind(), EventKind::UnresolvedImport));
-    warnings.extend(rest.into_iter().map(render));
-    if !unresolved.is_empty() {
-        return Err(unresolved
-            .into_iter()
-            .map(|w| {
-                format!(
-                    "{}\nto leave it as a runtime import, list it in `external`",
-                    render(w)
-                )
-            })
-            .collect());
+    // Two warnings are errors, since the output would silently misbehave:
+    // rolldown leaves an import it can't resolve in the output as an
+    // external, which would fail at runtime (externals are explicit here,
+    // `external`); and in an `iife` script it replaces an `import.meta` it
+    // can't rewrite (`import.meta.url`, an `import.meta.env.X` that `define`
+    // doesn't set) with `{}`.
+    let mut errors = Vec::new();
+    for warning in &out.warnings {
+        match warning.kind() {
+            EventKind::UnresolvedImport => errors.push(format!(
+                "{}\nto leave it as a runtime import, list it in `external`",
+                render(warning)
+            )),
+            EventKind::EmptyImportMeta => errors.push(format!(
+                "{}\na classic (`iife`) script has no `import.meta`: use `format: \"esm\"`, or \
+                 set the value with `define` (`import.meta.url` has no replacement: twyla URLs \
+                 are root-absolute, `import.meta.env.BASE_URL` is the prefix)",
+                render(warning)
+            )),
+            _ => warnings.push(render(warning)),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
     }
 
     let mut files = BTreeMap::new();
@@ -1027,6 +1172,8 @@ async fn bundle(
                                 .iter()
                                 .filter_map(|id| urls.lock().unwrap().get(id.as_str()).cloned())
                                 .collect(),
+                            // Found below, in the code.
+                            workers: Vec::new(),
                         },
                     },
                 );
@@ -1070,15 +1217,42 @@ async fn bundle(
              the two can't be told apart; rename it"
         )]);
     }
-    for file in files.values_mut() {
-        if let FileKind::Chunk {
+    // The workers each chunk starts: those whose reference survives in its
+    // final code (so a worker whose start was tree-shaken away isn't
+    // shipped). A worker's file name carries its content hash, so it
+    // appears in another chunk's code only where the code references it:
+    // as its twyla URL (`?worker`), or, relative to the chunk, as a string
+    // of its own (`new URL("w-<hash>.js", import.meta.url)`). In file-name
+    // order, so the traversal (and so the companions) don't depend on the
+    // order the build emitted them in.
+    let worker_files = std::mem::take(&mut *worker_files.lock().unwrap());
+    for (name, file) in files.iter_mut() {
+        let FileKind::Chunk {
             imports,
             dynamic_imports,
+            workers,
             ..
         } = &mut file.kind
-        {
-            imports.retain(|i| names.contains(i));
-            dynamic_imports.retain(|i| names.contains(i));
+        else {
+            continue;
+        };
+        imports.retain(|i| names.contains(i));
+        dynamic_imports.retain(|i| names.contains(i));
+        let code = String::from_utf8_lossy(&file.bytes);
+        for worker in &worker_files {
+            if worker.file == *name {
+                continue;
+            }
+            let referenced = match worker.relative {
+                true => ['"', '\'', '`'].iter().any(|q| {
+                    code.contains(&format!("{q}{}{q}", worker.file))
+                        || code.contains(&format!("{q}./{}{q}", worker.file))
+                }),
+                false => code.contains(&ctx.asset_url(&format!("assets/{}", worker.file))),
+            };
+            if referenced {
+                workers.push(worker.clone());
+            }
         }
     }
 
@@ -1086,9 +1260,18 @@ async fn bundle(
     for entry in entries {
         // rolldown reports the facade by its resolved (canonical) path.
         let canonical = std::fs::canonicalize(entry).unwrap_or_else(|_| entry.clone());
-        let found = entry_chunks.iter().find(|(facade, _)| {
-            Path::new(facade) == entry.as_path() || Path::new(facade) == canonical.as_path()
-        });
+        // A module that's both an entry and a worker can be two entry
+        // chunks (the configured one and the emitted one): the entry's is
+        // the one that isn't a worker's.
+        let is_worker = |name: &str| worker_files.iter().any(|w| w.file == name);
+        let mut found: Vec<&(String, String)> = entry_chunks
+            .iter()
+            .filter(|(facade, _)| {
+                Path::new(facade) == entry.as_path() || Path::new(facade) == canonical.as_path()
+            })
+            .collect();
+        found.sort_by_key(|(_, name)| is_worker(name));
+        let found = found.first();
         match found {
             Some((_, name)) => entry_files.push(name.clone()),
             None => {
@@ -1103,6 +1286,29 @@ async fn bundle(
         entries: entry_files,
         files,
     })
+}
+
+/// The build's defines: the user's, plus `import.meta.env.BASE_URL` (the
+/// prefix of every twyla URL, with a trailing slash) unless the user's
+/// define sets it or something containing it.
+fn define(ctx: &TwylaContext, options: &JsOptions) -> Vec<(String, String)> {
+    const BASE_URL: &str = "import.meta.env.BASE_URL";
+    let mut define: Vec<(String, String)> = options
+        .define
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let covered = define.iter().any(|(key, _)| {
+        BASE_URL == key
+            || BASE_URL
+                .strip_prefix(key.as_str())
+                .is_some_and(|r| r.starts_with('.'))
+    });
+    if !covered {
+        let base = serde_json::to_string(&ctx.asset_url("")).expect("a string serializes");
+        define.push((BASE_URL.to_string(), base));
+    }
+    define
 }
 
 /// rolldown's file name template for entries and chunks. See where it's used.
@@ -1361,8 +1567,49 @@ struct TwylaPlugin {
     fs: SandboxFs,
     /// Every `?url` import loaded, by its module id.
     urls: Arc<Mutex<BTreeMap<String, UrlFile>>>,
-    /// The bundle's resolver (over `fs`), for queried imports.
+    /// The bundle's resolver (over `fs`), for queried and root-absolute
+    /// imports.
     resolver: Arc<rolldown_resolver::Resolver<SandboxFs>>,
+    /// Whether the build splits code: a worker needs a file of its own.
+    split: bool,
+    /// Every `new URL("<literal>", import.meta.url)` in each module, by
+    /// module id, found when the module is parsed (`transform_ast`), so its
+    /// import can be told apart by the call it's in.
+    new_urls: Mutex<BTreeMap<String, Vec<NewUrl>>>,
+    /// Every worker entry emitted, by its reference id, and whether code
+    /// references it relatively (`new URL(..)`) rather than by its twyla
+    /// URL (`?worker`).
+    emitted: Mutex<Vec<(ArcStr, bool)>>,
+    /// The emitted workers' files, once named (`generate_bundle`).
+    worker_files: Arc<Mutex<Vec<WorkerFile>>>,
+}
+
+/// One `new URL("<literal>", import.meta.url)` in a module.
+#[derive(Clone, Debug)]
+struct NewUrl {
+    specifier: String,
+    /// 1-based, in the module's source.
+    line: usize,
+    use_: NewUrlUse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NewUrlUse {
+    /// `new Worker(new URL(..), { type: "module" })` (or `SharedWorker`).
+    Worker,
+    /// `new Worker(new URL(..))` without `{ type: "module" }` written out.
+    ClassicWorker,
+    /// Anything else.
+    Other,
+}
+
+/// An emitted worker entry's file, and how code references it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct WorkerFile {
+    file: String,
+    /// Relative to the referencing chunk (`new URL(..)`), rather than by
+    /// its twyla URL (`?worker`).
+    relative: bool,
 }
 
 /// An import query: `import x from "./file?raw"`. One explicit match on the
@@ -1375,6 +1622,12 @@ enum Query {
     Url,
     /// The file as a `data:` URL.
     Inline,
+    /// A script bundled as a worker entry of its own: a function that
+    /// starts it (`new Worker(url, {type: "module"})`).
+    Worker,
+    /// The same worker entry, but just its URL (`?worker&url`, the one
+    /// combination of queries allowed).
+    WorkerUrl,
 }
 
 impl Query {
@@ -1383,9 +1636,11 @@ impl Query {
             "raw" => Ok(Self::Raw),
             "url" => Ok(Self::Url),
             "inline" => Ok(Self::Inline),
+            "worker" => Ok(Self::Worker),
+            "worker&url" => Ok(Self::WorkerUrl),
             other => Err(format!(
                 "unsupported import query `?{other}`: asset.js supports exactly one of `?raw`, \
-                 `?url` and `?inline`"
+                 `?url`, `?inline`, `?worker` and `?worker&url`"
             )),
         }
     }
@@ -1395,6 +1650,8 @@ impl Query {
             Self::Raw => "raw",
             Self::Url => "url",
             Self::Inline => "inline",
+            Self::Worker => "worker",
+            Self::WorkerUrl => "worker&url",
         }
     }
 }
@@ -1404,6 +1661,134 @@ impl Query {
 /// the same file (no prefix) and from other queries of it; equal for every
 /// specifier that resolves to the same file with the same query.
 const QUERY_ID_PREFIX: &str = "\0twyla-query:";
+
+/// The module id `new URL("./w.ts", import.meta.url)` resolves to (then the
+/// root-relative path): a stand-in whose load emits `w.ts` as a worker entry
+/// chunk, which rolldown then rewrites the `new URL(..)` to point at.
+const NEW_URL_ID_PREFIX: &str = "\0twyla-new-url:";
+
+/// Whether `specifier` is root-absolute (`/scripts/x.ts`): relative to the
+/// project root, as in typst and Vite, not the filesystem's. (`//host/x` is
+/// a protocol-relative URL.)
+fn is_root_absolute(specifier: &str) -> bool {
+    specifier.starts_with('/') && !specifier.starts_with("//")
+}
+
+/// Whether `path` is a script a worker (or any entry) can be bundled from.
+fn is_script(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    matches!(
+        ext,
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx"
+    )
+}
+
+/// Finds every `new URL("<literal>", import.meta.url)` in a module (the
+/// pattern rolldown reports as a `NewUrl` import), and the call it's the
+/// first argument of.
+struct NewUrlFinder<'s> {
+    source: &'s str,
+    /// By the `new URL`'s span start.
+    found: BTreeMap<u32, NewUrl>,
+}
+
+impl NewUrlFinder<'_> {
+    fn line(&self, offset: u32) -> usize {
+        let end = (offset as usize).min(self.source.len());
+        self.source.as_bytes()[..end]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+            + 1
+    }
+}
+
+/// The literal of `new URL("<literal>", import.meta.url)`.
+fn new_url_literal(expr: &oxc::ast::ast::NewExpression<'_>) -> Option<String> {
+    use oxc::ast::ast::Expression;
+    if !matches!(&expr.callee, Expression::Identifier(id) if id.name == "URL") {
+        return None;
+    }
+    let is_import_meta_url = match expr.arguments.get(1).and_then(|a| a.as_expression()) {
+        Some(Expression::StaticMemberExpression(member)) => {
+            member.property.name == "url" && matches!(member.object, Expression::ImportMeta(_))
+        }
+        _ => false,
+    };
+    if !is_import_meta_url {
+        return None;
+    }
+    match expr.arguments.first()?.as_expression()? {
+        Expression::StringLiteral(lit) => Some(js_string(lit.value)),
+        Expression::TemplateLiteral(tpl) if tpl.is_no_substitution_template() => {
+            tpl.quasis[0].value.cooked.map(js_string)
+        }
+        _ => None,
+    }
+}
+
+/// A JS string's value, as rolldown spells the import (lone surrogates
+/// replaced).
+fn js_string(value: oxc::str::JSStr<'_>) -> String {
+    match value.as_str() {
+        Some(value) => value.to_string(),
+        None => char::decode_utf16(value.encode_utf16())
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect(),
+    }
+}
+
+/// Whether `options` is an object literal with `type: "module"`.
+fn is_module_worker_options(options: Option<&oxc::ast::ast::Argument<'_>>) -> bool {
+    use oxc::ast::ast::{Expression, ObjectPropertyKind};
+    let Some(Expression::ObjectExpression(object)) = options.and_then(|a| a.as_expression()) else {
+        return false;
+    };
+    object.properties.iter().any(|property| match property {
+        ObjectPropertyKind::ObjectProperty(p) => {
+            !p.computed
+                && p.key.static_name().is_some_and(|k| k == "type")
+                && matches!(&p.value, Expression::StringLiteral(v) if v.value == "module")
+        }
+        ObjectPropertyKind::SpreadProperty(_) => false,
+    })
+}
+
+impl<'a> oxc::ast_visit::Visit<'a> for NewUrlFinder<'_> {
+    fn visit_new_expression(&mut self, it: &oxc::ast::ast::NewExpression<'a>) {
+        use oxc::ast::ast::Expression;
+        use oxc::span::GetSpan;
+        let is_worker = matches!(&it.callee, Expression::Identifier(id)
+            if id.name == "Worker" || id.name == "SharedWorker");
+        if is_worker
+            && let Some(Expression::NewExpression(url)) =
+                it.arguments.first().and_then(|a| a.as_expression())
+            && let Some(specifier) = new_url_literal(url)
+        {
+            let use_ = match is_module_worker_options(it.arguments.get(1)) {
+                true => NewUrlUse::Worker,
+                false => NewUrlUse::ClassicWorker,
+            };
+            let line = self.line(url.span().start);
+            self.found.insert(
+                url.span().start,
+                NewUrl {
+                    specifier,
+                    line,
+                    use_,
+                },
+            );
+        } else if let Some(specifier) = new_url_literal(it) {
+            let line = self.line(it.span().start);
+            self.found.entry(it.span().start).or_insert(NewUrl {
+                specifier,
+                line,
+                use_: NewUrlUse::Other,
+            });
+        }
+        oxc::ast_visit::walk::walk_new_expression(self, it);
+    }
+}
 
 /// A specifier's path and import query, if it has one. Specifiers that
 /// start with a URL scheme (`https:`, `data:`, `node:`) are left alone; a
@@ -1431,20 +1816,179 @@ impl TwylaPlugin {
         specifier: &str,
         resolved: &Path,
     ) -> Option<PathBuf> {
-        if !(specifier.starts_with("./") || specifier.starts_with("../")) {
+        let lexical = if is_root_absolute(specifier) {
+            self.fs.admit(&self.ctx.root.join(&specifier[1..])).ok()?
+        } else if specifier.starts_with("./") || specifier.starts_with("../") {
+            let importer = Path::new(importer?);
+            if !importer.is_absolute() {
+                return None;
+            }
+            self.fs.admit(&importer.parent()?.join(specifier)).ok()?
+        } else {
             return None;
-        }
-        let importer = Path::new(importer?);
-        if !importer.is_absolute() {
-            return None;
-        }
-        let lexical = self.fs.admit(&importer.parent()?.join(specifier)).ok()?;
+        };
         if lexical == resolved {
             return None;
         }
         // Both admitted, so both inside the root.
         let same = std::fs::canonicalize(&lexical).ok()? == std::fs::canonicalize(resolved).ok()?;
         same.then_some(lexical)
+    }
+
+    /// Resolve `specifier` (no query) for `args`' importer and import kind
+    /// with the bundle's own resolver — through the sandbox, with tsconfig
+    /// `paths`, package `exports`, …, and recorded — mapping a root-absolute
+    /// specifier to the project root. Not with `ctx.resolve`: that goes
+    /// through the resolver rolldown's `BundleFactory` built on the OS
+    /// filesystem, outside the sandbox. Returns the resolution and its
+    /// (admitted) path.
+    fn resolve_in_project(
+        &self,
+        args: &HookResolveIdArgs<'_>,
+        specifier: &str,
+    ) -> anyhow::Result<(rolldown_resolver::ResolveReturn, PathBuf)> {
+        let mapped = match is_root_absolute(specifier) {
+            true => {
+                // `/../x` names a file above the root; refused by name
+                // before the resolver goes looking.
+                let mut depth = 0usize;
+                for part in specifier.split('/') {
+                    match part {
+                        "" | "." => {}
+                        ".." if depth == 0 => {
+                            return Err(self.refuse(format!(
+                                "can't resolve `{}`: it's outside the twyla project root",
+                                args.specifier
+                            )));
+                        }
+                        ".." => depth -= 1,
+                        _ => depth += 1,
+                    }
+                }
+                self.ctx
+                    .root
+                    .join(&specifier[1..])
+                    .to_string_lossy()
+                    .into_owned()
+            }
+            false => specifier.to_string(),
+        };
+        let resolved = self
+            .resolver
+            .resolve(args.importer.map(Path::new), &mapped, args.kind, false)
+            .map_err(|err| self.refuse(format!("can't resolve `{}`: {err}", args.specifier)))?;
+        let path = Path::new(resolved.path.as_str());
+        if !path.is_absolute() {
+            return Err(self.refuse(format!(
+                "can't import `{}`: it isn't a file in the project",
+                args.specifier
+            )));
+        }
+        // Confined like every other access (the load reads through the
+        // sandbox too); refused here so the error names the import.
+        let Ok(admitted) = self.fs.admit(path) else {
+            return Err(self.refuse(format!(
+                "can't resolve `{}`: it's outside the twyla project root",
+                args.specifier
+            )));
+        };
+        Ok((resolved, admitted))
+    }
+
+    /// `path` (inside the root) as it appears in a module id: root-relative,
+    /// since rolldown prints `\0` ids verbatim (module comments, sourcemap
+    /// sources), and the output mustn't depend on where the project is.
+    fn root_relative(&self, path: &Path) -> String {
+        path.strip_prefix(&self.ctx.root)
+            .expect("admitted paths are inside the root")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// `new URL("<literal>", import.meta.url)`, which rolldown reports as an
+    /// import (`experimental.resolve_new_url_to_asset`). As the first
+    /// argument of `new Worker(.., { type: "module" })`, a local script is
+    /// bundled as a worker entry (as with `?worker`). Any other local
+    /// `new URL` is an error: the URL would resolve next to the bundled
+    /// chunk in `assets/`, where the file isn't. A URL with a scheme (or
+    /// `//host/…`) is left alone.
+    fn resolve_new_url(&self, args: &HookResolveIdArgs<'_>) -> HookResolveIdReturn {
+        let specifier = args.specifier;
+        let scheme = split_query(specifier).is_none() && specifier.contains(':');
+        if scheme || specifier.starts_with("//") {
+            return Ok(Some(HookResolveIdOutput {
+                id: specifier.into(),
+                external: Some(ResolvedExternal::Bool(true)),
+                ..Default::default()
+            }));
+        }
+        // How the module uses it, from its parse. Each use of the literal
+        // in the module must be a module worker.
+        let uses: Vec<NewUrl> = args
+            .importer
+            .and_then(|importer| self.new_urls.lock().unwrap().get(importer).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|u| u.specifier == specifier)
+            .collect();
+        let shown = args
+            .importer
+            .map(|i| self.shown(Path::new(i)))
+            .unwrap_or_else(|| "an entry".to_string());
+        let at = |line: usize| format!("{shown}:{line}");
+        let not_a_worker = uses.iter().find(|u| u.use_ == NewUrlUse::Other);
+        if uses.is_empty() || not_a_worker.is_some() {
+            let at = not_a_worker.map_or(shown.clone(), |u| at(u.line));
+            return Err(self.refuse(format!(
+                "{at}: `new URL(\"{specifier}\", import.meta.url)` would resolve next to the \
+                 bundled script in `assets/`, where `{specifier}` isn't emitted; import its URL \
+                 with `import url from \"{specifier}?url\"` instead (or, for a worker, \
+                 `new Worker(new URL(\"{specifier}\", import.meta.url), {{ type: \"module\" }})`)"
+            )));
+        }
+        if let Some(classic) = uses.iter().find(|u| u.use_ == NewUrlUse::ClassicWorker) {
+            return Err(self.refuse(format!(
+                "{}: the worker `{specifier}` is bundled as a module, so it must be started as \
+                 one: `new Worker(new URL(\"{specifier}\", import.meta.url), \
+                 {{ type: \"module\" }})`, with the options written out",
+                at(classic.line)
+            )));
+        }
+        let line = uses[0].line;
+        let plain = split_query(specifier).map_or(specifier, |(path, _)| path);
+        if plain != specifier || specifier.contains('#') {
+            return Err(self.refuse(format!(
+                "{}: a worker's `new URL(\"{specifier}\", import.meta.url)` can't have a query \
+                 or a fragment",
+                at(line)
+            )));
+        }
+        if !self.split {
+            return Err(self.refuse(format!(
+                "{}: the worker `{specifier}` is bundled as a file of its own, which takes code \
+                 splitting (`split: true`, `format: \"esm\"`)",
+                at(line)
+            )));
+        }
+        let (_, admitted) = self.resolve_in_project(args, specifier)?;
+        if !is_script(&admitted) {
+            return Err(self.refuse(format!(
+                "{}: the worker `{specifier}` must be a JavaScript or TypeScript module",
+                at(line)
+            )));
+        }
+        Ok(Some(HookResolveIdOutput {
+            id: format!("{NEW_URL_ID_PREFIX}{}", self.root_relative(&admitted)).into(),
+            ..Default::default()
+        }))
+    }
+
+    /// `path` for messages: root-relative when inside the root.
+    fn shown(&self, path: &Path) -> String {
+        path.strip_prefix(&self.ctx.root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
     }
 
     /// Refuse an import: rolldown's diagnostic drops the reason, so it's
@@ -1508,6 +2052,7 @@ impl TwylaPlugin {
                 );
                 url
             }
+            Query::Worker | Query::WorkerUrl => unreachable!("loaded in `load`, which emits"),
         };
         let json = serde_json::to_string(&value).expect("a string serializes");
         Ok(format!("export default {json};\n"))
@@ -1525,7 +2070,11 @@ impl Plugin for TwylaPlugin {
     }
 
     fn register_hook_usage(&self) -> HookUsage {
-        HookUsage::ResolveId | HookUsage::Load
+        HookUsage::ResolveId
+            | HookUsage::Load
+            | HookUsage::TransformAst
+            | HookUsage::ResolveFileUrl
+            | HookUsage::GenerateBundle
     }
 
     async fn resolve_id(
@@ -1540,8 +2089,23 @@ impl Plugin for TwylaPlugin {
                 ..Default::default()
             }));
         }
-        let Some((bare, query)) = split_query(args.specifier) else {
+        // Entries are the absolute paths twyla passes in.
+        if args.is_entry {
             return Ok(None);
+        }
+        if matches!(args.kind, ImportKind::NewUrl) {
+            return self.resolve_new_url(args);
+        }
+        let Some((bare, query)) = split_query(args.specifier) else {
+            if !is_root_absolute(args.specifier) {
+                return Ok(None);
+            }
+            // A plain root-absolute import: resolved here, since rolldown
+            // would take it as a filesystem path.
+            let (resolved, _) = self.resolve_in_project(args, args.specifier)?;
+            return Ok(Some(HookResolveIdOutput::from_resolved_id(
+                ResolvedId::from(resolved),
+            )));
         };
         // A leading `#` is a package import (`#internal/x.txt`); anywhere
         // else it'd be a fragment, which a queried import has no use for (and
@@ -1554,55 +2118,79 @@ impl Plugin for TwylaPlugin {
         }
         let query = Query::parse(query)
             .map_err(|err| self.refuse(format!("can't import `{}`: {err}", args.specifier)))?;
-        // The path without its query, resolved like any import: by the
-        // bundle's own resolver, through the sandbox (with tsconfig `paths`,
-        // package `exports`, …), and recorded. Not with `ctx.resolve`: that
-        // goes through the resolver rolldown's `BundleFactory` built on the
-        // OS filesystem, outside the sandbox.
-        let resolved = self
-            .resolver
-            .resolve(args.importer.map(Path::new), bare, args.kind, false)
-            .map_err(|err| self.refuse(format!("can't resolve `{}`: {err}", args.specifier)))?;
-        let path = Path::new(resolved.path.as_str());
-        if !path.is_absolute() {
-            return Err(self.refuse(format!(
-                "can't import `{}`: `?{}` needs a file in the project",
-                args.specifier,
-                query.name()
-            )));
+        let (_, admitted) = self.resolve_in_project(args, bare)?;
+        if matches!(query, Query::Worker | Query::WorkerUrl) {
+            if !is_script(&admitted) {
+                return Err(self.refuse(format!(
+                    "can't import `{}`: a worker must be a JavaScript or TypeScript module",
+                    args.specifier
+                )));
+            }
+            if !self.split {
+                return Err(self.refuse(format!(
+                    "can't import `{}`: a worker is bundled as a file of its own, which takes \
+                     code splitting (`split: true`, `format: \"esm\"`)",
+                    args.specifier
+                )));
+            }
         }
-        // Confined like every other access (the load reads through the
-        // sandbox too); refused here so the error names the import.
-        let Ok(admitted) = self.fs.admit(path) else {
-            return Err(self.refuse(format!(
-                "can't resolve `{}`: it's outside the twyla project root",
-                args.specifier
-            )));
-        };
         // The resolver follows symlinks to the real file. A relative import
         // of a link names the file by the link instead, as `asset.file`
         // does: the same file, under the name the code (and the page) uses.
-        let named = self
-            .lexical_target(args.importer, bare, &admitted)
-            .unwrap_or(admitted);
-        // Root-relative in the id: rolldown prints `\0` ids verbatim (module
-        // comments, sourcemap sources), and the output mustn't depend on
-        // where the project is.
-        let relative = named
-            .strip_prefix(&self.ctx.root)
-            .expect("admitted paths are inside the root")
-            .to_string_lossy();
+        // (A worker is bundled from the real file, like any entry.)
+        let named = match query {
+            Query::Worker | Query::WorkerUrl => admitted,
+            _ => self
+                .lexical_target(args.importer, bare, &admitted)
+                .unwrap_or(admitted),
+        };
         Ok(Some(HookResolveIdOutput {
-            id: format!("{QUERY_ID_PREFIX}{}:{relative}", query.name()).into(),
+            id: format!(
+                "{QUERY_ID_PREFIX}{}:{}",
+                query.name(),
+                self.root_relative(&named)
+            )
+            .into(),
             ..Default::default()
         }))
     }
 
-    async fn load(&self, _ctx: SharedLoadPluginContext, args: &HookLoadArgs<'_>) -> HookLoadReturn {
+    async fn load(&self, ctx: SharedLoadPluginContext, args: &HookLoadArgs<'_>) -> HookLoadReturn {
+        // `new URL("./w.ts", import.meta.url)`: emit the worker entry and tie
+        // it to this stand-in module, so rolldown rewrites the `new URL(..)`
+        // to the chunk's file. The stand-in itself never runs.
+        if let Some(path) = args.id.strip_prefix(NEW_URL_ID_PREFIX) {
+            let reference = self.emit_worker(&ctx, &self.ctx.root.join(path), true)?;
+            ctx.associate_module_with_file_ref(args.id, &reference);
+            return Ok(Some(HookLoadOutput {
+                code: ArcStr::from("export {};\n"),
+                module_type: Some(ModuleType::Js),
+                ..Default::default()
+            }));
+        }
         if let Some(rest) = args.id.strip_prefix(QUERY_ID_PREFIX)
             && let Some((name, path)) = rest.split_once(':')
         {
             let query = Query::parse(name).map_err(|err| self.refuse(err))?;
+            if matches!(query, Query::Worker | Query::WorkerUrl) {
+                let worker = self.ctx.root.join(path);
+                let reference = self.emit_worker(&ctx, &worker, false)?;
+                // The URL is filled in by `resolve_file_url`, once the worker
+                // chunk has its name.
+                let url = format!("import.meta.ROLLDOWN_FILE_URL_{reference}");
+                let code = match query {
+                    Query::Worker => format!(
+                        "export default function WorkerWrapper(options) {{\n  \
+                         return new Worker({url}, {{ type: \"module\", ...options }});\n}}\n"
+                    ),
+                    _ => format!("export default {url};\n"),
+                };
+                return Ok(Some(HookLoadOutput {
+                    code: ArcStr::from(code),
+                    module_type: Some(ModuleType::Js),
+                    ..Default::default()
+                }));
+            }
             let code = self
                 .load_query(args.id, query, &self.ctx.root.join(path))
                 .map_err(|err| self.refuse(err))?;
@@ -1641,6 +2229,93 @@ impl Plugin for TwylaPlugin {
             return Err(self.refuse(message));
         }
         Ok(None)
+    }
+
+    /// Record the module's `new URL("<literal>", import.meta.url)`s, with
+    /// the call each is in, for `resolve_new_url`.
+    async fn transform_ast(
+        &self,
+        _ctx: &PluginContext,
+        args: HookTransformAstArgs<'_>,
+    ) -> HookTransformAstReturn {
+        use oxc::ast_visit::Visit as _;
+        let mut finder = NewUrlFinder {
+            source: args.ast.source(),
+            found: BTreeMap::new(),
+        };
+        finder.visit_program(args.ast.program());
+        if !finder.found.is_empty() {
+            self.new_urls
+                .lock()
+                .unwrap()
+                .insert(args.id.to_string(), finder.found.into_values().collect());
+        }
+        Ok(args.ast)
+    }
+
+    /// Name every emitted worker's file, now that names are final.
+    async fn generate_bundle(
+        &self,
+        ctx: &PluginContext,
+        _args: &mut HookGenerateBundleArgs<'_>,
+    ) -> HookNoopReturn {
+        let mut files = Vec::new();
+        for (reference, relative) in self.emitted.lock().unwrap().iter() {
+            files.push(WorkerFile {
+                file: ctx.get_file_name(reference)?.to_string(),
+                relative: *relative,
+            });
+        }
+        files.sort();
+        files.dedup();
+        *self.worker_files.lock().unwrap() = files;
+        Ok(())
+    }
+
+    /// A worker chunk's URL: root-absolute (with twyla's base URL), like
+    /// every other twyla URL, so it doesn't depend on where the importing
+    /// chunk is, or on `import.meta.url` (which a worker started from an
+    /// inlined script wouldn't have).
+    async fn resolve_file_url(
+        &self,
+        _ctx: &PluginContext,
+        args: &HookResolveFileUrlArgs<'_>,
+    ) -> HookResolveFileUrlReturn {
+        let url = self.ctx.asset_url(&format!("assets/{}", args.file_name));
+        Ok(Some(
+            serde_json::to_string(&url).expect("a string serializes"),
+        ))
+    }
+}
+
+impl TwylaPlugin {
+    /// Emit `worker` (absolute, admitted) as an entry chunk of this build,
+    /// referenced `relative`ly or not.
+    fn emit_worker(
+        &self,
+        ctx: &SharedLoadPluginContext,
+        worker: &Path,
+        relative: bool,
+    ) -> anyhow::Result<ArcStr> {
+        let reference = ctx
+            .emit_chunk(EmittedChunk {
+                id: worker.to_string_lossy().into_owned(),
+                name: None,
+                file_name: None,
+                importer: None,
+                preserve_entry_signatures: None,
+            })
+            .map_err(|err| {
+                self.refuse(format!(
+                    "can't bundle the worker {}: {err}",
+                    self.shown(worker)
+                ))
+            })?;
+        self.emitted
+            .lock()
+            .unwrap()
+            .push((reference.clone(), relative));
+        Ok(reference)
     }
 }
 

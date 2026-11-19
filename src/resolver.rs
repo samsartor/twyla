@@ -257,10 +257,11 @@ impl Resolver {
         })
     }
 
-    /// The [`File`](CompanionKind::File) companions of the assets only ever
+    /// The [`File`](CompanionKind::File) and [`Worker`](CompanionKind::Worker)
+    /// companions of the assets only ever
     /// `.read()` (which [`emittable_assets`](Self::emittable_assets) omits):
-    /// an inlined `asset.js` entry still references its `?url` files by
-    /// their absolute URLs, so they're emitted on their own.
+    /// an inlined `asset.js` entry still references its `?url` files and
+    /// `?worker`s by their absolute URLs, so they're emitted on their own.
     pub fn read_only_file_companions(&self) -> Vec<Companion> {
         let mut out = Vec::new();
         for asset in self.assets.iter() {
@@ -273,7 +274,7 @@ impl Resolver {
                 continue;
             }
             for companion in &asset.built.companions {
-                if companion.kind == CompanionKind::File {
+                if matches!(companion.kind, CompanionKind::File | CompanionKind::Worker) {
                     out.push(companion.clone());
                 }
             }

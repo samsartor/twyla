@@ -517,6 +517,15 @@ pub enum CompanionKind {
     /// `?url` import). Needed even by an inlined entry, so it's emitted
     /// whenever its asset is used at all.
     File,
+    /// A file of a worker an `asset.js` entry starts (its entry chunk, its
+    /// chunks, their sourcemaps). The worker is fetched by its absolute URL
+    /// (`?worker`) and its own files relative to it, so, like a `File`, it's
+    /// needed even by an inlined entry.
+    Worker,
+    /// The entry chunk of a worker the code starts by a URL relative to the
+    /// script (`new Worker(new URL("./w.ts", import.meta.url))`). Like a
+    /// `Chunk`, it keeps the entry from being inlined.
+    RelativeWorker,
 }
 
 impl Built {

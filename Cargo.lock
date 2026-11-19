@@ -5459,6 +5459,7 @@ dependencies = [
  "markup5ever_rcdom",
  "notify",
  "owo-colors",
+ "oxc",
  "oxc_resolver",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
