@@ -15,8 +15,9 @@
 //
 // Every asset type exposes the same two contextual methods (`.url()`/`.read()`),
 // so `render-item` promotes them to the head of the `asset` section and renders
-// each type without its (now-shared) scope, rather than repeating them under
-// every type — see the `asset` handling in `/templates/components.typ`.
+// each type with only the methods of its own (e.g. `asset.js`'s `.preload()`),
+// rather than repeating them under every type — see the `asset` handling in
+// `/templates/components.typ`.
 #let items = (
   ("document", document),
   ("documents", documents),

@@ -285,6 +285,63 @@ fn build_emits_fingerprinted_sass_and_file_assets() {
     );
 }
 
+/// `asset.js` through `twyla build`: the entry and the chunk it loads with
+/// `import()` both land in `assets/` under rolldown's names, so the entry's
+/// relative chunk import resolves on disk.
+#[test]
+fn build_emits_js_entry_and_chunks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("content")).unwrap();
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("content/main.typ"),
+        "#context html.elem(\"script\", attrs: \
+         (type: \"module\", src: asset.js(\"/scripts/main.ts\").url()))",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/main.ts"),
+        "const later = (): Promise<unknown> => import('./later');\nlater();\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/later.ts"),
+        "export const later: string = 'LATER';\nconsole.log(later);\n",
+    )
+    .unwrap();
+
+    let out = tempfile::tempdir().expect("out");
+    let ctx = TwylaContext::new(root, None).expect("ctx");
+    let summary = build_run(Build {
+        ctx,
+        output_dir: out.path().to_path_buf(),
+    })
+    .expect("build");
+    assert_eq!(summary.assets, 2, "entry + chunk");
+
+    let assets_dir = out.path().join("assets");
+    let files: Vec<String> = std::fs::read_dir(&assets_dir)
+        .expect("assets/ dir written")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    let main = files
+        .iter()
+        .find(|f| f.starts_with("main-") && f.ends_with(".js"))
+        .unwrap_or_else(|| panic!("no main-*.js in {files:?}"));
+    let chunk = files
+        .iter()
+        .find(|f| f.starts_with("later-") && f.ends_with(".js"))
+        .unwrap_or_else(|| panic!("no later-*.js chunk in {files:?}"));
+    let main_body = std::fs::read_to_string(assets_dir.join(main)).unwrap();
+    assert!(main_body.contains(&format!("./{chunk}")), "{main_body}");
+    let chunk_body = std::fs::read_to_string(assets_dir.join(chunk)).unwrap();
+    assert!(chunk_body.contains("LATER"), "{chunk_body}");
+
+    let page = std::fs::read_to_string(out.path().join("index.html")).unwrap();
+    assert!(page.contains(&format!("src=\"/assets/{main}\"")), "{page}");
+}
+
 // =========================================================================
 // Pending — features twyla doesn't implement yet. Each is `#[ignore]`d and
 // fails today; un-ignore (and add the fixture content noted) as the

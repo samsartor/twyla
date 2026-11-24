@@ -157,7 +157,7 @@
   repr(value)
 })
 
-#let render-item(name, value, depth: 2, prefix: "", recurse-scope: true, display: none, receiver: "", docs: none) = {
+#let render-item(name, value, depth: 2, prefix: "", skip-members: (), display: none, receiver: "", docs: none) = {
   let anchor = item-anchor(name, prefix)
   let head-label = if display == none { name } else { display }
 
@@ -167,17 +167,18 @@
     // The `asset` types share `.url()`/`.read()`: promote them to the head of
     // the section (reflected off the first type, `asset.file`, their canonical
     // source) as methods on any asset (`asset.*.`), then render each type as a
-    // constructor without its (now-promoted) scope.
-    let promote-scope = name == "asset"
-    if promote-scope {
-      let shared = describe(dictionary(value).values().first()).scope
-      for (m-name, m) in dictionary(shared) {
-        render-item(m-name, m, depth: depth + 1, prefix: anchor, ..method-style(m-name, "asset.*."))
-      }
+    // constructor with only the methods of its own (`asset.svg`'s `.elem-id()`,
+    // `asset.js`'s `.preload()`). A type's own `.read()` (same name, its own
+    // docs) is skipped too: the shared one stands for it.
+    let shared = if name == "asset" {
+      dictionary(describe(dictionary(value).values().first()).scope)
+    } else { (:) }
+    for (m-name, m) in shared {
+      render-item(m-name, m, depth: depth + 1, prefix: anchor, ..method-style(m-name, "asset.*."))
     }
     for (member-name, member) in dictionary(value) {
       render-item(member-name, member, depth: depth + 1, prefix: anchor,
-        recurse-scope: not promote-scope, ..constructor-style(member-name, name))
+        skip-members: shared.keys(), ..constructor-style(member-name, name))
     }
     return
   }
@@ -208,10 +209,11 @@
   }
 
   // Associated scope (e.g. `document.url`) — rendered as methods on this item.
-  // Suppressed for the `asset` types, whose shared `.url`/`.read` are promoted
+  // `skip-members` drops the `asset` types' shared `.url`/`.read`, promoted
   // to the section head instead.
-  if recurse-scope and d.at("scope", default: none) != none {
+  if d.at("scope", default: none) != none {
     for (member-name, member) in dictionary(d.scope) {
+      if member-name in skip-members { continue }
       render-item(member-name, member, depth: depth + 1, prefix: anchor, ..method-style(member-name, d.name + "."))
     }
   }
@@ -226,29 +228,29 @@
 // reads `.url()` for methods and `asset.file` for constructors. Takes the same
 // `..constructor-style`/`..method-style` spread as `render-item`, so it also
 // accepts `receiver` — unused here (the TOC renders no signature).
-#let toc-entries(name, value, prefix: "", recurse-scope: true, display: none, receiver: "") = {
+#let toc-entries(name, value, prefix: "", skip-members: (), display: none, receiver: "") = {
   let anchor = item-anchor(name, prefix)
   let children = ()
   if type(value) == module {
     // The `asset` types' shared scope is promoted to the section head (as
     // methods), and not listed under each type.
-    let promote-scope = name == "asset"
-    if promote-scope {
-      let shared = describe(dictionary(value).values().first()).scope
-      for (m-name, m) in dictionary(shared) {
-        children += toc-entries(m-name, m, prefix: anchor, ..method-style(m-name, "asset.*."))
-      }
+    let shared = if name == "asset" {
+      dictionary(describe(dictionary(value).values().first()).scope)
+    } else { (:) }
+    for (m-name, m) in shared {
+      children += toc-entries(m-name, m, prefix: anchor, ..method-style(m-name, "asset.*."))
     }
     // Constructors keep their bare name in the sidebar — they're already nested
     // under the module (`sass`, not `asset.sass`); the body heading qualifies.
     for (member-name, member) in dictionary(value) {
-      children += toc-entries(member-name, member, prefix: anchor, recurse-scope: not promote-scope)
+      children += toc-entries(member-name, member, prefix: anchor, skip-members: shared.keys())
     }
   } else {
     let d = describe(value)
     if d == none and not is-reference-value(value) { return () }
-    if d != none and recurse-scope and d.at("scope", default: none) != none {
+    if d != none and d.at("scope", default: none) != none {
       for (member-name, member) in dictionary(d.scope) {
+        if member-name in skip-members { continue }
         children += toc-entries(member-name, member, prefix: anchor, ..method-style(member-name, d.name + "."))
       }
     }

@@ -378,6 +378,11 @@ impl TwylaContext {
     /// `assets/main-<hash>.css`. Joined under the build output dir on disk and
     /// exposed at the matching root-relative URL ([`asset_url`](Self::asset_url)).
     pub fn default_asset_output(&self, built: &asset::Built) -> String {
+        // The build named its own output (`asset.js`: rolldown's chunk
+        // names are baked into the code). See `Built::output_path`.
+        if let Some(path) = &built.output_path {
+            return path.clone();
+        }
         let hex = built.sha256_hex();
         let fingerprint = &hex[..32];
         match &built.stem {
