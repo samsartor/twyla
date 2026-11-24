@@ -69,7 +69,6 @@ use typst::syntax::package::PackageSpec;
 use typst::syntax::{FileId, RootedPath, Source, Span, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
-use typst::visualize::Color;
 use typst::{Library, LibraryExt, World};
 use typst_html::HtmlDocument;
 use typst_kit::files::FsRoot;
@@ -375,8 +374,9 @@ fn serialize(
                 Format::Pdf => typst_pdf::pdf(&doc, &PdfOptions::default())?,
                 Format::Png => {
                     let ppp = ppi as f32 / 72.0;
-                    let pixmap =
-                        typst_render::render_merged(&doc, ppp, Abs::zero(), Some(Color::WHITE));
+                    // Each page paints its own fill (white unless `fill: none`), so leave the
+                    // canvas transparent: a transparent page stays transparent.
+                    let pixmap = typst_render::render_merged(&doc, ppp, Abs::zero(), None);
                     pixmap
                         .encode_png()
                         .map_err(|err| err_at(span, eco_format!("PNG encode failed: {err}")))?
