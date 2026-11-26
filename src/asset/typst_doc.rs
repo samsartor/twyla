@@ -353,7 +353,7 @@ fn serialize(
                 warnings: w,
             } = typst::compile::<HtmlDocument>(world);
             warnings.extend(w);
-            typst_html::html(&output?)?.into_bytes()
+            typst_html::html(&output?, &typst_html::HtmlOptions { pretty: true })?.into_bytes()
         }
         Format::Svg | Format::Png | Format::Pdf => {
             let Warned {
@@ -364,7 +364,11 @@ fn serialize(
             let doc = output?;
             match format {
                 Format::Svg => {
-                    let svg = typst_svg::svg_merged(&doc, Abs::zero());
+                    let options = typst_svg::SvgOptions {
+                        pretty: true,
+                        ..Default::default()
+                    };
+                    let svg = typst_svg::svg_merged(&doc, &options, Abs::zero());
                     if minify {
                         super::svg::minify_str(svg, span, warnings).into_bytes()
                     } else {
@@ -373,10 +377,13 @@ fn serialize(
                 }
                 Format::Pdf => typst_pdf::pdf(&doc, &PdfOptions::default())?,
                 Format::Png => {
-                    let ppp = ppi as f32 / 72.0;
+                    let options = typst_render::RenderOptions {
+                        pixel_per_pt: (ppi as f64 / 72.0).into(),
+                        render_bleed: false,
+                    };
                     // Each page paints its own fill (white unless `fill: none`), so leave the
                     // canvas transparent: a transparent page stays transparent.
-                    let pixmap = typst_render::render_merged(&doc, ppp, Abs::zero(), None);
+                    let pixmap = typst_render::render_merged(&doc, &options, Abs::zero(), None);
                     pixmap
                         .encode_png()
                         .map_err(|err| err_at(span, eco_format!("PNG encode failed: {err}")))?
@@ -467,7 +474,7 @@ impl TypstWorld<'_> {
                 let root = located.entry(spec.clone()).or_insert_with(|| {
                     locate_package(self.packages, spec, &mut |dep| self.rec.ingest([dep]))
                 });
-                Ok(root.clone()?.resolve(id.vpath()))
+                root.clone()?.resolve(id.vpath())
             }
         }
     }
@@ -507,7 +514,7 @@ impl TypstWorld<'_> {
         for diag in diags {
             let spans = std::iter::once(diag.span)
                 .chain(diag.hints.iter().map(|hint| hint.span))
-                .chain(diag.trace.iter().map(|point| point.span));
+                .chain(diag.trace.iter().map(|point| point.span.into()));
             for id in spans.filter_map(|span| span.id()) {
                 if out.iter().any(|source| source.id() == id) {
                     continue;

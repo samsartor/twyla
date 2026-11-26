@@ -840,8 +840,8 @@ fn resolved_asset(ctx: &TwylaContext, spec: AssetSpec, span: Span, built: Built)
 /// alone — if that file changed, the entry was evicted anyway.
 fn respan(diag: &SourceDiagnostic, from: Span, to: Span) -> SourceDiagnostic {
     let mut diag = diag.clone();
-    if diag.span == from {
-        diag.span = to;
+    if diag.span == from.into() {
+        diag.span = to.into();
     }
     diag
 }

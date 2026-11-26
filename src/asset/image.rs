@@ -564,12 +564,19 @@ fn rasterize(
     frame.push(offset, FrameItem::Image(image, placed, span));
     let page = Page {
         frame,
+        bleed: Default::default(),
         fill: Smart::Custom(opaque.then(|| Color::WHITE.into())),
         numbering: None,
         supplement: Content::empty(),
         number: 1,
     };
-    let pixmap = typst_render::render(&page, 1.0);
+    let pixmap = typst_render::render(
+        &page,
+        &typst_render::RenderOptions {
+            pixel_per_pt: 1.0.into(),
+            render_bleed: false,
+        },
+    );
 
     let mut rgba = Vec::with_capacity(pixmap.data().len());
     for pixel in pixmap.pixels() {

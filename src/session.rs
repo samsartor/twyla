@@ -954,7 +954,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{errors:?}"));
             let id = error.span.id().expect("error has a location");
             let source = typst::World::source(world, id).unwrap();
-            let range = source.range(error.span).unwrap();
+            let range = typst::WorldExt::range(world, error.span).unwrap();
             source.lines().byte_to_line(range.start).unwrap()
         };
         assert_eq!(error_line(&world, &mut resolver), 0);

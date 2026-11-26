@@ -514,7 +514,9 @@ impl RenderWorld {
                 BundleFile::Document(BundleDocument::Html(doc)) => doc,
                 _ => continue,
             };
-            let raw = typst_html::html(doc).map_err(|errors| compile_err(&diag_world, &errors))?;
+            // Typst 0.15 defaults to compact HTML; keep Twyla's existing formatting.
+            let raw = typst_html::html(doc, &typst_html::HtmlOptions { pretty: true })
+                .map_err(|errors| compile_err(&diag_world, &errors))?;
             if let Err(err) = all.insert_unique(Output::Doc(OutputDoc {
                 html: resolve_raw_html_placeholders(&raw),
                 output_path: path.get_without_slash().to_owned(),
@@ -779,7 +781,7 @@ impl FileLoader for TwylaLoader {
             VirtualRoot::Project => self.root.join(id.vpath().get_without_slash()),
             VirtualRoot::Package(spec) => {
                 locate_package(&self.packages, spec, &mut |dep| self.record(dep))?
-                    .resolve(id.vpath())
+                    .resolve(id.vpath())?
             }
         };
         let (dep, result) = ledger::observe_read(&path);
