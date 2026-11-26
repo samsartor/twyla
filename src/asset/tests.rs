@@ -1148,12 +1148,15 @@ fn typst_path_source_compiles_to_pdf() {
     );
 }
 
-/// The `png` format renders to a raster image at the requested `ppi`.
+/// The `png` format respects both the requested `ppi` and a transparent page.
 #[test]
 fn typst_inline_content_compiles_to_png() {
     let (ctx, _dir) = site(&[(
         "content/main.typ",
-        "#context asset.typst(circle(fill: red, radius: 10pt), format: \"png\", ppi: 96).url()",
+        "#context asset.typst([\n\
+         #set page(width: 72pt, height: 36pt, margin: 0pt, fill: none)\n\
+         #rect(width: 12pt, height: 12pt, fill: red)\n\
+         ], format: \"png\", ppi: 96).url()",
     )]);
     let (_html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
 
@@ -1163,11 +1166,14 @@ fn typst_inline_content_compiles_to_png() {
         "not png: {}",
         asset.output_path
     );
-    assert_eq!(
-        ::image::guess_format(&asset.built.emit.read().unwrap()).unwrap(),
+    let png = ::image::load_from_memory_with_format(
+        &asset.built.emit.read().unwrap(),
         ::image::ImageFormat::Png,
-        "output should be a PNG",
-    );
+    )
+    .unwrap()
+    .to_rgba8();
+    assert_eq!(png.dimensions(), (96, 48));
+    assert_eq!(png.get_pixel(95, 47).0[3], 0);
 }
 
 /// The `html` format compiles the document like a page and emits an `.html`
