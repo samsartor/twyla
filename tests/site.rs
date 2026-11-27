@@ -202,6 +202,7 @@ fn build_emits_pages_and_static() {
     let summary: BuildSummary = build_run(Build {
         ctx: ctx(),
         output_dir: out.path().to_path_buf(),
+        progress: false,
     })
     .expect("build test_site");
 
@@ -256,6 +257,7 @@ fn build_emits_fingerprinted_sass_and_file_assets() {
     let summary = build_run(Build {
         ctx,
         output_dir: out.path().to_path_buf(),
+        progress: false,
     })
     .expect("build");
 
@@ -316,6 +318,7 @@ fn build_emits_js_entry_and_chunks() {
     let summary = build_run(Build {
         ctx,
         output_dir: out.path().to_path_buf(),
+        progress: false,
     })
     .expect("build");
     assert_eq!(summary.assets, 2, "entry + chunk");
@@ -391,6 +394,7 @@ fn referenced_image_is_fingerprinted() {
     let summary = build_run(Build {
         ctx,
         output_dir: out.path().to_path_buf(),
+        progress: false,
     })
     .expect("build");
 
@@ -440,6 +444,7 @@ fn build_emits_feed_with_post_entries() {
     build_run(Build {
         ctx: ctx(),
         output_dir: out.path().to_path_buf(),
+        progress: false,
     })
     .expect("build");
     let feed = out.path().join("atom.xml");

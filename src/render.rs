@@ -36,6 +36,7 @@ use crate::asset::ResolvedAsset;
 use crate::compile::CompiledBundle;
 use crate::document::ResolvedDocument;
 use crate::ledger::{self, Dep};
+use crate::progress::Progress;
 use crate::project::{ContentScan, TwylaContext};
 use crate::resolver::Resolver;
 use crate::watch::Stamp;
@@ -389,6 +390,9 @@ pub struct RenderWorld {
     pub library: LazyHash<Library>,
     pub fonts: FontStore,
     pub files: FileStore<TwylaLoader>,
+    /// Draw a progress line on stderr during compiles (off by default; the
+    /// CLI turns it on). See [`crate::progress`].
+    pub show_progress: bool,
 }
 
 impl RenderWorld {
@@ -437,6 +441,7 @@ impl RenderWorld {
             ctx,
             main_id,
             library: LazyHash::new(library),
+            show_progress: false,
             fonts,
             files: FileStore::new(loader),
         })
@@ -491,15 +496,17 @@ impl RenderWorld {
                 ))
             })
             .collect();
+        // Cleared when dropped at the end of this function, on any path.
+        let progress = Progress::new(self.show_progress);
         let Warned { output, warnings } =
-            crate::compile::compile_bundle(&self.ctx, self, &fileids, resolver);
+            crate::compile::compile_bundle(&self.ctx, self, &fileids, resolver, &progress);
         // Diagnostics can point into files only an asset build loaded (an
         // `asset.typst` sub-document): render those from the build's sources.
         let diag_world = DiagWorld {
             world: self,
             sources: resolver.diag_sources(),
         };
-        emit_warnings(&diag_world, &warnings);
+        progress.suspend(|| emit_warnings(&diag_world, &warnings));
 
         let CompiledBundle {
             bundle,
@@ -509,7 +516,9 @@ impl RenderWorld {
         } = output.map_err(|errors| compile_err(&diag_world, &errors))?;
 
         let mut all = IdHashMap::new();
+        progress.phase("html", Some(bundle.files.len()));
         for (path, file) in bundle.files.iter() {
+            progress.tick();
             let doc = match file {
                 BundleFile::Document(BundleDocument::Html(doc)) => doc,
                 _ => continue,

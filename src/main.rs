@@ -225,6 +225,7 @@ fn cmd_build(args: ContextArgs, output_dir: Option<PathBuf>) -> ExitCode {
     match build_run(Build {
         ctx,
         output_dir: output_dir.clone(),
+        progress: true,
     }) {
         Ok(summary) => {
             eprintln!(

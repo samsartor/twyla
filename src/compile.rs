@@ -30,6 +30,7 @@ use crate::document::{
     DOCUMENTS_LIST_KEY, DocumentAtIntrospect, DocumentOutput, DocumentsArrayIntrospect,
     ResolvedDocument, ResolvedDocumentIntrospect, TwylaDocument, derive_output,
 };
+use crate::progress::Progress;
 use crate::project::{TwylaContext, present_output};
 use crate::resolver::Resolver;
 
@@ -57,6 +58,7 @@ pub fn compile_bundle(
     world: &dyn World,
     sources: &[FileId],
     resolver: &mut Resolver,
+    progress: &Progress,
 ) -> Warned<SourceResult<CompiledBundle>> {
     let mut sink = Sink::new();
     let traced = Traced::default();
@@ -67,6 +69,7 @@ pub fn compile_bundle(
         &mut sink,
         sources,
         resolver,
+        progress,
     )
     .map_err(deduplicate);
     // Bound the `asset.js` group cache, whether or not the compile succeeded.
@@ -84,6 +87,7 @@ fn compile_bundle_impl(
     sink: &mut Sink,
     sources: &[FileId],
     resolver: &mut Resolver,
+    progress: &Progress,
 ) -> SourceResult<CompiledBundle> {
     // Evict cached assets (built or failed) whose ledger deps changed since the
     // last compile (no-op on the first compile / a fresh resolver). What
@@ -115,9 +119,12 @@ fn compile_bundle_impl(
     // loop below only re-*realizes*. Inline / `#context` `document(..)` calls
     // inside these bodies are discovered later, via the sink, during that render
     // — not here (so they ride the same pass as asset resolution).
+    progress.phase("eval", Some(sources.len()));
     let evaled = engine.parallelize(sources, |engine, id| {
         let body = eval_file(engine, *id)?;
-        harvest_metadata(ctx, engine, *id, body)
+        let harvested = harvest_metadata(ctx, engine, *id, body);
+        progress.tick();
+        harvested
     });
     let mut files: Vec<ResolvedDocument> = Vec::new();
     for res in evaled {
@@ -126,7 +133,7 @@ fn compile_bundle_impl(
 
     // One fixed point: typst introspection, asset resolution, and document
     // discovery all converge together (see [`compile_bundle_loop`]).
-    let bundle = compile_bundle_loop(ctx, world, traced, sink, &files, resolver)?;
+    let bundle = compile_bundle_loop(ctx, world, traced, sink, &files, resolver, progress)?;
 
     // Every page (file pages first, then discovered inline documents — both
     // already `ResolvedDocument`s) and every emittable asset, as the flat lists
@@ -309,6 +316,7 @@ fn compile_bundle_loop(
     sink: &mut Sink,
     files: &[ResolvedDocument],
     resolver: &mut Resolver,
+    progress: &Progress,
 ) -> SourceResult<Bundle> {
     let library = world.library();
     let base = StyleChain::new(&library.styles);
@@ -364,12 +372,19 @@ fn compile_bundle_loop(
                 route: Route::default(),
             };
 
+            progress.phase(format!("layout {}", history.len() + 1), None);
             document = Bundle::create(&mut engine, &content, styles)?;
         }
 
         // Resolve every asset and collect every document this realization
         // requested (recorded as introspections), growing the resolver's stores.
-        let discovered = discover_requests(resolver, world, subsink.introspections());
+        let discovered = discover_requests(
+            resolver,
+            world,
+            subsink.introspections(),
+            progress,
+            history.len() + 1,
+        );
 
         // Surface the warnings of the assets this pass requested (e.g. a
         // best-effort svg minify that fell back to verbatim) — stored with
@@ -517,6 +532,8 @@ fn discover_requests(
     resolver: &mut Resolver,
     world: Tracked<dyn World + '_>,
     introspections: &[Introspection],
+    progress: &Progress,
+    pass: usize,
 ) -> SourceResult<()> {
     // Documents are collected afresh each pass: every pass replays every
     // live request (see above), and a document whose body captured a value
@@ -524,6 +541,11 @@ fn discover_requests(
     // that a regrouped `asset.js` changed) would otherwise conflict with its
     // own earlier version, or linger under a stale auto output.
     resolver.clear_documents();
+    let assets = introspections
+        .iter()
+        .filter(|i| i.downcast::<AssetReqIntrospect>().is_some())
+        .count();
+    progress.phase(format!("assets {pass}"), Some(assets));
     // Every `asset.js` request first: they're built in groups, which must
     // know all of the pass's members before any is resolved.
     resolver.prebuild_js_groups(
@@ -537,7 +559,9 @@ fn discover_requests(
     let mut errors = EcoVec::new();
     for introspection in introspections {
         let result = if let Some(req) = introspection.downcast::<AssetReqIntrospect>() {
-            resolver.resolve_asset(world, &req.0)
+            let resolved = resolver.resolve_asset(world, &req.0);
+            progress.tick();
+            resolved
         } else if let Some(req) = introspection.downcast::<ResolvedDocumentIntrospect>() {
             resolver.collect_document(&req.0)
         } else {

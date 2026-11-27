@@ -158,7 +158,10 @@ pub fn run(serve: Serve) -> io::Result<()> {
     // reported on stderr before any browser sees it, and the first
     // request after bind hits a warm cache.
     let mut session = match DevSession::new(&serve.ctx) {
-        Ok(s) => s,
+        Ok(mut s) => {
+            s.world.show_progress = true;
+            s
+        }
         Err(e) => {
             eprintln!(
                 "  {} setup failed",
