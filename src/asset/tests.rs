@@ -372,6 +372,42 @@ fn raw_emits_inline_text_with_an_extension() {
     assert!(html.contains(&asset.url));
 }
 
+/// An asset requested only by an earlier, unconverged pass (here: before the
+/// heading query resolves) is built but not emitted — only what the final
+/// output references ships.
+#[test]
+fn assets_of_superseded_passes_are_not_emitted() {
+    let (ctx, _dir) = site(&[(
+        "content/main.typ",
+        "#context asset.raw(\"n=\" + str(query(heading).len()), extension: \"txt\").url()\n= Hi\n",
+    )]);
+
+    let (html, assets) = compile(&RenderWorld::new(&ctx).unwrap());
+    assert_eq!(assets.len(), 1, "got {assets:?}");
+    assert_eq!(assets[0].built.emit.read().unwrap().as_slice(), b"n=1");
+    assert!(html.contains(&assets[0].url));
+}
+
+/// Same for a spec that survives into the converged pass but is used
+/// differently there: an `output:` path only an earlier pass asked for isn't
+/// emitted.
+#[test]
+fn output_paths_of_superseded_passes_are_not_emitted() {
+    let (ctx, _dir) = site(&[(
+        "content/main.typ",
+        "#context if query(heading).len() == 0 {\n\
+           asset.raw(\"x\", extension: \"txt\", output: \"preview.txt\").url()\n\
+         } else {\n\
+           str(asset.raw(\"x\", extension: \"txt\").read())\n\
+         }\n\
+         = Hi\n",
+    )]);
+
+    let (html, keys) = compile_asset_keys(&RenderWorld::new(&ctx).unwrap());
+    assert!(html.contains('x'), "{html}");
+    assert!(keys.is_empty(), "got {keys:?}");
+}
+
 #[test]
 fn raw_defaults_to_bin_extension() {
     let (ctx, _dir) = site(&[(

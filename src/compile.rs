@@ -544,6 +544,7 @@ fn discover_requests(
     // that a regrouped `asset.js` changed) would otherwise conflict with its
     // own earlier version, or linger under a stale auto output.
     resolver.clear_documents();
+    resolver.begin_pass();
     let assets = introspections
         .iter()
         .filter(|i| i.downcast::<AssetReqIntrospect>().is_some())
