@@ -99,6 +99,10 @@ pub struct Resolver {
     /// unwind: [`asset_deps`](Self::asset_deps) includes it, and the dev
     /// server collects those before discarding the resolver.
     building: DepRecorder,
+    /// The recorders of a parallel batch of builds in progress
+    /// ([`prebuild_assets`](Self::prebuild_assets)), one per build; empty
+    /// between batches. A field for the same reason as `building`.
+    building_batch: Vec<DepRecorder>,
     /// Package sources for `asset.typst` sub-compiles, which read package
     /// files themselves (through `building`) rather than through the live
     /// world. See [`crate::render::system_packages`].
@@ -185,6 +189,7 @@ impl Resolver {
             pass_requested: HashMap::new(),
             warnings: Vec::new(),
             building: DepRecorder::new(),
+            building_batch: Vec::new(),
             packages: crate::render::system_packages(ctx),
             stats: ResolverStats::default(),
             #[cfg(test)]
@@ -245,7 +250,91 @@ impl Resolver {
     /// What the asset build in progress has touched so far. Empty unless a
     /// build panicked (see [`building`](Self::building)).
     pub fn interrupted_build_deps(&self) -> Vec<Dep> {
-        self.building.deps()
+        let mut deps = self.building.deps();
+        for rec in &self.building_batch {
+            deps.extend(rec.deps());
+        }
+        deps
+    }
+
+    /// Build, in parallel, every spec among `reqs` that isn't resolved (or
+    /// cached as failed) yet, and file the outcomes exactly as
+    /// [`resolve_asset`](Self::resolve_asset) would. The per-request
+    /// bookkeeping (usage, warnings, errors) is still `resolve_asset`'s, which
+    /// then finds each spec already stored.
+    ///
+    /// Builds are independent — each reads through its own [`DepRecorder`]
+    /// and only reads `&self` — so a pass's batch of new assets (e.g. many
+    /// `asset.typst` figures) runs across all cores instead of one by one.
+    /// `asset.js` specs are skipped: they're built in groups by
+    /// [`prebuild_js_groups`](Self::prebuild_js_groups).
+    pub fn prebuild_assets<'r>(
+        &mut self,
+        world: Tracked<dyn World + '_>,
+        reqs: impl IntoIterator<Item = &'r AssetReq>,
+    ) {
+        use rayon::prelude::*;
+        let mut seen = HashSet::new();
+        let todo: Vec<&AssetReq> = reqs
+            .into_iter()
+            .filter(|req| {
+                !matches!(req.spec, AssetSpec::Js { .. })
+                    && !self.assets.contains_key(&req.spec)
+                    && !self.failed.contains_key(&req.spec)
+                    && seen.insert(&req.spec)
+            })
+            .collect();
+        // A batch of one gains nothing; `resolve_asset` builds it.
+        if todo.len() < 2 {
+            return;
+        }
+        self.building_batch = todo.iter().map(|_| DepRecorder::new()).collect();
+        let this = &*self;
+        let results: Vec<_> = todo
+            .par_iter()
+            .zip(this.building_batch.par_iter())
+            .map(|(req, rec)| {
+                let mut warnings = Vec::new();
+                let mut diag_sources = Vec::new();
+                let result = this.build_asset(
+                    world,
+                    &req.spec,
+                    req.span,
+                    rec,
+                    &mut warnings,
+                    &mut diag_sources,
+                );
+                (result, warnings, diag_sources)
+            })
+            .collect();
+        let recorders = std::mem::take(&mut self.building_batch);
+        for ((req, rec), (result, warnings, diag_sources)) in
+            todo.into_iter().zip(recorders).zip(results)
+        {
+            self.stats.builds += 1;
+            self.stats.content_reads += rec.content_reads();
+            let deps = rec.take();
+            match result {
+                Ok(mut asset) => {
+                    asset.deps = deps;
+                    asset.warnings = warnings;
+                    asset.diag_sources = diag_sources;
+                    self.assets.insert_overwrite(Arc::new(asset));
+                }
+                Err(errors) => {
+                    self.failed.insert(
+                        req.spec.clone(),
+                        FailedAsset {
+                            span: req.span,
+                            deps,
+                            warnings,
+                            errors,
+                            diag_sources,
+                        },
+                    );
+                }
+            }
+        }
     }
 
     /// The assets actually written as files: one item per distinct resolved

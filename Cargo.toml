@@ -79,6 +79,8 @@ ansi-to-html = "0.2"
 owo-colors = { version = "4", features = ["supports-colors"] }
 
 iddqd = "0.4.2"
+# Parallel asset builds within a discovery pass (src/resolver.rs).
+rayon = "1"
 
 # SVG minifier (svgo port) for `asset.svg`. We call its parse → optimize →
 # serialize stages directly (rather than `optimize_with_config`) so the root

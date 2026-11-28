@@ -559,6 +559,15 @@ fn discover_requests(
             .filter_map(|i| i.downcast::<AssetReqIntrospect>())
             .map(|req| &req.0),
     );
+    // Every other new asset next, all at once, in parallel; the loop below
+    // then finds each built (or failed) and records its usage.
+    resolver.prebuild_assets(
+        world,
+        introspections
+            .iter()
+            .filter_map(|i| i.downcast::<AssetReqIntrospect>())
+            .map(|req| &req.0),
+    );
     // Every failing request is reported, not just the first: a failed
     // `asset.js` group fails each of its members, at each one's call site.
     let mut errors = EcoVec::new();
