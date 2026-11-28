@@ -189,12 +189,32 @@ cast! {
 /// The resolved document source carried in [`AssetSpec::Typst`]: a project file
 /// id, or a captured content value (content-addressed, like
 /// [`AssetSpec::Raw`](super::AssetSpec::Raw) bytes).
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, Hash)]
 pub enum TypstInput {
     /// A project `.typ` file, compiled as `main` (read + watched).
     File(FileId),
     /// An inline content value, compiled through a synthetic `main`.
     Content(Content),
+}
+
+/// Content-addressed: two inline contents are the same input iff their
+/// typst hashes are equal. Typst's own `Content` equality is much looser than
+/// its `Hash` (it skips each element's location, label and span, among
+/// others), so a derived `PartialEq` would let two specs that hash apart
+/// compare equal. That breaks every map keyed by [`AssetSpec`]: a lookup
+/// could land on an *equal* entry for a different spec (a bucket-tag
+/// collision is enough), skip the build, and leave the spec unresolved in
+/// the hash-keyed introspector — shipping a pending URL.
+impl PartialEq for TypstInput {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::File(a), Self::File(b)) => a == b,
+            (Self::Content(a), Self::Content(b)) => {
+                typst_utils::hash128(a) == typst_utils::hash128(b)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Output format for a compiled typst asset.
@@ -566,5 +586,29 @@ impl World for TypstWorld<'_> {
     }
     fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
         self.world.today(offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TypstInput;
+    use typst::foundations::Content;
+    use typst::syntax::Source;
+    use typst::text::TextElem;
+
+    /// Typst's `Content` equality ignores spans (and locations, labels…) but
+    /// its hash doesn't: inline-content inputs must follow the hash, or the
+    /// asset maps' `Eq`/`Hash` disagree.
+    #[test]
+    fn inline_content_inputs_compare_by_hash() {
+        let source = Source::detached("x");
+        let s1 = source.root().span();
+        let s2 = source.root().children().next().unwrap().span();
+        assert_ne!(s1, s2);
+        let a: Content = TextElem::packed("x").spanned(s1);
+        let b: Content = TextElem::packed("x").spanned(s2);
+        assert_eq!(a, b, "typst's own equality is span-blind");
+        assert_ne!(TypstInput::Content(a.clone()), TypstInput::Content(b));
+        assert_eq!(TypstInput::Content(a.clone()), TypstInput::Content(a));
     }
 }

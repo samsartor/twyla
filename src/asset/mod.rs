@@ -411,7 +411,7 @@ pub(crate) fn decode_empty(encoding: Option<Encoding>) -> Readable {
 /// Placeholder URL returned for an as-yet-unresolved asset. By convergence
 /// every consumer has re-run against a populated map, so this never survives
 /// into output (a leak means non-convergence — a bug).
-const ASSET_PENDING: &str = "/__twyla-asset-pending__";
+pub(crate) const ASSET_PENDING: &str = "/__twyla-asset-pending__";
 
 /// Resolve an asset element's `path` field to the `FileId` it names, relative
 /// to `span`'s file (the file the asset call was written in — mirrors how

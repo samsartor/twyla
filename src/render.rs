@@ -19,7 +19,7 @@ use typst::foundations::{
     Binding, Bytes, Datetime, Dict, Duration, IntoValue, Module, Scope, Value, Version,
 };
 use typst::syntax::package::PackageSpec;
-use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
+use typst::syntax::{FileId, RootedPath, Source, Span, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
@@ -526,6 +526,23 @@ impl RenderWorld {
             // Typst 0.15 defaults to compact HTML; keep Twyla's existing formatting.
             let raw = typst_html::html(doc, &typst_html::HtmlOptions { pretty: true })
                 .map_err(|errors| compile_err(&diag_world, &errors))?;
+            // The fixed-point loop must never converge on an unresolved asset
+            // URL; if one slips through anyway, say so rather than silently
+            // ship a broken link. A warning, not an error: a page may also
+            // just quote the placeholder (e.g. documentation about it).
+            if raw.contains(crate::asset::ASSET_PENDING) {
+                let warning = SourceDiagnostic::warning(
+                    Span::detached(),
+                    format!(
+                        "`/{}` contains `{}`, the URL of an asset that was never resolved",
+                        path.get_without_slash(),
+                        crate::asset::ASSET_PENDING,
+                    ),
+                )
+                .with_hint("unless the page quotes it on purpose, this is a twyla bug");
+                self.progress
+                    .suspend(|| emit_warnings(&diag_world, &[warning]));
+            }
             if let Err(err) = all.insert_unique(Output::Doc(OutputDoc {
                 html: resolve_raw_html_placeholders(&raw),
                 output_path: path.get_without_slash().to_owned(),
