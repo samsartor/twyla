@@ -170,7 +170,7 @@ pub fn run(serve: Serve) -> io::Result<()> {
     let term = progress::stderr();
     let mut session = match DevSession::new(&serve.ctx) {
         Ok(mut s) => {
-            s.world.progress = Some(term.clone());
+            s.world.progress = term.clone();
             s
         }
         Err(e) => {

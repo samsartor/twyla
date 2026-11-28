@@ -165,7 +165,7 @@ impl DevSession {
         let ctx = self.world.ctx.clone();
         match RenderWorld::new(&ctx) {
             Ok(mut world) => {
-                world.progress = self.world.progress.take();
+                world.progress = self.world.progress.clone();
                 self.world = world;
             }
             // Can't build a new one: keep the old world (its FileStore is
@@ -843,7 +843,7 @@ mod tests {
                 &world,
                 &[main],
                 &mut resolver,
-                &crate::progress::Progress::hidden(),
+                &crate::progress::hidden(),
             );
             assert!(warned.output.is_ok(), "round {round}");
             assert!(
@@ -930,7 +930,7 @@ mod tests {
             &world,
             &[page_id("content/main.typ")],
             &mut resolver,
-            &crate::progress::Progress::hidden(),
+            &crate::progress::hidden(),
         );
         assert!(warned.output.is_err());
         assert!(
@@ -961,7 +961,7 @@ mod tests {
                 world,
                 &[main],
                 resolver,
-                &crate::progress::Progress::hidden(),
+                &crate::progress::hidden(),
             );
             let errors = warned.output.err().expect("expected an output error");
             let error = errors
@@ -1009,7 +1009,7 @@ mod tests {
                 &world,
                 &[page_id("content/main.typ")],
                 &mut resolver,
-                &crate::progress::Progress::hidden(),
+                &crate::progress::hidden(),
             );
             assert!(warned.output.is_ok(), "round {round}");
             assert!(

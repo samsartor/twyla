@@ -3,7 +3,7 @@
 //! A compile is a sequence of phases, not one countable job: the set of pages
 //! and assets is only discovered while the fixed-point loop runs, and the
 //! number of layout passes isn't known up front. So instead of one overall
-//! bar, each phase gets its own line, replaced in place:
+//! bar, each phase gets its own bar on the same line, one after another:
 //!
 //! ```text
 //! eval        ████████████████████████  42/42
@@ -15,104 +15,56 @@
 //! Layout passes are spinners: a pass is one opaque `Bundle::create` call,
 //! with no per-document progress to count.
 //!
-//! Drawn to stderr only when it's a terminal (indicatif hides the bar
-//! otherwise); [`Progress::hidden`] never draws. The line is cleared when the
-//! [`Progress`] is dropped, so an early `?` return leaves no residue.
-//!
-//! Each phase is a fresh bar, fully configured off-screen and then swapped
-//! in. Reconfiguring one bar in place takes several setter calls, and
-//! indicatif may draw between any two of them (e.g. the new count beside the
-//! old label).
+//! This is plain indicatif: the compile takes a [`MultiProgress`] and each
+//! phase holds the [`ProgressBar`] that [`phase`] adds to it. Dropping a bar
+//! clears it (indicatif's default `ProgressFinish::AndClear`) and removes it
+//! from the `MultiProgress`, so a phase ends by dropping its bar — explicitly,
+//! before the next phase starts, or on an early `?` return.
 
 use std::borrow::Cow;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-/// The stderr line progress is drawn on. A long-running caller (serve) makes
-/// one and shares it between every compile and anything else that prints to
-/// stderr meanwhile, which must print through [`MultiProgress::suspend`] so it
-/// doesn't land on top of the line. Hidden when stderr isn't a terminal.
+/// The stderr line progress is drawn on (hidden by indicatif when stderr
+/// isn't a terminal). A long-running caller (serve) makes one and shares it
+/// between every compile and anything else that prints to stderr meanwhile,
+/// which must print through [`MultiProgress::suspend`] so it doesn't land on
+/// top of the line.
 pub fn stderr() -> MultiProgress {
     MultiProgress::with_draw_target(ProgressDrawTarget::stderr())
 }
 
-/// One compile's progress line. Shared across the threads typst parallelizes
-/// over.
-pub struct Progress {
-    /// The stderr line phases are swapped into; `None` when hidden.
-    multi: Option<MultiProgress>,
-    /// The current phase's bar.
-    bar: Mutex<ProgressBar>,
+/// A `MultiProgress` that never draws (tests, embedders).
+pub fn hidden() -> MultiProgress {
+    MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
 }
 
-impl Progress {
-    /// A progress line drawn on `target` (see [`stderr`]), or a no-op when
-    /// there is none or it's hidden (stderr isn't a terminal), so redirected
-    /// output pays for no ticker threads or locking.
-    pub fn new(target: Option<&MultiProgress>) -> Self {
-        match target {
-            Some(multi) if !multi.is_hidden() => Self {
-                multi: Some(multi.clone()),
-                bar: Mutex::new(ProgressBar::hidden()),
-            },
-            _ => Self::hidden(),
-        }
+/// Start a phase on `multi`: a counted bar of `total` steps (tick it with
+/// [`ProgressBar::inc`]), or a spinner for `None`. Drop it to end the phase.
+///
+/// When `multi` is hidden this is a bare hidden bar, so redirected output
+/// pays for no ticker thread.
+pub fn phase(
+    multi: &MultiProgress,
+    label: impl Into<Cow<'static, str>>,
+    total: Option<usize>,
+) -> ProgressBar {
+    if multi.is_hidden() {
+        return ProgressBar::hidden();
     }
-
-    /// A progress handle that never draws (tests, embedders).
-    pub fn hidden() -> Self {
-        Self {
-            multi: None,
-            bar: Mutex::new(ProgressBar::hidden()),
-        }
-    }
-
-    /// Start a new phase with its own label and count. `total: None` shows a
-    /// spinner.
-    pub fn phase(&self, label: impl Into<Cow<'static, str>>, total: Option<usize>) {
-        let Some(multi) = &self.multi else { return };
-        let next = ProgressBar::with_draw_target(None, ProgressDrawTarget::hidden());
-        match total {
-            Some(total) => {
-                next.set_style(bar_style());
-                next.set_length(total as u64);
-            }
-            None => next.set_style(spinner_style()),
-        }
-        next.set_message(label);
-        // Keep the spinner (and elapsed time) moving while a step is slow.
-        next.enable_steady_tick(Duration::from_millis(80));
-        let mut bar = self.bar.lock().unwrap();
-        multi.remove(&bar);
-        *bar = multi.add(next);
-    }
-
-    /// One step of the current phase done.
-    pub fn tick(&self) {
-        if self.multi.is_none() {
-            return;
-        }
-        self.bar.lock().unwrap().inc(1);
-    }
-
-    /// Run `f` (which prints to the terminal) with the line hidden.
-    pub fn suspend<R>(&self, f: impl FnOnce() -> R) -> R {
-        match &self.multi {
-            Some(multi) => multi.suspend(f),
-            None => f(),
-        }
-    }
-}
-
-impl Drop for Progress {
-    fn drop(&mut self) {
-        if let Some(multi) = &self.multi {
-            multi.remove(&self.bar.lock().unwrap());
-            let _ = multi.clear();
-        }
-    }
+    // Fully configured before it's added: a bar draws on most setters, and
+    // drawing half-configured would flash a stale label or count.
+    let bar = ProgressBar::with_draw_target(total.map(|t| t as u64), ProgressDrawTarget::hidden());
+    bar.set_style(match total {
+        Some(_) => bar_style(),
+        None => spinner_style(),
+    });
+    bar.set_message(label);
+    let bar = multi.add(bar);
+    // Keep the spinner (and elapsed time) moving while a step is slow.
+    bar.enable_steady_tick(Duration::from_millis(80));
+    bar
 }
 
 // Both styles share the leading columns (spinner, label), so a phase switch

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use comemo::{Track, Tracked, TrackedMut};
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
 use iddqd::IdHashMap;
+use indicatif::MultiProgress;
 use typst::World;
 use typst::diag::{HintedString, Severity, SourceDiagnostic, SourceResult, StrResult, Warned};
 use typst::foundations::{
@@ -30,7 +31,7 @@ use crate::document::{
     DOCUMENTS_LIST_KEY, DocumentAtIntrospect, DocumentOutput, DocumentsArrayIntrospect,
     ResolvedDocument, ResolvedDocumentIntrospect, TwylaDocument, derive_output,
 };
-use crate::progress::Progress;
+use crate::progress;
 use crate::project::{TwylaContext, present_output};
 use crate::resolver::Resolver;
 
@@ -58,7 +59,7 @@ pub fn compile_bundle(
     world: &dyn World,
     sources: &[FileId],
     resolver: &mut Resolver,
-    progress: &Progress,
+    progress: &MultiProgress,
 ) -> Warned<SourceResult<CompiledBundle>> {
     let mut sink = Sink::new();
     let traced = Traced::default();
@@ -87,7 +88,7 @@ fn compile_bundle_impl(
     sink: &mut Sink,
     sources: &[FileId],
     resolver: &mut Resolver,
-    progress: &Progress,
+    progress: &MultiProgress,
 ) -> SourceResult<CompiledBundle> {
     // Evict cached assets (built or failed) whose ledger deps changed since the
     // last compile (no-op on the first compile / a fresh resolver). What
@@ -119,17 +120,18 @@ fn compile_bundle_impl(
     // loop below only re-*realizes*. Inline / `#context` `document(..)` calls
     // inside these bodies are discovered later, via the sink, during that render
     // — not here (so they ride the same pass as asset resolution).
-    progress.phase("eval", Some(sources.len()));
+    let bar = progress::phase(progress, "eval", Some(sources.len()));
     let evaled = engine.parallelize(sources, |engine, id| {
         let body = eval_file(engine, *id)?;
         let harvested = harvest_metadata(ctx, engine, *id, body);
-        progress.tick();
+        bar.inc(1);
         harvested
     });
     let mut files: Vec<ResolvedDocument> = Vec::new();
     for res in evaled {
         files.push(res?);
     }
+    drop(bar);
 
     // One fixed point: typst introspection, asset resolution, and document
     // discovery all converge together (see [`compile_bundle_loop`]).
@@ -316,7 +318,7 @@ fn compile_bundle_loop(
     sink: &mut Sink,
     files: &[ResolvedDocument],
     resolver: &mut Resolver,
-    progress: &Progress,
+    progress: &MultiProgress,
 ) -> SourceResult<Bundle> {
     let library = world.library();
     let base = StyleChain::new(&library.styles);
@@ -372,8 +374,9 @@ fn compile_bundle_loop(
                 route: Route::default(),
             };
 
-            progress.phase(format!("layout {}", history.len() + 1), None);
+            let bar = progress::phase(progress, format!("layout {}", history.len() + 1), None);
             document = Bundle::create(&mut engine, &content, styles)?;
+            drop(bar);
         }
 
         // Resolve every asset and collect every document this realization
@@ -532,7 +535,7 @@ fn discover_requests(
     resolver: &mut Resolver,
     world: Tracked<dyn World + '_>,
     introspections: &[Introspection],
-    progress: &Progress,
+    progress: &MultiProgress,
     pass: usize,
 ) -> SourceResult<()> {
     // Documents are collected afresh each pass: every pass replays every
@@ -545,7 +548,8 @@ fn discover_requests(
         .iter()
         .filter(|i| i.downcast::<AssetReqIntrospect>().is_some())
         .count();
-    progress.phase(format!("assets {pass}"), Some(assets));
+    // Ends (clears) when this function returns.
+    let bar = progress::phase(progress, format!("assets {pass}"), Some(assets));
     // Every `asset.js` request first: they're built in groups, which must
     // know all of the pass's members before any is resolved.
     resolver.prebuild_js_groups(
@@ -560,7 +564,7 @@ fn discover_requests(
     for introspection in introspections {
         let result = if let Some(req) = introspection.downcast::<AssetReqIntrospect>() {
             let resolved = resolver.resolve_asset(world, &req.0);
-            progress.tick();
+            bar.inc(1);
             resolved
         } else if let Some(req) = introspection.downcast::<ResolvedDocumentIntrospect>() {
             resolver.collect_document(&req.0)

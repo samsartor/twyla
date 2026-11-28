@@ -37,7 +37,7 @@ use crate::asset::ResolvedAsset;
 use crate::compile::CompiledBundle;
 use crate::document::ResolvedDocument;
 use crate::ledger::{self, Dep};
-use crate::progress::Progress;
+use crate::progress;
 use crate::project::{ContentScan, TwylaContext};
 use crate::resolver::Resolver;
 use crate::watch::Stamp;
@@ -391,9 +391,9 @@ pub struct RenderWorld {
     pub library: LazyHash<Library>,
     pub fonts: FontStore,
     pub files: FileStore<TwylaLoader>,
-    /// Where to draw a progress line during compiles (`None` by default; the
-    /// CLI sets [`progress::stderr`](crate::progress::stderr)).
-    pub progress: Option<MultiProgress>,
+    /// Where to draw a progress line during compiles: hidden by default; the
+    /// CLI sets [`progress::stderr`].
+    pub progress: MultiProgress,
 }
 
 impl RenderWorld {
@@ -442,7 +442,7 @@ impl RenderWorld {
             ctx,
             main_id,
             library: LazyHash::new(library),
-            progress: None,
+            progress: progress::hidden(),
             fonts,
             files: FileStore::new(loader),
         })
@@ -497,17 +497,16 @@ impl RenderWorld {
                 ))
             })
             .collect();
-        // Cleared when dropped at the end of this function, on any path.
-        let progress = Progress::new(self.progress.as_ref());
         let Warned { output, warnings } =
-            crate::compile::compile_bundle(&self.ctx, self, &fileids, resolver, &progress);
+            crate::compile::compile_bundle(&self.ctx, self, &fileids, resolver, &self.progress);
         // Diagnostics can point into files only an asset build loaded (an
         // `asset.typst` sub-document): render those from the build's sources.
         let diag_world = DiagWorld {
             world: self,
             sources: resolver.diag_sources(),
         };
-        progress.suspend(|| emit_warnings(&diag_world, &warnings));
+        self.progress
+            .suspend(|| emit_warnings(&diag_world, &warnings));
 
         let CompiledBundle {
             bundle,
@@ -517,9 +516,9 @@ impl RenderWorld {
         } = output.map_err(|errors| compile_err(&diag_world, &errors))?;
 
         let mut all = IdHashMap::new();
-        progress.phase("html", Some(bundle.files.len()));
+        let bar = progress::phase(&self.progress, "html", Some(bundle.files.len()));
         for (path, file) in bundle.files.iter() {
-            progress.tick();
+            bar.inc(1);
             let doc = match file {
                 BundleFile::Document(BundleDocument::Html(doc)) => doc,
                 _ => continue,
@@ -535,6 +534,7 @@ impl RenderWorld {
                 return Err(duplication_error(err).0);
             }
         }
+        drop(bar);
 
         for doc in pages {
             let mut out = all.get_mut(doc.output.as_str());

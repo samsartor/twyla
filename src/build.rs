@@ -48,7 +48,9 @@ impl std::error::Error for BuildError {}
 pub fn run(build: Build) -> Result<BuildSummary, BuildError> {
     let outputs = RenderWorld::new(&build.ctx)
         .and_then(|mut world| {
-            world.progress = build.progress.then(crate::progress::stderr);
+            if build.progress {
+                world.progress = crate::progress::stderr();
+            }
             world.compile_bundle(&mut Resolver::new(&build.ctx))
         })
         .map_err(BuildError::Render)?;
