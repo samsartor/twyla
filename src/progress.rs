@@ -30,6 +30,14 @@ use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
+/// The stderr line progress is drawn on. A long-running caller (serve) makes
+/// one and shares it between every compile and anything else that prints to
+/// stderr meanwhile, which must print through [`MultiProgress::suspend`] so it
+/// doesn't land on top of the line. Hidden when stderr isn't a terminal.
+pub fn stderr() -> MultiProgress {
+    MultiProgress::with_draw_target(ProgressDrawTarget::stderr())
+}
+
 /// One compile's progress line. Shared across the threads typst parallelizes
 /// over.
 pub struct Progress {
@@ -40,15 +48,16 @@ pub struct Progress {
 }
 
 impl Progress {
-    /// A progress line on stderr when `show` is set (and stderr is a
-    /// terminal), otherwise a no-op.
-    pub fn new(show: bool) -> Self {
-        if !show {
-            return Self::hidden();
-        }
-        Self {
-            multi: Some(MultiProgress::with_draw_target(ProgressDrawTarget::stderr())),
-            bar: Mutex::new(ProgressBar::hidden()),
+    /// A progress line drawn on `target` (see [`stderr`]), or a no-op when
+    /// there is none or it's hidden (stderr isn't a terminal), so redirected
+    /// output pays for no ticker threads or locking.
+    pub fn new(target: Option<&MultiProgress>) -> Self {
+        match target {
+            Some(multi) if !multi.is_hidden() => Self {
+                multi: Some(multi.clone()),
+                bar: Mutex::new(ProgressBar::hidden()),
+            },
+            _ => Self::hidden(),
         }
     }
 
@@ -82,6 +91,9 @@ impl Progress {
 
     /// One step of the current phase done.
     pub fn tick(&self) {
+        if self.multi.is_none() {
+            return;
+        }
         self.bar.lock().unwrap().inc(1);
     }
 

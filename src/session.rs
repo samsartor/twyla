@@ -165,7 +165,7 @@ impl DevSession {
         let ctx = self.world.ctx.clone();
         match RenderWorld::new(&ctx) {
             Ok(mut world) => {
-                world.show_progress = self.world.show_progress;
+                world.progress = self.world.progress.take();
                 self.world = world;
             }
             // Can't build a new one: keep the old world (its FileStore is

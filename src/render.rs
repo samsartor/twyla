@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::{fmt, fs, io};
 
 use iddqd::{IdHashItem, IdHashMap, id_upcast};
+use indicatif::MultiProgress;
 
 use typst::diag::{FileError, FileResult, PackageError, PackageResult, SourceDiagnostic, Warned};
 use typst::foundations::{
@@ -390,9 +391,9 @@ pub struct RenderWorld {
     pub library: LazyHash<Library>,
     pub fonts: FontStore,
     pub files: FileStore<TwylaLoader>,
-    /// Draw a progress line on stderr during compiles (off by default; the
-    /// CLI turns it on). See [`crate::progress`].
-    pub show_progress: bool,
+    /// Where to draw a progress line during compiles (`None` by default; the
+    /// CLI sets [`progress::stderr`](crate::progress::stderr)).
+    pub progress: Option<MultiProgress>,
 }
 
 impl RenderWorld {
@@ -441,7 +442,7 @@ impl RenderWorld {
             ctx,
             main_id,
             library: LazyHash::new(library),
-            show_progress: false,
+            progress: None,
             fonts,
             files: FileStore::new(loader),
         })
@@ -497,7 +498,7 @@ impl RenderWorld {
             })
             .collect();
         // Cleared when dropped at the end of this function, on any path.
-        let progress = Progress::new(self.show_progress);
+        let progress = Progress::new(self.progress.as_ref());
         let Warned { output, warnings } =
             crate::compile::compile_bundle(&self.ctx, self, &fileids, resolver, &progress);
         // Diagnostics can point into files only an asset build loaded (an
