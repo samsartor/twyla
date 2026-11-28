@@ -544,15 +544,26 @@ fn discover_requests(
     // that a regrouped `asset.js` changed) would otherwise conflict with its
     // own earlier version, or linger under a stale auto output.
     resolver.clear_documents();
+    resolver.begin_pass();
     let assets = introspections
         .iter()
         .filter(|i| i.downcast::<AssetReqIntrospect>().is_some())
         .count();
     // Ends (clears) when this function returns.
     let bar = progress::phase(progress, format!("assets {pass}"), Some(assets));
+    let _scope = typst_timing::TimingScope::new("resolve assets");
     // Every `asset.js` request first: they're built in groups, which must
     // know all of the pass's members before any is resolved.
     resolver.prebuild_js_groups(
+        introspections
+            .iter()
+            .filter_map(|i| i.downcast::<AssetReqIntrospect>())
+            .map(|req| &req.0),
+    );
+    // Every other new asset next, all at once, in parallel; the loop below
+    // then finds each built (or failed) and records its usage.
+    resolver.prebuild_assets(
+        world,
         introspections
             .iter()
             .filter_map(|i| i.downcast::<AssetReqIntrospect>())

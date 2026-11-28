@@ -10,12 +10,21 @@
 //! object the twyla manifest enumerates and the dev server serves from — so
 //! the build can't disagree with them about what ships.
 //!
+//! With `TWYLA_TIMING=<path>` set, the build (compile and writing files) is
+//! recorded with [`typst_timing`] and written to `<path>` as a Chrome trace
+//! (open it in Perfetto or `chrome://tracing`), like `typst compile
+//! --timings`: typst's own eval/layout/introspection scopes, plus twyla's
+//! asset builds (per `asset.*` call site), asset resolution passes, HTML
+//! serialization and emit.
+//!
 //! No cleaning of the output dir, no dependency tracking. Stale files from
 //! prior builds remain unless you `rm -rf` first. Revisit once we're confident
 //! about a stable dir layout.
 
 use std::io;
 use std::path::PathBuf;
+
+use typst_kit::timer::Timer;
 
 use crate::project::TwylaContext;
 use crate::render::{Output, Outputs, RenderError, RenderWorld};
@@ -46,20 +55,29 @@ impl std::fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 pub fn run(build: Build) -> Result<BuildSummary, BuildError> {
-    let outputs = RenderWorld::new(&build.ctx)
-        .and_then(|mut world| {
-            if build.progress {
-                world.progress = crate::progress::stderr();
-            }
-            world.compile_bundle(&mut Resolver::new(&build.ctx))
+    let mut world = RenderWorld::new(&build.ctx).map_err(BuildError::Render)?;
+    if build.progress {
+        world.progress = crate::progress::stderr();
+    }
+    let mut timer = Timer::new_or_placeholder(std::env::var_os("TWYLA_TIMING").map(PathBuf::from));
+    let outputs = timer
+        .record(&mut world, |world| {
+            let outputs = world
+                .compile_bundle(&mut Resolver::new(&build.ctx))
+                .map_err(BuildError::Render)?;
+            let _scope = typst_timing::TimingScope::new("emit to disk");
+            outputs
+                .emit_to_fs(&build.output_dir)
+                .map_err(|e| BuildError::Io {
+                    context: "writing site outputs".to_string(),
+                    source: e,
+                })?;
+            Ok(outputs)
         })
-        .map_err(BuildError::Render)?;
-    outputs
-        .emit_to_fs(&build.output_dir)
         .map_err(|e| BuildError::Io {
-            context: "writing site outputs".to_string(),
-            source: e,
-        })?;
+            context: "writing the TWYLA_TIMING trace".to_string(),
+            source: io::Error::other(e.to_string()),
+        })??;
     Ok(BuildSummary::of(&outputs))
 }
 

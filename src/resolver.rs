@@ -42,7 +42,7 @@ use typst::diag::{SourceDiagnostic, SourceResult};
 
 use crate::asset::{
     AssetReq, AssetSpec, Built, Companion, CompanionKind, OutputReq, Resolution, ResolvedAsset,
-    file, image, js, raw, sass, svg, typst_doc,
+    file, hash_spec, image, js, raw, sass, svg, typst_doc,
 };
 use crate::document::ResolvedDocument;
 use crate::ledger::{self, Dep, DepRecorder, Revalidation};
@@ -78,6 +78,15 @@ pub struct Resolver {
     js_groups: HashMap<(JsGroupKey, Vec<FileId>), JsGroup>,
     /// Every document discovered so far, keyed by its `output` path.
     documents: IdHashMap<Arc<ResolvedDocument>>,
+    /// The specs (by [`hash_spec`]) requested in the latest discovery pass,
+    /// each with the output policies that pass asked for. Only these are
+    /// emitted: an earlier pass of the same compile can request specs that
+    /// the converged output no longer uses (e.g. a figure rendered before its
+    /// cross-references resolved), or use a surviving spec differently (an
+    /// `output:` path it later stops asking for), and those must not litter
+    /// the output dir. Usage (`outputs`) isn't reset per pass instead,
+    /// because it's part of the value convergence compares.
+    pass_requested: HashMap<u128, Vec<OutputReq>>,
     /// Warnings of the assets requested since the last drain (e.g. a
     /// best-effort svg minify that fell back to verbatim), pushed on every
     /// request — fresh build or cache hit — so a cached asset's warnings
@@ -90,6 +99,10 @@ pub struct Resolver {
     /// unwind: [`asset_deps`](Self::asset_deps) includes it, and the dev
     /// server collects those before discarding the resolver.
     building: DepRecorder,
+    /// The recorders of a parallel batch of builds in progress
+    /// ([`prebuild_assets`](Self::prebuild_assets)), one per build; empty
+    /// between batches. A field for the same reason as `building`.
+    building_batch: Vec<DepRecorder>,
     /// Package sources for `asset.typst` sub-compiles, which read package
     /// files themselves (through `building`) rather than through the live
     /// world. See [`crate::render::system_packages`].
@@ -173,8 +186,10 @@ impl Resolver {
             failed: HashMap::new(),
             js_groups: HashMap::new(),
             documents: IdHashMap::new(),
+            pass_requested: HashMap::new(),
             warnings: Vec::new(),
             building: DepRecorder::new(),
+            building_batch: Vec::new(),
             packages: crate::render::system_packages(ctx),
             stats: ResolverStats::default(),
             #[cfg(test)]
@@ -235,7 +250,91 @@ impl Resolver {
     /// What the asset build in progress has touched so far. Empty unless a
     /// build panicked (see [`building`](Self::building)).
     pub fn interrupted_build_deps(&self) -> Vec<Dep> {
-        self.building.deps()
+        let mut deps = self.building.deps();
+        for rec in &self.building_batch {
+            deps.extend(rec.deps());
+        }
+        deps
+    }
+
+    /// Build, in parallel, every spec among `reqs` that isn't resolved (or
+    /// cached as failed) yet, and file the outcomes exactly as
+    /// [`resolve_asset`](Self::resolve_asset) would. The per-request
+    /// bookkeeping (usage, warnings, errors) is still `resolve_asset`'s, which
+    /// then finds each spec already stored.
+    ///
+    /// Builds are independent — each reads through its own [`DepRecorder`]
+    /// and only reads `&self` — so a pass's batch of new assets (e.g. many
+    /// `asset.typst` figures) runs across all cores instead of one by one.
+    /// `asset.js` specs are skipped: they're built in groups by
+    /// [`prebuild_js_groups`](Self::prebuild_js_groups).
+    pub fn prebuild_assets<'r>(
+        &mut self,
+        world: Tracked<dyn World + '_>,
+        reqs: impl IntoIterator<Item = &'r AssetReq>,
+    ) {
+        use rayon::prelude::*;
+        let mut seen = HashSet::new();
+        let todo: Vec<&AssetReq> = reqs
+            .into_iter()
+            .filter(|req| {
+                !matches!(req.spec, AssetSpec::Js { .. })
+                    && !self.assets.contains_key(&req.spec)
+                    && !self.failed.contains_key(&req.spec)
+                    && seen.insert(&req.spec)
+            })
+            .collect();
+        // A batch of one gains nothing; `resolve_asset` builds it.
+        if todo.len() < 2 {
+            return;
+        }
+        self.building_batch = todo.iter().map(|_| DepRecorder::new()).collect();
+        let this = &*self;
+        let results: Vec<_> = todo
+            .par_iter()
+            .zip(this.building_batch.par_iter())
+            .map(|(req, rec)| {
+                let mut warnings = Vec::new();
+                let mut diag_sources = Vec::new();
+                let result = this.build_asset(
+                    world,
+                    &req.spec,
+                    req.span,
+                    rec,
+                    &mut warnings,
+                    &mut diag_sources,
+                );
+                (result, warnings, diag_sources)
+            })
+            .collect();
+        let recorders = std::mem::take(&mut self.building_batch);
+        for ((req, rec), (result, warnings, diag_sources)) in
+            todo.into_iter().zip(recorders).zip(results)
+        {
+            self.stats.builds += 1;
+            self.stats.content_reads += rec.content_reads();
+            let deps = rec.take();
+            match result {
+                Ok(mut asset) => {
+                    asset.deps = deps;
+                    asset.warnings = warnings;
+                    asset.diag_sources = diag_sources;
+                    self.assets.insert_overwrite(Arc::new(asset));
+                }
+                Err(errors) => {
+                    self.failed.insert(
+                        req.spec.clone(),
+                        FailedAsset {
+                            span: req.span,
+                            deps,
+                            warnings,
+                            errors,
+                            diag_sources,
+                        },
+                    );
+                }
+            }
+        }
     }
 
     /// The assets actually written as files: one item per distinct resolved
@@ -243,10 +342,12 @@ impl Resolver {
     /// never linked or explicitly emitted) is omitted — nothing references the
     /// file, so writing it would just litter the output dir.
     pub fn emittable_assets(&self) -> impl Iterator<Item = (String, Arc<ResolvedAsset>)> + '_ {
-        self.assets.iter().flat_map(|asset| {
+        self.requested_assets().flat_map(|(asset, policies)| {
             let mut paths = Vec::<String>::new();
             for resolution in &asset.resolutions {
-                if matches!(resolution.policy, OutputReq::Read) {
+                if matches!(resolution.policy, OutputReq::Read)
+                    || !policies.contains(&resolution.policy)
+                {
                     continue;
                 }
                 if !paths.contains(&resolution.output_path) {
@@ -264,12 +365,9 @@ impl Resolver {
     /// `?worker`s by their absolute URLs, so they're emitted on their own.
     pub fn read_only_file_companions(&self) -> Vec<Companion> {
         let mut out = Vec::new();
-        for asset in self.assets.iter() {
-            let read_only = !asset.resolutions.is_empty()
-                && asset
-                    .resolutions
-                    .iter()
-                    .all(|r| matches!(r.policy, OutputReq::Read));
+        for (asset, policies) in self.requested_assets() {
+            let read_only =
+                !policies.is_empty() && policies.iter().all(|p| matches!(p, OutputReq::Read));
             if !read_only {
                 continue;
             }
@@ -295,6 +393,21 @@ impl Resolver {
     /// compile rediscovers the full set fresh.
     pub fn clear_documents(&mut self) {
         self.documents = IdHashMap::new();
+    }
+
+    /// The resolved assets the latest discovery pass requested, with the
+    /// output policies it requested them under.
+    fn requested_assets(&self) -> impl Iterator<Item = (&Arc<ResolvedAsset>, &[OutputReq])> {
+        self.assets.iter().filter_map(|asset| {
+            let policies = self.pass_requested.get(&hash_spec(&asset.spec))?;
+            Some((asset, policies.as_slice()))
+        })
+    }
+
+    /// Start a discovery pass: forget which specs the previous pass
+    /// requested (see `pass_requested`).
+    pub fn begin_pass(&mut self) {
+        self.pass_requested.clear();
     }
 
     /// Forget how assets were used (clears each asset's `outputs`). Called once
@@ -522,6 +635,12 @@ impl Resolver {
         world: Tracked<dyn World + '_>,
         req: &AssetReq,
     ) -> SourceResult<()> {
+        let policies = self.pass_requested.entry(hash_spec(&req.spec)).or_default();
+        for output in &req.outputs {
+            if !policies.contains(output) {
+                policies.push(output.clone());
+            }
+        }
         if let Some(failed) = self.failed.get(&req.spec) {
             let (from, to) = (failed.span, req.span);
             self.warnings
@@ -705,6 +824,7 @@ impl Resolver {
         warnings: &mut Vec<SourceDiagnostic>,
         diag_sources: &mut Vec<Source>,
     ) -> SourceResult<ResolvedAsset> {
+        let _scope = typst_timing::TimingScope::with_span(spec.kind(), Some(span.into_raw()));
         let built = match spec {
             AssetSpec::File { file } => file::build(*file, &self.ctx, span, rec)?,
             AssetSpec::Sass {

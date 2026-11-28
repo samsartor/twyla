@@ -12,7 +12,7 @@
 //! #context raw-html(asset.typst(circle(fill: blue), format: "svg").read())
 //! ```
 //!
-//! **Assets compile as plain, stock typst** — a fresh [`Library`] *without*
+//! **Assets compile as plain, stock typst** — a stock [`Library`] *without*
 //! twyla's builtins (`document` / `asset` / `content` / the native HTML rules).
 //! A typst asset can't cross-link into the site or read `#document`; it's a
 //! self-contained artifact whose output is a pure function of its source +
@@ -25,9 +25,10 @@
 //! work.
 //!
 //! Mechanism (see `crate::examples::SnippetWorld`, the precedent): a path source
-//! compiles the real project file as `main`; an inline content value is bound
-//! into the stock library's global scope under a private name and compiled
-//! through a one-line synthetic `main` (`#__twyla_inline`). `svg`/`png`/`pdf`
+//! compiles the real project file as `main`; an inline content value is
+//! already evaluated, so it skips eval and goes straight into typst's relayout
+//! loop ([`compile_content`]). Every build shares one stock library
+//! ([`stock_library`]), so comemo can reuse work across builds. `svg`/`png`/`pdf`
 //! compile to a [`PagedDocument`] and serialize via `typst_svg` / `typst_render`
 //! / `typst_pdf`; `html` compiles to an [`HtmlDocument`] like the rest of the
 //! site. Project files the sub-compile loads (the document, its imports,
@@ -48,21 +49,23 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use super::{AssetSpec, Built, OutputReq, emit_or_request, sha256};
 use crate::ledger::DepRecorder;
 use crate::project::TwylaContext;
 use crate::render::{Emit, locate_package};
+use comemo::Track;
 use comemo::Tracked;
 use ecow::{EcoString, eco_format, eco_vec};
 use typst::diag::{
     FileError, FileResult, HintedStrResult, PackageResult, SourceDiagnostic, SourceResult, Warned,
 };
 use typst::foundations::{
-    Bytes, Cast, Content, Datetime, Duration, IntoValue, Packed, PathOrStr, ShowFn, StyleChain,
-    cast, elem, func, scope,
+    Bytes, Cast, Content, Datetime, Duration, Packed, PathOrStr, ShowFn, StyleChain, cast, elem,
+    func, scope,
 };
+use typst::foundations::{Output, Target, TargetElem};
 use typst::layout::Abs;
 use typst::loading::Encoding;
 use typst::syntax::package::PackageSpec;
@@ -75,7 +78,10 @@ use typst_kit::files::FsRoot;
 use typst_kit::packages::SystemPackages;
 use typst_layout::PagedDocument;
 use typst_library::Feature;
+use typst_library::engine::{Engine, Route, Sink, Traced};
+use typst_library::introspection::{EmptyIntrospector, Introspector, MAX_ITERS, analyze};
 use typst_pdf::PdfOptions;
+use typst_utils::Protected;
 
 /// Compile a typst document (content or a project `.typ` file) to a
 /// fingerprinted asset.
@@ -189,12 +195,32 @@ cast! {
 /// The resolved document source carried in [`AssetSpec::Typst`]: a project file
 /// id, or a captured content value (content-addressed, like
 /// [`AssetSpec::Raw`](super::AssetSpec::Raw) bytes).
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, Hash)]
 pub enum TypstInput {
     /// A project `.typ` file, compiled as `main` (read + watched).
     File(FileId),
     /// An inline content value, compiled through a synthetic `main`.
     Content(Content),
+}
+
+/// Content-addressed: two inline contents are the same input iff their
+/// typst hashes are equal. Typst's own `Content` equality is much looser than
+/// its `Hash` (it skips each element's location, label and span, among
+/// others), so a derived `PartialEq` would let two specs that hash apart
+/// compare equal. That breaks every map keyed by [`AssetSpec`]: a lookup
+/// could land on an *equal* entry for a different spec (a bucket-tag
+/// collision is enough), skip the build, and leave the spec unresolved in
+/// the hash-keyed introspector — shipping a pending URL.
+impl PartialEq for TypstInput {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::File(a), Self::File(b)) => a == b,
+            (Self::Content(a), Self::Content(b)) => {
+                typst_utils::hash128(a) == typst_utils::hash128(b)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Output format for a compiled typst asset.
@@ -247,14 +273,7 @@ pub(crate) fn build(
     warnings: &mut Vec<SourceDiagnostic>,
     diag_sources: &mut Vec<Source>,
 ) -> SourceResult<Built> {
-    // A stock library: the standard typst stdlib (with the HTML feature, needed
-    // for `format: "html"` and harmless otherwise) but NONE of twyla's
-    // `install_stdlib` splices — no custom rules, no `document`/`asset`/`content`.
-    let mut library = Library::builder()
-        .with_features([Feature::Html].into_iter().collect())
-        .build();
-
-    let (main_id, main_src, stem) = match input {
+    let (main_id, main_src, stem, content) = match input {
         TypstInput::File(file) => {
             // Compile the real project file as `main`; the sub-world reads it
             // (and its imports) through the recorder.
@@ -262,28 +281,24 @@ pub(crate) fn build(
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .map(str::to_owned);
-            (*file, None, stem)
+            (*file, None, stem, None)
         }
         TypstInput::Content(content) => {
-            // Bind the captured value into the stock global scope and reference
-            // it from a trivial synthetic main (the library is per-compile, so
-            // the mutation is local). No file stem → hash-only output name.
-            library
-                .global
-                .scope_mut()
-                .define("__twyla_inline", content.clone().into_value());
+            // Already-evaluated content is laid out directly (see
+            // [`compile_content`]); the empty main is never evaluated, it just
+            // gives the world a `main`. No file stem → hash-only output name.
             let id = FileId::new(RootedPath::new(
                 VirtualRoot::Project,
                 VirtualPath::new("__twyla_inline__.typ").unwrap(),
             ));
-            let src = Source::new(id, EcoString::inline("#__twyla_inline").into());
-            (id, Some(src), None)
+            let src = Source::new(id, EcoString::new().into());
+            (id, Some(src), None, Some(content))
         }
     };
 
     let subworld = TypstWorld {
         world,
-        library: LazyHash::new(library),
+        library: stock_library(),
         main_id,
         main_src,
         root: &ctx.root,
@@ -294,7 +309,15 @@ pub(crate) fn build(
     };
 
     let mut sub_warnings = Vec::new();
-    let result = serialize(&subworld, format, ppi, minify, span, &mut sub_warnings);
+    let result = serialize(
+        &subworld,
+        content,
+        format,
+        ppi,
+        minify,
+        span,
+        &mut sub_warnings,
+    );
     // Capture the sources of everything the sub-compile has to say, while
     // the sub-world still holds them.
     let errors = result.as_ref().err().map(|e| e.as_slice()).unwrap_or(&[]);
@@ -340,6 +363,7 @@ pub(crate) fn build(
 /// warnings go to `warnings`.
 fn serialize(
     world: &TypstWorld,
+    content: Option<&Content>,
     format: Format,
     ppi: i64,
     minify: bool,
@@ -351,7 +375,7 @@ fn serialize(
             let Warned {
                 output,
                 warnings: w,
-            } = typst::compile::<HtmlDocument>(world);
+            } = compile::<HtmlDocument>(world, content);
             warnings.extend(w);
             typst_html::html(&output?, &typst_html::HtmlOptions { pretty: true })?.into_bytes()
         }
@@ -359,7 +383,7 @@ fn serialize(
             let Warned {
                 output,
                 warnings: w,
-            } = typst::compile::<PagedDocument>(world);
+            } = compile::<PagedDocument>(world, content);
             warnings.extend(w);
             let doc = output?;
             match format {
@@ -394,6 +418,116 @@ fn serialize(
     })
 }
 
+/// The stock library every `asset.typst` sub-compile runs against: the
+/// standard typst stdlib (with the HTML feature, needed for `format: "html"`
+/// and harmless otherwise) but NONE of twyla's `install_stdlib` splices — no
+/// custom rules, no `document`/`asset`/`content`.
+///
+/// One instance for the whole process, not one per build: the library is
+/// part of nearly every memoized call's key, so a shared one (hashed once)
+/// lets comemo reuse work across sub-compiles — figures sharing a package,
+/// styles, or subcontent — and across the dev server's rebuilds. Inline
+/// content is therefore never injected into the library's scope (which would
+/// make every build's library distinct); see [`compile_content`].
+fn stock_library() -> Arc<LazyHash<Library>> {
+    static STOCK: LazyLock<Arc<LazyHash<Library>>> = LazyLock::new(|| {
+        Arc::new(LazyHash::new(
+            Library::builder()
+                .with_features([Feature::Html].into_iter().collect())
+                .build(),
+        ))
+    });
+    STOCK.clone()
+}
+
+/// Compile the sub-document: the world's `main`, or already-evaluated
+/// `content`.
+fn compile<T: Output>(world: &TypstWorld, content: Option<&Content>) -> Warned<SourceResult<T>> {
+    match content {
+        Some(content) => compile_content(world, content),
+        None => typst::compile::<T>(world),
+    }
+}
+
+/// `typst::compile` for content that's already evaluated: typst's relayout
+/// loop (`compile_impl`) minus the eval of `main`.
+fn compile_content<T: Output>(world: &dyn World, content: &Content) -> Warned<SourceResult<T>> {
+    let world = world.track();
+    let traced = Traced::default();
+    let traced = traced.track();
+    let mut sink = Sink::new();
+    let output = (|| {
+        let library = world.library();
+        if T::target() == Target::Html {
+            // What `typst::compile` says for HTML output, for parity.
+            sink.warn(
+                SourceDiagnostic::warning(
+                    Span::detached(),
+                    "html export is under active development and incomplete",
+                )
+                .with_hint("its behaviour may change at any time")
+                .with_hint("do not rely on this feature for production use cases")
+                .with_hint("see https://github.com/typst/typst/issues/5512 for more information"),
+            );
+        }
+        let base = StyleChain::new(&library.styles);
+        let target = TargetElem::target.set(T::target()).wrap();
+        let styles = base.chain(&target);
+        let empty = EmptyIntrospector;
+        let mut history: Vec<T> = Vec::new();
+        let mut document: T;
+        loop {
+            let introspector = history
+                .last()
+                .map(|doc| doc.introspector())
+                .unwrap_or(&empty);
+            let constraint = comemo::Constraint::new();
+            let mut subsink = Sink::new();
+            let mut engine = Engine {
+                library,
+                world,
+                introspector: Protected::new(introspector.track_with(&constraint)),
+                traced,
+                sink: subsink.track_mut(),
+                route: Route::default(),
+            };
+            document = T::create(&mut engine, content, styles)?;
+            if constraint.validate(document.introspector()) {
+                sink.extend_from_sink(subsink);
+                break;
+            }
+            if history.len() == MAX_ITERS - 1 {
+                let mut introspectors = [&empty as &dyn Introspector; MAX_ITERS + 1];
+                for i in 1..MAX_ITERS {
+                    introspectors[i] = history[i - 1].introspector();
+                }
+                introspectors[MAX_ITERS] = document.introspector();
+                let warnings = analyze(world, introspectors, subsink.introspections());
+                sink.extend_from_sink(subsink);
+                for warning in warnings {
+                    sink.warn(warning);
+                }
+                break;
+            }
+            history.push(document);
+        }
+        let delayed = sink.delayed();
+        if !delayed.is_empty() {
+            return Err(delayed);
+        }
+        Ok(document)
+    })()
+    .map_err(|mut diags| {
+        let mut seen = std::collections::HashSet::new();
+        diags.retain(|d| seen.insert(typst_utils::hash128(&(&d.span, &d.message))));
+        diags
+    });
+    Warned {
+        output,
+        warnings: sink.warnings(),
+    }
+}
+
 /// A spanned error from any `Display` payload.
 fn err_at(span: Span, msg: impl std::fmt::Display) -> ecow::EcoVec<SourceDiagnostic> {
     eco_vec![SourceDiagnostic::error(
@@ -416,7 +550,7 @@ pub(crate) fn file_world<'a>(
 ) -> TypstWorld<'a> {
     let main = Source::detached("");
     TypstWorld {
-        library: world.library().clone(),
+        library: Arc::new(world.library().clone()),
         world,
         main_id: main.id(),
         main_src: Some(main),
@@ -438,7 +572,7 @@ pub(crate) fn file_world<'a>(
 /// font book is read off the live world per call.
 pub(crate) struct TypstWorld<'a> {
     world: Tracked<'a, dyn World + 'a>,
-    library: LazyHash<Library>,
+    library: Arc<LazyHash<Library>>,
     main_id: FileId,
     /// `Some` for an inline-content compile (the synthetic main); `None` for a
     /// path source (the real file is read like any other project file).
@@ -566,5 +700,29 @@ impl World for TypstWorld<'_> {
     }
     fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
         self.world.today(offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TypstInput;
+    use typst::foundations::Content;
+    use typst::syntax::Source;
+    use typst::text::TextElem;
+
+    /// Typst's `Content` equality ignores spans (and locations, labels…) but
+    /// its hash doesn't: inline-content inputs must follow the hash, or the
+    /// asset maps' `Eq`/`Hash` disagree.
+    #[test]
+    fn inline_content_inputs_compare_by_hash() {
+        let source = Source::detached("x");
+        let s1 = source.root().span();
+        let s2 = source.root().children().next().unwrap().span();
+        assert_ne!(s1, s2);
+        let a: Content = TextElem::packed("x").spanned(s1);
+        let b: Content = TextElem::packed("x").spanned(s2);
+        assert_eq!(a, b, "typst's own equality is span-blind");
+        assert_ne!(TypstInput::Content(a.clone()), TypstInput::Content(b));
+        assert_eq!(TypstInput::Content(a.clone()), TypstInput::Content(a));
     }
 }
