@@ -7,6 +7,7 @@
 //! callers (`build`, `check`, `render`) just construct a fresh world,
 //! compile once, and drop it.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{fmt, fs, io};
@@ -40,7 +41,7 @@ use crate::ledger::{self, Dep};
 use crate::progress;
 use crate::project::{ContentScan, TwylaContext};
 use crate::resolver::Resolver;
-use crate::watch::Stamp;
+use crate::watch::{ChangedPaths, Stamp};
 
 /// The `type` attribute marking a raw-HTML carrier `<script>`. The builtin
 /// [`crate::content::raw_html`] produces an element with this type; the
@@ -418,6 +419,7 @@ impl RenderWorld {
         let loader = TwylaLoader {
             root: ctx.root.clone(),
             observed: Mutex::new(Vec::new()),
+            unchanged: Mutex::new(HashMap::new()),
             packages: system_packages(&ctx),
         };
 
@@ -456,6 +458,32 @@ impl RenderWorld {
     /// yields exactly that compile's typst dependencies.
     pub fn take_loads(&self) -> Vec<Dep> {
         std::mem::take(&mut *self.files.loader().observed.lock().unwrap())
+    }
+
+    /// Stop reusing earlier reads of the files the watcher reported changed
+    /// (all of them, if it lost events), so the next compile reads them
+    /// again even if their [`Stamp`] didn't change: where a stamp is only
+    /// mtime + length (no ctime/inode off unix), a same-length rewrite that
+    /// keeps the mtime would otherwise be served from the cache.
+    pub fn forget_reads(&self, changed: &ChangedPaths) {
+        let mut unchanged = self.files.loader().unchanged.lock().unwrap();
+        if changed.unknown {
+            unchanged.clear();
+            return;
+        }
+        for path in &changed.paths {
+            let path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+            unchanged.remove(&path);
+        }
+    }
+
+    /// Swap the cached bytes of an earlier read of `path`, leaving its stamp:
+    /// what a stamp-preserving edit looks like to [`TwylaLoader::reuse`].
+    #[cfg(test)]
+    pub(crate) fn tamper_cached_read(&self, path: &Path, bytes: &[u8]) {
+        let mut unchanged = self.files.loader().unchanged.lock().unwrap();
+        let entry = unchanged.get_mut(path).expect("path was read and cached");
+        entry.1 = Bytes::new(bytes.to_vec());
     }
 
     /// Compile every routed page in the bundle.
@@ -798,6 +826,16 @@ pub struct TwylaLoader {
     /// stat'ing dependencies after the compile (which can't see a file that
     /// changed in between).
     observed: Mutex<Vec<Dep>>,
+    /// Every file read so far that can be reused while unchanged: its read's
+    /// [`Dep`] and the bytes. [`FileStore::reset`] makes every file load
+    /// again on the next compile; a file whose stamp still matches (and
+    /// whose read wasn't [racy](Dep::is_racy)) is served from here instead —
+    /// the same trust [`ledger::revalidate`] gives an asset's deps — so a dev
+    /// server rebuild doesn't re-read and re-hash (SHA-256 for the ledger,
+    /// then typst's own hash of the new `Bytes`) every image and data file
+    /// the site's typst code loads. The returned `Bytes` is the same
+    /// allocation as before, so typst's cached hash of it carries over too.
+    unchanged: Mutex<HashMap<PathBuf, (Dep, Bytes)>>,
     /// See [`system_packages`].
     packages: SystemPackages,
 }
@@ -811,13 +849,19 @@ impl FileLoader for TwylaLoader {
                     .resolve(id.vpath())?
             }
         };
+        let path = std::path::absolute(&path).unwrap_or(path);
+        if let Some(bytes) = self.reuse(&path) {
+            return Ok(bytes);
+        }
         let (dep, result) = ledger::observe_read(&path);
+        let result = result.map(Bytes::new);
+        self.remember(&dep, &result);
         // `read` on a directory: typst's own loader reports this specially
         // (`FsRoot::load`); match it. Decided from the recorded observation,
         // not a second lookup.
         let is_dir = matches!(dep.stamp, Stamp::Dir { .. } | Stamp::Unreadable);
         self.record(dep);
-        result.map(Bytes::new).map_err(|err| {
+        result.map_err(|err| {
             if is_dir {
                 FileError::IsDirectory
             } else {
@@ -830,6 +874,35 @@ impl FileLoader for TwylaLoader {
 impl TwylaLoader {
     fn record(&self, dep: Dep) {
         self.observed.lock().unwrap().push(dep);
+    }
+
+    /// The bytes of an earlier read of `path`, if the file is provably
+    /// unchanged since (see `unchanged`). Records the earlier read's dep:
+    /// its stamp was just re-verified.
+    fn reuse(&self, path: &Path) -> Option<Bytes> {
+        let unchanged = self.unchanged.lock().unwrap();
+        let (dep, bytes) = unchanged.get(path)?;
+        if dep.is_racy() || Stamp::now(path) != dep.stamp {
+            return None;
+        }
+        let (dep, bytes) = (dep.clone(), bytes.clone());
+        drop(unchanged);
+        self.record(dep);
+        Some(bytes)
+    }
+
+    /// Keep a successful, stable read for [`reuse`](Self::reuse); forget
+    /// anything else about the path.
+    fn remember(&self, dep: &Dep, result: &io::Result<Bytes>) {
+        let mut unchanged = self.unchanged.lock().unwrap();
+        match result {
+            Ok(bytes) if dep.sha256.is_some() && dep.stamp != Stamp::Unknown && !dep.is_racy() => {
+                unchanged.insert(dep.path.clone(), (dep.clone(), bytes.clone()));
+            }
+            _ => {
+                unchanged.remove(&dep.path);
+            }
+        }
     }
 }
 

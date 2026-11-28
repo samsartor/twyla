@@ -18,6 +18,7 @@ use crate::ledger::Dep;
 use crate::project::{ContentScan, TwylaContext};
 use crate::render::{Outputs, RenderError, RenderErrorKind, RenderWorld, plain_err};
 use crate::resolver::Resolver;
+use crate::watch::ChangedPaths;
 pub use crate::watch::{Stamp, WatchSet};
 
 /// Persistent compile state for `twyla serve`. See the module docs.
@@ -77,6 +78,14 @@ impl DevSession {
     /// `content/` and `static/` are rescanned every time, once, and that one
     /// scan feeds both the compile and the watch set.
     pub fn rebuild(&mut self) -> Rebuild {
+        self.rebuild_after(&ChangedPaths::default())
+    }
+
+    /// [`rebuild`](Self::rebuild) after the watcher reported `changed`: those
+    /// files are read from disk again rather than trusted by their stamps
+    /// (see [`RenderWorld::forget_reads`]).
+    pub fn rebuild_after(&mut self, changed: &ChangedPaths) -> Rebuild {
+        self.world.forget_reads(changed);
         comemo::evict(10);
         self.world.files.reset();
         // Start this compile's load log empty (a one-shot `compile_bundle`
@@ -258,6 +267,63 @@ mod tests {
             "new nested page not picked up",
         );
         assert!(r2.watch.contains(content.join("posts/second.typ")));
+    }
+
+    /// The typst loader serves an unchanged file from its previous read (see
+    /// `TwylaLoader::unchanged`), but never once the file changed — even by a
+    /// same-length rewrite.
+    #[test]
+    fn unchanged_file_reuse_still_sees_edits() {
+        let (ctx, dir) = site(&[
+            ("content/main.typ", "#read(\"/data.txt\")"),
+            ("data.txt", "aaa"),
+        ]);
+        // Past the racy window, so the first read is reusable.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut session = DevSession::new(&ctx).unwrap();
+        let html = |r: Rebuild| r.result.unwrap().docs().next().unwrap().html.clone();
+        assert!(html(session.rebuild()).contains("aaa"));
+        assert!(html(session.rebuild()).contains("aaa"));
+        write(dir.path(), "data.txt", "bbb");
+        assert!(html(session.rebuild()).contains("bbb"));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(html(session.rebuild()).contains("bbb"));
+        write(dir.path(), "data.txt", "ccc");
+        assert!(html(session.rebuild()).contains("ccc"));
+    }
+
+    /// A file the watcher reports changed is read again even if its stamp
+    /// matches the cached read's (a same-length, mtime-preserving rewrite on
+    /// a platform whose stamps have no ctime/inode); an unknown change
+    /// (lost events) rereads everything.
+    #[test]
+    fn reported_changes_bypass_the_unchanged_file_cache() {
+        let (ctx, dir) = site(&[
+            ("content/main.typ", "#read(\"/data.txt\")"),
+            ("data.txt", "aaa"),
+        ]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut session = DevSession::new(&ctx).unwrap();
+        let html = |r: Rebuild| r.result.unwrap().docs().next().unwrap().html.clone();
+        assert!(html(session.rebuild()).contains("aaa"));
+        let data = std::path::absolute(dir.path().join("data.txt")).unwrap();
+
+        // Unreported, the cache is trusted (that's the point of it).
+        session.world.tamper_cached_read(&data, b"zzz");
+        assert!(html(session.rebuild()).contains("zzz"));
+
+        let named = ChangedPaths {
+            paths: [data.clone()].into(),
+            unknown: false,
+        };
+        assert!(html(session.rebuild_after(&named)).contains("aaa"));
+
+        session.world.tamper_cached_read(&data, b"zzz");
+        let unknown = ChangedPaths {
+            unknown: true,
+            ..Default::default()
+        };
+        assert!(html(session.rebuild_after(&unknown)).contains("aaa"));
     }
 
     /// A missing `content/` is still watched (polled), so creating it and its

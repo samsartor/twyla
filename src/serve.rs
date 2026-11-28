@@ -330,7 +330,7 @@ fn run_watcher(
         // result published decides below whether this was an in-place edit.
         let before = Published::of(&last_output.lock().unwrap());
         let start = Instant::now();
-        let rebuild = session.rebuild();
+        let rebuild = session.rebuild_after(&changed);
         let elapsed = start.elapsed();
         match &rebuild.result {
             Ok(site) => eprintln!(
