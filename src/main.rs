@@ -170,6 +170,18 @@ enum FromFormat {
 }
 
 fn main() -> ExitCode {
+    // A panic mid-compile would print after the progress line's text:
+    // indicatif doesn't draw (or clear) while unwinding. Clear the current
+    // stderr line first. Harmless when no progress line is up — the cursor is
+    // then at the start of an empty line.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::io::stderr().is_terminal() {
+            eprint!("\r\x1b[2K");
+        }
+        default_hook(info);
+    }));
+
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Serve {
@@ -225,6 +237,7 @@ fn cmd_build(args: ContextArgs, output_dir: Option<PathBuf>) -> ExitCode {
     match build_run(Build {
         ctx,
         output_dir: output_dir.clone(),
+        progress: true,
     }) {
         Ok(summary) => {
             eprintln!(

@@ -164,7 +164,10 @@ impl DevSession {
         comemo::evict(0);
         let ctx = self.world.ctx.clone();
         match RenderWorld::new(&ctx) {
-            Ok(world) => self.world = world,
+            Ok(mut world) => {
+                world.progress = self.world.progress.clone();
+                self.world = world;
+            }
             // Can't build a new one: keep the old world (its FileStore is
             // reset at the start of every rebuild anyway).
             Err(e) => eprintln!("cannot rebuild compile state after panic: {e}"),
@@ -835,7 +838,13 @@ mod tests {
         ));
         let mut resolver = Resolver::new(&ctx);
         for round in 0..2 {
-            let warned = crate::compile::compile_bundle(&ctx, &world, &[main], &mut resolver);
+            let warned = crate::compile::compile_bundle(
+                &ctx,
+                &world,
+                &[main],
+                &mut resolver,
+                &crate::progress::hidden(),
+            );
             assert!(warned.output.is_ok(), "round {round}");
             assert!(
                 warned.warnings.iter().any(|w| w.message.contains("svg")),
@@ -921,6 +930,7 @@ mod tests {
             &world,
             &[page_id("content/main.typ")],
             &mut resolver,
+            &crate::progress::hidden(),
         );
         assert!(warned.output.is_err());
         assert!(
@@ -946,7 +956,13 @@ mod tests {
         let mut world = RenderWorld::new(&ctx).unwrap();
         let mut resolver = Resolver::new(&ctx);
         let error_line = |world: &RenderWorld, resolver: &mut Resolver| {
-            let warned = crate::compile::compile_bundle(&ctx, world, &[main], resolver);
+            let warned = crate::compile::compile_bundle(
+                &ctx,
+                world,
+                &[main],
+                resolver,
+                &crate::progress::hidden(),
+            );
             let errors = warned.output.err().expect("expected an output error");
             let error = errors
                 .iter()
@@ -993,6 +1009,7 @@ mod tests {
                 &world,
                 &[page_id("content/main.typ")],
                 &mut resolver,
+                &crate::progress::hidden(),
             );
             assert!(warned.output.is_ok(), "round {round}");
             assert!(

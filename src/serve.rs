@@ -48,8 +48,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use indicatif::MultiProgress;
 use owo_colors::{AnsiColors, OwoColorize, Stream, Style};
 
+use crate::progress;
 use crate::project::TwylaContext;
 use crate::render::{Emit, Output, Outputs, RenderError};
 use crate::session::{DevSession, Rebuild};
@@ -69,16 +71,19 @@ fn status_color(status: u16) -> AnsiColors {
 }
 
 /// One aligned request-log line: status colored by class, then the method and
-/// path, then a dimmed trailing detail (the timing, or a note).
-fn log_request(status: u16, method: &str, path: &str, detail: &str) {
+/// path, then a dimmed trailing detail (the timing, or a note). Printed
+/// through `term` so it doesn't land on a rebuild's progress line.
+fn log_request(term: &MultiProgress, status: u16, method: &str, path: &str, detail: &str) {
     let code = format!("{status:>3}");
     let req = format!("{method} {path}");
-    eprintln!(
-        "  {}  {req:<34}{}",
-        code.if_supports_color(OUT, |s| s
-            .style(Style::new().color(status_color(status)).bold())),
-        detail.if_supports_color(OUT, |s| s.dimmed()),
-    );
+    term.suspend(|| {
+        eprintln!(
+            "  {}  {req:<34}{}",
+            code.if_supports_color(OUT, |s| s
+                .style(Style::new().color(status_color(status)).bold())),
+            detail.if_supports_color(OUT, |s| s.dimmed()),
+        )
+    });
 }
 
 pub struct Serve {
@@ -97,6 +102,8 @@ type ReloadClients = Mutex<Vec<TcpStream>>;
 
 struct ServeState {
     ctx: TwylaContext,
+    /// See `term` in [`run`].
+    term: MultiProgress,
     last_output: Arc<LastOutput>,
     reload_clients: Arc<ReloadClients>,
 }
@@ -157,8 +164,15 @@ pub fn run(serve: Serve) -> io::Result<()> {
     // foreground thread. Doing it before bind means a startup error is
     // reported on stderr before any browser sees it, and the first
     // request after bind hits a warm cache.
+    // The stderr line rebuilds draw their progress on. Request handling runs
+    // on this thread while the watcher thread compiles, so everything this
+    // thread logs goes through `term.suspend` to stay off the progress line.
+    let term = progress::stderr();
     let mut session = match DevSession::new(&serve.ctx) {
-        Ok(s) => s,
+        Ok(mut s) => {
+            s.world.progress = term.clone();
+            s
+        }
         Err(e) => {
             eprintln!(
                 "  {} setup failed",
@@ -210,6 +224,7 @@ pub fn run(serve: Serve) -> io::Result<()> {
 
     let state = ServeState {
         ctx: serve.ctx,
+        term,
         last_output,
         reload_clients,
     };
@@ -218,18 +233,22 @@ pub fn run(serve: Serve) -> io::Result<()> {
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
-                eprintln!(
-                    "  {}",
-                    format!("accept error: {e}").if_supports_color(OUT, |s| s.red())
-                );
+                state.term.suspend(|| {
+                    eprintln!(
+                        "  {}",
+                        format!("accept error: {e}").if_supports_color(OUT, |s| s.red())
+                    )
+                });
                 continue;
             }
         };
         if let Err(e) = handle(&state, stream) {
-            eprintln!(
-                "  {}",
-                format!("connection error: {e}").if_supports_color(OUT, |s| s.red())
-            );
+            state.term.suspend(|| {
+                eprintln!(
+                    "  {}",
+                    format!("connection error: {e}").if_supports_color(OUT, |s| s.red())
+                )
+            });
         }
     }
     Ok(())
@@ -602,7 +621,13 @@ fn handle(state: &ServeState, mut stream: TcpStream) -> io::Result<()> {
         inject_reload_script(&mut response.body);
     }
     let elapsed = start.elapsed();
-    log_request(response.status, &method, &path, &format!("{elapsed:.0?}"));
+    log_request(
+        &state.term,
+        response.status,
+        &method,
+        &path,
+        &format!("{elapsed:.0?}"),
+    );
 
     write_response(&mut stream, &response)
 }
@@ -624,7 +649,13 @@ fn accept_reload_client(state: &ServeState, mut stream: TcpStream) -> io::Result
          retry: 1000\n\n",
     )?;
     stream.flush()?;
-    log_request(200, "GET", "/__twyla/reload", "reload client connected");
+    log_request(
+        &state.term,
+        200,
+        "GET",
+        "/__twyla/reload",
+        "reload client connected",
+    );
     state.reload_clients.lock().unwrap().push(stream);
     Ok(())
 }

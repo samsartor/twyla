@@ -24,6 +24,7 @@ pub mod examples;
 pub mod html;
 pub mod import;
 pub mod ledger;
+pub mod progress;
 pub mod project;
 pub mod reflect;
 pub mod render;

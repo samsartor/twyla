@@ -18,11 +18,14 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::project::TwylaContext;
-use crate::render::{Output, Outputs, RenderError, render_site};
+use crate::render::{Output, Outputs, RenderError, RenderWorld};
+use crate::resolver::Resolver;
 
 pub struct Build {
     pub ctx: TwylaContext,
     pub output_dir: PathBuf,
+    /// Draw a progress line on stderr while compiling (if it's a terminal).
+    pub progress: bool,
 }
 
 #[derive(Debug)]
@@ -43,7 +46,14 @@ impl std::fmt::Display for BuildError {
 impl std::error::Error for BuildError {}
 
 pub fn run(build: Build) -> Result<BuildSummary, BuildError> {
-    let outputs = render_site(&build.ctx).map_err(BuildError::Render)?;
+    let outputs = RenderWorld::new(&build.ctx)
+        .and_then(|mut world| {
+            if build.progress {
+                world.progress = crate::progress::stderr();
+            }
+            world.compile_bundle(&mut Resolver::new(&build.ctx))
+        })
+        .map_err(BuildError::Render)?;
     outputs
         .emit_to_fs(&build.output_dir)
         .map_err(|e| BuildError::Io {
