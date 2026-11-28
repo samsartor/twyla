@@ -195,6 +195,7 @@ pub fn run(serve: Serve) -> io::Result<()> {
         watch,
     } = session.rebuild();
     print_banner(local, &serve.ctx.root, &initial, warm_start.elapsed());
+    session.age_caches();
 
     let last_output: Arc<LastOutput> = Arc::new(Mutex::new(initial));
     let reload_clients: Arc<ReloadClients> = Arc::new(Mutex::new(Vec::new()));
@@ -365,6 +366,8 @@ fn run_watcher(
             }
             None => broadcaster.reload(),
         }
+        // Now that the browser has the result, age the cache while we wait.
+        session.age_caches();
     }
 }
 

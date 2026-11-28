@@ -73,8 +73,10 @@ impl DevSession {
     /// the initial (cold) compile; later calls reuse the warm caches.
     ///
     /// Mirrors one iteration of typst's own `typst watch` loop
-    /// (`typst-cli/src/watch.rs`): age comemo, mark FileStore slots stale (both
-    /// no-ops before the first compile), compile, then collect what to watch.
+    /// (`typst-cli/src/watch.rs`): mark FileStore slots stale (a no-op before
+    /// the first compile), compile, then collect what to watch. Aging comemo's
+    /// cache is left to the caller, between rebuilds: see
+    /// [`age_caches`](Self::age_caches).
     /// `content/` and `static/` are rescanned every time, once, and that one
     /// scan feeds both the compile and the watch set.
     pub fn rebuild(&mut self) -> Rebuild {
@@ -86,7 +88,6 @@ impl DevSession {
     /// (see [`RenderWorld::forget_reads`]).
     pub fn rebuild_after(&mut self, changed: &ChangedPaths) -> Rebuild {
         self.world.forget_reads(changed);
-        comemo::evict(10);
         self.world.files.reset();
         // Start this compile's load log empty (a one-shot `compile_bundle`
         // outside `rebuild` may have left loads behind).
@@ -136,6 +137,15 @@ impl DevSession {
         }
         self.last_watch = watch.clone();
         Rebuild { result, watch }
+    }
+
+    /// Age comemo's memoization cache by one rebuild, dropping what the last
+    /// 10 rebuilds didn't use. Walks the whole cache, which for a large site
+    /// takes a good fraction of a warm rebuild — so `serve` calls this after
+    /// publishing a rebuild, while waiting for the next change, rather than at
+    /// the start of a rebuild where it would delay the reload.
+    pub fn age_caches(&self) {
+        comemo::evict(10);
     }
 
     /// What the compile that just ran observed. See [`Rebuild::watch`].
