@@ -545,6 +545,7 @@ impl RenderWorld {
 
         let mut all = IdHashMap::new();
         let bar = progress::phase(&self.progress, "html", Some(bundle.files.len()));
+        let scope = typst_timing::TimingScope::new("serialize html");
         for (path, file) in bundle.files.iter() {
             bar.inc(1);
             let doc = match file {
@@ -579,7 +580,7 @@ impl RenderWorld {
                 return Err(duplication_error(err).0);
             }
         }
-        drop(bar);
+        drop((bar, scope));
 
         for doc in pages {
             let mut out = all.get_mut(doc.output.as_str());

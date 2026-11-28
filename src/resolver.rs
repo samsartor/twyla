@@ -824,6 +824,7 @@ impl Resolver {
         warnings: &mut Vec<SourceDiagnostic>,
         diag_sources: &mut Vec<Source>,
     ) -> SourceResult<ResolvedAsset> {
+        let _scope = typst_timing::TimingScope::with_span(spec.kind(), Some(span.into_raw()));
         let built = match spec {
             AssetSpec::File { file } => file::build(*file, &self.ctx, span, rec)?,
             AssetSpec::Sass {

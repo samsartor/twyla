@@ -193,6 +193,22 @@ pub(crate) fn resolve_input(input: &AssetInput, span: Span) -> HintedStrResult<A
 
 impl Eq for AssetSpec {}
 
+impl AssetSpec {
+    /// The `asset.*` function that requested this spec, e.g. `"asset.image"`.
+    /// Names the spec's build in a `TWYLA_TIMING` trace.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::File { .. } => "asset.file",
+            Self::Sass { .. } => "asset.sass",
+            Self::Raw { .. } => "asset.raw",
+            Self::Svg { .. } => "asset.svg",
+            Self::Image { .. } => "asset.image",
+            Self::Typst { .. } => "asset.typst",
+            Self::Js { .. } => "asset.js",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Hash, Debug)]
 pub enum OutputReq {
     /// The user wants to read the asset bytes directly.

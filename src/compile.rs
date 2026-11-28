@@ -551,6 +551,7 @@ fn discover_requests(
         .count();
     // Ends (clears) when this function returns.
     let bar = progress::phase(progress, format!("assets {pass}"), Some(assets));
+    let _scope = typst_timing::TimingScope::new("resolve assets");
     // Every `asset.js` request first: they're built in groups, which must
     // know all of the pass's members before any is resolved.
     resolver.prebuild_js_groups(
